@@ -18,7 +18,7 @@ auto_start = true
 enabled = ["hello"]
 
 [keymap]
-leader = ":"
+leader = " "
 help = ":help"
 save = ":w"
 save_as = ":saveas"
@@ -30,3 +30,17 @@ split = ":split"
 open = ":open"
 reload = ":reload-config"
 registers = ":registers"
+
+[keymap.leader]
+"w" = "save"
+"q" = "quit"
+"Q" = "force_quit"
+"s" = "window_split_horizontal"
+"v" = "window_split_vertical"
+"h" = "window_left"
+"j" = "window_down"
+"k" = "window_up"
+"l" = "window_right"
+"t" = "tab_next"
+"T" = "tab_prev"
+"x" = "close_prompt"

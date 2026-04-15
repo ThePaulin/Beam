@@ -2,7 +2,8 @@
 
 ## Project Shape
 - Beam is a Zig terminal editor that embeds QuickJS for plugins and scripting.
-- The main application lives in [`src/main.zig`](./src/main.zig) and [`src/editor.zig`](./src/editor.zig).
+- The main application entrypoint lives in [`src/main.zig`](./src/main.zig).
+- Editor orchestration lives in [`src/editor.zig`](./src/editor.zig), with focused editor modules in [`src/editor/render.zig`](./src/editor/render.zig), [`src/editor/bindings.zig`](./src/editor/bindings.zig), and [`src/editor/commands.zig`](./src/editor/commands.zig).
 - Config parsing and defaults live in [`src/config.zig`](./src/config.zig).
 - Buffer editing behavior lives in [`src/buffer.zig`](./src/buffer.zig).
 - Plugin loading and the QuickJS bridge live in [`src/plugin.zig`](./src/plugin.zig), [`src/qjs_wrap.c`](./src/qjs_wrap.c), and [`src/qjs_wrap.h`](./src/qjs_wrap.h).
@@ -10,7 +11,12 @@
 
 ## Working Style
 - Make small, focused changes and keep the edit surface narrow.
-- Prefer updating tests close to the behavior you changed, especially in [`src/editor.zig`](./src/editor.zig), where most command and motion coverage already lives.
+- Prefer putting new editor logic into the smallest relevant module:
+  - rendering, theme, status, and text-width helpers in `src/editor/render.zig`
+  - normal-mode bindings and leader lookup in `src/editor/bindings.zig`
+  - command parsing and command-string helpers in `src/editor/commands.zig`
+  - orchestration, event flow, and cross-module wiring in `src/editor.zig`
+- Prefer updating tests close to the behavior you changed. Some coverage still lives in `src/editor.zig`, but new helper behavior should be tested beside the module that owns it.
 - When changing config keys, commands, or help text, update the user-facing docs and example config together so they stay aligned.
 - Keep generated artifacts out of source changes. Do not edit `zig-out/` by hand.
 - Use ASCII by default. Only introduce Unicode when it is already part of the file or required by the feature.
@@ -39,6 +45,7 @@
 ## Testing Expectations
 - Add or adjust tests when behavior changes; this project relies heavily on unit tests in the Zig source files.
 - Prefer regression tests for parsing, command dispatch, buffer operations, and plugin host behavior.
+- Keep the existing smoke checks in the loop for editor refactors: `zig build test` and `zig build run -- --help`.
 - If you touch the C bridge or plugin runtime, verify both Zig-side tests and the executable smoke test.
 
 ## Repo Conventions

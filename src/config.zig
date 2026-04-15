@@ -26,6 +26,11 @@ pub const Config = struct {
     plugins: Plugins,
 
     pub const Keymap = struct {
+        pub const LeaderBinding = struct {
+            sequence: []u8,
+            action: []u8,
+        };
+
         leader: []u8,
         help: []u8,
         save: []u8,
@@ -38,6 +43,7 @@ pub const Config = struct {
         open: []u8,
         reload: []u8,
         registers: []u8,
+        leader_bindings: std.array_list.Managed(LeaderBinding),
     };
 
     pub const Plugins = struct {
@@ -69,6 +75,7 @@ pub const Config = struct {
                 .open = try allocator.dupe(u8, ":open"),
                 .reload = try allocator.dupe(u8, ":reload-config"),
                 .registers = try allocator.dupe(u8, ":registers"),
+                .leader_bindings = std.array_list.Managed(Keymap.LeaderBinding).init(allocator),
             },
             .plugins = .{
                 .enabled = std.array_list.Managed([]u8).init(allocator),
@@ -97,6 +104,11 @@ pub const Config = struct {
         self.allocator.free(self.keymap.open);
         self.allocator.free(self.keymap.reload);
         self.allocator.free(self.keymap.registers);
+        for (self.keymap.leader_bindings.items) |binding| {
+            self.allocator.free(binding.sequence);
+            self.allocator.free(binding.action);
+        }
+        self.keymap.leader_bindings.deinit();
         for (self.plugins.enabled.items) |item| {
             self.allocator.free(item);
         }
@@ -265,6 +277,16 @@ fn apply(config: *Config, section: []const u8, key: []const u8, value: []const u
         }
     }
 
+    if (std.mem.eql(u8, section, "keymap.leader")) {
+        const sequence = try parseKey(scope, line_no, diag);
+        const action = try parseString(value, line_no, diag);
+        try config.keymap.leader_bindings.append(.{
+            .sequence = try config.allocator.dupe(u8, sequence),
+            .action = try config.allocator.dupe(u8, action),
+        });
+        return;
+    }
+
     diag.* = .{ .line = line_no, .column = 1, .message = "unknown config key" };
     return error.InvalidToml;
 }
@@ -287,6 +309,13 @@ fn replaceString(allocator: std.mem.Allocator, dest: *[]u8, value: []const u8, l
     const parsed = try parseString(value, line_no, diag);
     allocator.free(dest.*);
     dest.* = try allocator.dupe(u8, parsed);
+}
+
+fn parseKey(value: []const u8, line_no: usize, diag: *Diagnostics) ![]const u8 {
+    if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+        return parseString(value, line_no, diag);
+    }
+    return value;
 }
 
 fn parseString(value: []const u8, line_no: usize, diag: *Diagnostics) ![]const u8 {
@@ -373,4 +402,20 @@ test "config parse status bar icon default sentinel" {
         \\status_bar_icon = "default"
     , &diag);
     try std.testing.expectEqualStrings("default", cfg.status_bar_icon);
+}
+
+test "config parse leader bindings" {
+    var diag = Diagnostics{};
+    var cfg = try Config.init(std.testing.allocator);
+    defer cfg.deinit();
+    try parseInto(&cfg,
+        \\[keymap.leader]
+        \\"w" = "save"
+        \\"[" = "window_split_vertical"
+    , &diag);
+    try std.testing.expectEqual(@as(usize, 2), cfg.keymap.leader_bindings.items.len);
+    try std.testing.expectEqualStrings("w", cfg.keymap.leader_bindings.items[0].sequence);
+    try std.testing.expectEqualStrings("save", cfg.keymap.leader_bindings.items[0].action);
+    try std.testing.expectEqualStrings("[", cfg.keymap.leader_bindings.items[1].sequence);
+    try std.testing.expectEqualStrings("window_split_vertical", cfg.keymap.leader_bindings.items[1].action);
 }
