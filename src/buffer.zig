@@ -97,6 +97,10 @@ pub const Buffer = struct {
     }
 
     pub fn setCursor(self: *Buffer, row: usize, col: usize) void {
+        if (self.lines.items.len == 0) {
+            self.cursor = .{};
+            return;
+        }
         self.cursor.row = @min(row, self.lines.items.len - 1);
         self.cursor.col = @min(col, self.lines.items[self.cursor.row].len);
     }
@@ -184,7 +188,7 @@ pub const Buffer = struct {
         try self.pushUndoSnapshot();
         self.allocator.free(self.lines.items[row]);
         self.lines.items[row] = try self.allocator.dupe(u8, text);
-        self.redo_stack.clearRetainingCapacity();
+        self.clearHistory(&self.redo_stack);
         self.dirty = true;
     }
 
@@ -226,7 +230,8 @@ pub const Buffer = struct {
     }
 
     pub fn moveLineEnd(self: *Buffer) void {
-        self.cursor.col = self.currentLine().len;
+        const line = self.currentLine();
+        self.cursor.col = if (line.len > 0) line.len - 1 else 0;
     }
 
     pub fn moveToFirstNonBlank(self: *Buffer) void {
@@ -252,11 +257,19 @@ pub const Buffer = struct {
     }
 
     pub fn moveToDocumentEnd(self: *Buffer) void {
+        if (self.lines.items.len == 0) {
+            self.cursor = .{};
+            return;
+        }
         self.cursor.row = self.lines.items.len - 1;
-        self.cursor.col = self.lines.items[self.cursor.row].len;
+        self.cursor.col = 0;
     }
 
     pub fn moveToLine(self: *Buffer, row: usize) void {
+        if (self.lines.items.len == 0) {
+            self.cursor = .{};
+            return;
+        }
         self.cursor.row = @min(row, self.lines.items.len - 1);
         self.cursor.col = 0;
     }
@@ -329,7 +342,7 @@ pub const Buffer = struct {
         new_line[self.cursor.col] = byte;
         self.allocator.free(line);
         self.lines.items[self.cursor.row] = new_line;
-        self.redo_stack.clearRetainingCapacity();
+        self.clearHistory(&self.redo_stack);
         self.dirty = true;
     }
 
@@ -463,7 +476,7 @@ pub const Buffer = struct {
         defer self.allocator.free(new_text);
         try self.setText(new_text);
         self.cursor = self.positionAfterReplacement(start, replacement);
-        self.redo_stack.clearRetainingCapacity();
+        self.clearHistory(&self.redo_stack);
         self.dirty = true;
     }
 
@@ -475,7 +488,7 @@ pub const Buffer = struct {
         defer self.allocator.free(new_text);
         try self.setText(new_text);
         self.cursor = self.positionAfterReplacement(start, replacement);
-        self.redo_stack.clearRetainingCapacity();
+        self.clearHistory(&self.redo_stack);
         self.dirty = true;
         return removed;
     }
@@ -541,7 +554,7 @@ pub const Buffer = struct {
         } else {
             try self.insertIntoLine(byte);
         }
-        self.redo_stack.clearRetainingCapacity();
+        self.clearHistory(&self.redo_stack);
         self.dirty = true;
     }
 
@@ -583,7 +596,7 @@ pub const Buffer = struct {
             self.cursor.row = prev_row;
             self.cursor.col = prev_len;
         }
-        self.redo_stack.clearRetainingCapacity();
+        self.clearHistory(&self.redo_stack);
         self.dirty = true;
     }
 
@@ -610,7 +623,7 @@ pub const Buffer = struct {
             self.lines.items[self.cursor.row] = merged;
             _ = self.lines.orderedRemove(self.cursor.row + 1);
         }
-        self.redo_stack.clearRetainingCapacity();
+        self.clearHistory(&self.redo_stack);
         self.dirty = true;
     }
 
@@ -623,6 +636,25 @@ pub const Buffer = struct {
         try self.lines.insert(self.cursor.row + 1, right);
         self.cursor.row += 1;
         self.cursor.col = 0;
+    }
+
+    pub fn insertBlankLineBelow(self: *Buffer) !void {
+        try self.pushUndoSnapshot();
+        const empty = try self.allocator.dupe(u8, "");
+        try self.lines.insert(self.cursor.row + 1, empty);
+        self.cursor.row += 1;
+        self.cursor.col = 0;
+        self.clearHistory(&self.redo_stack);
+        self.dirty = true;
+    }
+
+    pub fn insertBlankLineAbove(self: *Buffer) !void {
+        try self.pushUndoSnapshot();
+        const empty = try self.allocator.dupe(u8, "");
+        try self.lines.insert(self.cursor.row, empty);
+        self.cursor.col = 0;
+        self.clearHistory(&self.redo_stack);
+        self.dirty = true;
     }
 
     pub fn undo(self: *Buffer) !void {
@@ -754,6 +786,28 @@ test "buffer search" {
     const found = buffer.search("wor") orelse return error.TestExpected;
     try std.testing.expectEqual(@as(usize, 1), found.row);
     try std.testing.expectEqual(@as(usize, 0), found.col);
+}
+
+test "buffer cursor clamps to available lines and columns" {
+    var buffer = try Buffer.initEmpty(std.testing.allocator);
+    defer buffer.deinit();
+    try buffer.setText("alpha\nbeta");
+
+    buffer.setCursor(99, 99);
+    try std.testing.expectEqual(@as(usize, 1), buffer.cursor.row);
+    try std.testing.expectEqual(@as(usize, 4), buffer.cursor.col);
+
+    buffer.moveToLine(99);
+    try std.testing.expectEqual(@as(usize, 1), buffer.cursor.row);
+    try std.testing.expectEqual(@as(usize, 0), buffer.cursor.col);
+
+    buffer.moveToDocumentEnd();
+    try std.testing.expectEqual(@as(usize, 1), buffer.cursor.row);
+    try std.testing.expectEqual(@as(usize, 0), buffer.cursor.col);
+
+    buffer.moveLineEnd();
+    try std.testing.expectEqual(@as(usize, 1), buffer.cursor.row);
+    try std.testing.expectEqual(@as(usize, 3), buffer.cursor.col);
 }
 
 fn isWordChar(byte: u8) bool {

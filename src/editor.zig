@@ -2,159 +2,60 @@ const std = @import("std");
 const builtin = @import("builtin");
 const buffer_mod = @import("buffer.zig");
 const config_mod = @import("config.zig");
+const bindings_mod = @import("editor/bindings.zig");
+const commands_mod = @import("editor/commands.zig");
+const render_mod = @import("editor/render.zig");
 const plugin_mod = @import("plugin.zig");
 const terminal_mod = @import("terminal.zig");
 
-const NormalAction = enum {
-    move_left,
-    move_down,
-    move_up,
-    move_right,
-    move_line_start,
-    move_line_nonblank,
-    move_line_last_nonblank,
-    move_line_end,
-    move_doc_start,
-    move_doc_middle,
-    move_doc_end,
-    tab_next,
-    tab_prev,
-    window_split_horizontal,
-    window_split_vertical,
-    window_new,
-    window_switch,
-    window_close,
-    window_exchange,
-    window_resize_increase,
-    window_resize_decrease,
-    window_resize_wider,
-    window_resize_narrower,
-    window_maximize_width,
-    window_maximize_height,
-    window_equalize,
-    window_to_tab,
-    window_left,
-    window_right,
-    window_up,
-    window_down,
-    window_far_left,
-    window_far_right,
-    window_far_bottom,
-    window_far_top,
-    fold_create,
-    fold_delete,
-    fold_toggle,
-    fold_open,
-    fold_close,
-    fold_open_all,
-    fold_close_all,
-    fold_toggle_enabled,
-    fold_delete_all,
-    diff_get,
-    diff_put,
-    diff_this,
-    diff_off,
-    diff_update,
-    diff_next_change,
-    diff_prev_change,
-    move_word_forward,
-    move_word_forward_big,
-    move_word_backward,
-    move_word_backward_big,
-    move_word_end,
-    move_word_end_big,
-    move_word_end_backward,
-    move_word_end_backward_big,
-    move_paragraph_forward,
-    move_paragraph_backward,
-    move_sentence_forward,
-    move_sentence_backward,
-    scroll_up,
-    scroll_down,
-    jump_history_forward,
-    jump_history_backward,
-    switch_previous_buffer,
-    find_forward,
-    find_backward,
-    find_forward_before,
-    find_backward_before,
-    repeat_find_forward,
-    repeat_find_backward,
-    delete_char,
-    replace_char,
-    substitute_char,
-    substitute_line,
-    insert_before,
-    insert_at_bol,
-    append_after,
-    append_eol,
-    open_below,
-    open_above,
-    delete_line,
-    delete_to_bol,
-    yank_line,
-    paste_after,
-    paste_before,
-    undo,
-    redo,
-    delete_word,
-    yank_word,
-    delete_to_eol,
-    change_word,
-    change_line,
-    change_to_eol,
-    join_line_space,
-    join_line_nospace,
-    paste_after_keep_cursor,
-    paste_before_keep_cursor,
-    indent_line,
-    dedent_line,
-    toggle_case_char,
-    toggle_case_word,
-    lowercase_word,
-    uppercase_word,
-    viewport_top,
-    viewport_middle,
-    viewport_bottom,
-    save,
-    save_as,
-    close,
-    terminal,
-    help,
-    jump_local_declaration,
-    jump_global_declaration,
-    jump_matching_character,
-    search_next,
-    search_prev,
-    search_word_forward,
-    search_word_backward,
-    registers,
-    open,
-    open_file_under_cursor,
-    open_link_under_cursor,
-    split,
-    tab_new,
-    tab_close,
-    tab_only,
-    tab_move,
-    visual_restore,
-    set_mark,
-    jump_mark,
-    jump_mark_exact,
-    repeat_last_command,
-    reload_config,
-    quit,
-    force_quit,
-    macro_record,
-    macro_run,
-    visual_char,
-    visual_line,
-    visual_block,
-    exit_visual,
-    visual_yank,
-    visual_delete,
-    not_implemented,
-};
+const NormalAction = bindings_mod.NormalAction;
+const Style = render_mod.Style;
+const Theme = render_mod.Theme;
+const Mode = render_mod.Mode;
+
+fn writeStyle(writer: anytype, style: Style) !void {
+    return render_mod.writeStyle(writer, style);
+}
+
+fn writeStyledText(writer: anytype, style: Style, text: []const u8) !void {
+    return render_mod.writeStyledText(writer, style, text);
+}
+
+fn displayWidth(text: []const u8) usize {
+    return render_mod.displayWidth(text);
+}
+
+fn clipText(text: []const u8, width: usize) []const u8 {
+    return render_mod.clipText(text, width);
+}
+
+fn modeIconText(self: *App, mode: Mode) []const u8 {
+    return render_mod.modeIconText(&self.config, mode);
+}
+
+fn modeLabel(mode: Mode) []const u8 {
+    return render_mod.modeLabel(mode);
+}
+
+fn normalActionHelp(sequence: []const u8, leader: []const u8, bindings: []const config_mod.Config.Keymap.LeaderBinding) ?[]const u8 {
+    return bindings_mod.normalActionHelp(sequence, leader, bindings);
+}
+
+fn normalActionHasPrefix(prefix: []const u8, leader: []const u8, bindings: []const config_mod.Config.Keymap.LeaderBinding) bool {
+    return bindings_mod.normalActionHasPrefix(prefix, leader, bindings);
+}
+
+fn normalActionFor(sequence: []const u8, leader: []const u8, bindings: []const config_mod.Config.Keymap.LeaderBinding) ?NormalAction {
+    return bindings_mod.normalActionFor(sequence, leader, bindings);
+}
+
+fn matchesCommand(head: []const u8, aliases: []const []const u8, configured: []const u8) bool {
+    return commands_mod.matchesCommand(head, aliases, configured);
+}
+
+fn stripVisualRangePrefix(command: []const u8) []const u8 {
+    return commands_mod.stripVisualRangePrefix(command);
+}
 
 const QuickfixEntry = struct {
     path: []u8,
@@ -162,159 +63,7 @@ const QuickfixEntry = struct {
     line: []u8,
 };
 
-const NormalBinding = struct {
-    sequence: []const u8,
-    action: NormalAction,
-    help: []const u8,
-};
-
-const normal_bindings = [_]NormalBinding{
-    .{ .sequence = "h", .action = .move_left, .help = "move cursor left" },
-    .{ .sequence = "j", .action = .move_down, .help = "move cursor down" },
-    .{ .sequence = "k", .action = .move_up, .help = "move cursor up" },
-    .{ .sequence = "l", .action = .move_right, .help = "move cursor right" },
-    .{ .sequence = "0", .action = .move_line_start, .help = "jump to the start of the line" },
-    .{ .sequence = "^", .action = .move_line_nonblank, .help = "jump to first non-blank character" },
-    .{ .sequence = "$", .action = .move_line_end, .help = "jump to the end of the line" },
-    .{ .sequence = "gg", .action = .move_doc_start, .help = "go to the first line" },
-    .{ .sequence = "G", .action = .move_doc_end, .help = "go to the last line" },
-    .{ .sequence = "gt", .action = .tab_next, .help = "move to the next tab" },
-    .{ .sequence = "gT", .action = .tab_prev, .help = "move to the previous tab" },
-    .{ .sequence = "\x17s", .action = .window_split_horizontal, .help = "split window" },
-    .{ .sequence = "\x17v", .action = .window_split_vertical, .help = "split window vertically" },
-    .{ .sequence = "\x17n", .action = .window_new, .help = "open a new empty window" },
-    .{ .sequence = "\x17w", .action = .window_switch, .help = "switch windows" },
-    .{ .sequence = "\x17q", .action = .window_close, .help = "quit a window" },
-    .{ .sequence = "\x17x", .action = .window_exchange, .help = "exchange current window with next one" },
-    .{ .sequence = "\x17+", .action = .window_resize_increase, .help = "increase window size" },
-    .{ .sequence = "\x17-", .action = .window_resize_decrease, .help = "decrease window size" },
-    .{ .sequence = "\x17>", .action = .window_resize_wider, .help = "make window wider" },
-    .{ .sequence = "\x17<", .action = .window_resize_narrower, .help = "make window narrower" },
-    .{ .sequence = "\x17\\", .action = .window_maximize_width, .help = "maximize window width" },
-    .{ .sequence = "\x17|", .action = .window_maximize_width, .help = "maximize window width" },
-    .{ .sequence = "\x17_", .action = .window_maximize_height, .help = "maximize window height" },
-    .{ .sequence = "\x17=", .action = .window_equalize, .help = "make all windows equal height and width" },
-    .{ .sequence = "\x17T", .action = .window_to_tab, .help = "move the current split into its own tab" },
-    .{ .sequence = "\x17h", .action = .window_left, .help = "move cursor to the left window" },
-    .{ .sequence = "\x17l", .action = .window_right, .help = "move cursor to the right window" },
-    .{ .sequence = "\x17k", .action = .window_up, .help = "move cursor to the window above" },
-    .{ .sequence = "\x17j", .action = .window_down, .help = "move cursor to the window below" },
-    .{ .sequence = "\x17H", .action = .window_far_left, .help = "make current window full height at far left" },
-    .{ .sequence = "\x17L", .action = .window_far_right, .help = "make current window full height at far right" },
-    .{ .sequence = "\x17J", .action = .window_far_bottom, .help = "make current window full width at the very bottom" },
-    .{ .sequence = "\x17K", .action = .window_far_top, .help = "make current window full width at the very top" },
-    .{ .sequence = "zf", .action = .fold_create, .help = "manually define a fold" },
-    .{ .sequence = "zd", .action = .fold_delete, .help = "delete fold under the cursor" },
-    .{ .sequence = "zE", .action = .fold_delete_all, .help = "delete all folds" },
-    .{ .sequence = "za", .action = .fold_toggle, .help = "toggle fold under the cursor" },
-    .{ .sequence = "zo", .action = .fold_open, .help = "open fold under the cursor" },
-    .{ .sequence = "zc", .action = .fold_close, .help = "close fold under the cursor" },
-    .{ .sequence = "zr", .action = .fold_open_all, .help = "reduce folds by opening all folds" },
-    .{ .sequence = "zm", .action = .fold_close_all, .help = "fold more by closing all folds" },
-    .{ .sequence = "zi", .action = .fold_toggle_enabled, .help = "toggle folding functionality" },
-    .{ .sequence = "do", .action = .diff_get, .help = "obtain difference from the other buffer" },
-    .{ .sequence = "dp", .action = .diff_put, .help = "put difference to the other buffer" },
-    .{ .sequence = "]c", .action = .diff_next_change, .help = "jump to the start of the next change" },
-    .{ .sequence = "[c", .action = .diff_prev_change, .help = "jump to the start of the previous change" },
-    .{ .sequence = "w", .action = .move_word_forward, .help = "jump forwards to the start of a word" },
-    .{ .sequence = "W", .action = .move_word_forward_big, .help = "jump forwards to the start of a WORD" },
-    .{ .sequence = "b", .action = .move_word_backward, .help = "jump backwards to the start of a word" },
-    .{ .sequence = "B", .action = .move_word_backward_big, .help = "jump backwards to the start of a WORD" },
-    .{ .sequence = "e", .action = .move_word_end, .help = "jump forwards to the end of a word" },
-    .{ .sequence = "E", .action = .move_word_end_big, .help = "jump forwards to the end of a WORD" },
-    .{ .sequence = "ge", .action = .move_word_end_backward, .help = "jump backwards to the end of a word" },
-    .{ .sequence = "gE", .action = .move_word_end_backward_big, .help = "jump backwards to the end of a WORD" },
-    .{ .sequence = "}", .action = .move_paragraph_forward, .help = "jump to next paragraph" },
-    .{ .sequence = "{", .action = .move_paragraph_backward, .help = "jump to previous paragraph" },
-    .{ .sequence = ")", .action = .move_sentence_forward, .help = "jump to next sentence" },
-    .{ .sequence = "(", .action = .move_sentence_backward, .help = "jump to previous sentence" },
-    .{ .sequence = "gj", .action = .move_down, .help = "move cursor down on wrapped text" },
-    .{ .sequence = "gk", .action = .move_up, .help = "move cursor up on wrapped text" },
-    .{ .sequence = "g_", .action = .move_line_last_nonblank, .help = "jump to the last non-blank character" },
-    .{ .sequence = "gd", .action = .jump_local_declaration, .help = "move to local declaration" },
-    .{ .sequence = "gD", .action = .jump_global_declaration, .help = "move to global declaration" },
-    .{ .sequence = "gf", .action = .open_file_under_cursor, .help = "open file under cursor" },
-    .{ .sequence = "gx", .action = .open_link_under_cursor, .help = "open link under cursor" },
-    .{ .sequence = "n", .action = .search_next, .help = "jump to the next search match" },
-    .{ .sequence = "N", .action = .search_prev, .help = "jump to the previous search match" },
-    .{ .sequence = "*", .action = .search_word_forward, .help = "search word under cursor forward" },
-    .{ .sequence = "#", .action = .search_word_backward, .help = "search word under cursor backward" },
-    .{ .sequence = "f", .action = .find_forward, .help = "jump to next occurrence of a character" },
-    .{ .sequence = "F", .action = .find_backward, .help = "jump to previous occurrence of a character" },
-    .{ .sequence = "t", .action = .find_forward_before, .help = "jump before next occurrence of a character" },
-    .{ .sequence = "T", .action = .find_backward_before, .help = "jump after previous occurrence of a character" },
-    .{ .sequence = ";", .action = .repeat_find_forward, .help = "repeat the previous find command" },
-    .{ .sequence = ",", .action = .repeat_find_backward, .help = "repeat the previous find command backwards" },
-    .{ .sequence = "m", .action = .set_mark, .help = "set a mark" },
-    .{ .sequence = "'", .action = .jump_mark, .help = "jump to a mark's line" },
-    .{ .sequence = "`", .action = .jump_mark_exact, .help = "jump to a mark's exact position" },
-    .{ .sequence = "gp", .action = .paste_after_keep_cursor, .help = "put and leave cursor after the new text" },
-    .{ .sequence = "gP", .action = .paste_before_keep_cursor, .help = "put before cursor and leave cursor after the new text" },
-    .{ .sequence = "g~", .action = .toggle_case_word, .help = "switch case up to motion" },
-    .{ .sequence = "gu", .action = .lowercase_word, .help = "change to lowercase up to motion" },
-    .{ .sequence = "gU", .action = .uppercase_word, .help = "change to uppercase up to motion" },
-    .{ .sequence = ".", .action = .repeat_last_command, .help = "repeat the last command" },
-    .{ .sequence = "x", .action = .delete_char, .help = "delete a single character" },
-    .{ .sequence = "r", .action = .replace_char, .help = "replace a single character" },
-    .{ .sequence = "s", .action = .substitute_char, .help = "delete character and substitute text" },
-    .{ .sequence = "S", .action = .substitute_line, .help = "delete line and substitute text" },
-    .{ .sequence = "i", .action = .insert_before, .help = "insert before the cursor" },
-    .{ .sequence = "I", .action = .insert_at_bol, .help = "insert at the beginning of the line" },
-    .{ .sequence = "a", .action = .append_after, .help = "append after the cursor" },
-    .{ .sequence = "A", .action = .append_eol, .help = "append at the end of the line" },
-    .{ .sequence = "o", .action = .open_below, .help = "open a new line below" },
-    .{ .sequence = "O", .action = .open_above, .help = "open a new line above" },
-    .{ .sequence = "u", .action = .undo, .help = "undo" },
-    .{ .sequence = "\x12", .action = .redo, .help = "redo" },
-    .{ .sequence = "\x15", .action = .scroll_up, .help = "scroll up" },
-    .{ .sequence = "\x04", .action = .scroll_down, .help = "scroll down" },
-    .{ .sequence = "\x09", .action = .jump_history_forward, .help = "move forward in jump list" },
-    .{ .sequence = "\x0f", .action = .jump_history_backward, .help = "move backward in jump list" },
-    .{ .sequence = "\x1e", .action = .switch_previous_buffer, .help = "toggle between current and previous file" },
-    .{ .sequence = "zz", .action = .viewport_middle, .help = "center cursor on screen" },
-    .{ .sequence = "zt", .action = .viewport_top, .help = "position cursor on top of the screen" },
-    .{ .sequence = "zb", .action = .viewport_bottom, .help = "position cursor on bottom of the screen" },
-    .{ .sequence = "H", .action = .move_doc_start, .help = "move to the top of the screen" },
-    .{ .sequence = "M", .action = .move_doc_middle, .help = "move to the middle of the screen" },
-    .{ .sequence = "L", .action = .move_doc_end, .help = "move to the bottom of the screen" },
-    .{ .sequence = "dd", .action = .delete_line, .help = "delete a line" },
-    .{ .sequence = "d0", .action = .delete_to_bol, .help = "delete to beginning of line" },
-    .{ .sequence = "yy", .action = .yank_line, .help = "yank a line" },
-    .{ .sequence = "p", .action = .paste_after, .help = "put after cursor" },
-    .{ .sequence = "P", .action = .paste_before, .help = "put before cursor" },
-    .{ .sequence = "dw", .action = .delete_word, .help = "delete a word" },
-    .{ .sequence = "diw", .action = .delete_word, .help = "delete inner word" },
-    .{ .sequence = "cw", .action = .change_word, .help = "change word" },
-    .{ .sequence = "ce", .action = .change_word, .help = "change to end of word" },
-    .{ .sequence = "ciw", .action = .change_word, .help = "change inner word" },
-    .{ .sequence = "cc", .action = .change_line, .help = "change entire line" },
-    .{ .sequence = "C", .action = .change_to_eol, .help = "change to end of line" },
-    .{ .sequence = "d$", .action = .delete_to_eol, .help = "delete to end of line" },
-    .{ .sequence = "D", .action = .delete_to_eol, .help = "delete to end of line" },
-    .{ .sequence = "yw", .action = .yank_word, .help = "yank a word" },
-    .{ .sequence = "yiw", .action = .yank_word, .help = "yank inner word" },
-    .{ .sequence = "yaw", .action = .yank_word, .help = "yank around word" },
-    .{ .sequence = "y$", .action = .yank_word, .help = "yank to end of line" },
-    .{ .sequence = "Y", .action = .yank_word, .help = "yank to end of line" },
-    .{ .sequence = "J", .action = .join_line_space, .help = "join lines with a space" },
-    .{ .sequence = "gJ", .action = .join_line_nospace, .help = "join lines without a space" },
-    .{ .sequence = ">", .action = .indent_line, .help = "shift text right" },
-    .{ .sequence = "<", .action = .dedent_line, .help = "shift text left" },
-    .{ .sequence = "~", .action = .toggle_case_char, .help = "switch case" },
-    .{ .sequence = "v", .action = .visual_char, .help = "start visual character mode" },
-    .{ .sequence = "V", .action = .visual_line, .help = "start visual line mode" },
-    .{ .sequence = "\x16", .action = .visual_block, .help = "start visual block mode" },
-    .{ .sequence = "gv", .action = .visual_restore, .help = "reselect the previous visual area" },
-    .{ .sequence = "y", .action = .visual_yank, .help = "yank selected text" },
-    .{ .sequence = "d", .action = .visual_delete, .help = "delete selected text" },
-    .{ .sequence = "q", .action = .macro_record, .help = "record macro" },
-    .{ .sequence = "@", .action = .macro_run, .help = "run macro" },
-    .{ .sequence = "%", .action = .jump_matching_character, .help = "move cursor to matching character" },
-    .{ .sequence = "K", .action = .help, .help = "open help for the word under the cursor" },
-};
-
 const SplitFocus = enum { left, right };
-const Mode = enum { normal, insert, command, search, visual };
 
 // First-pass gaps we will tackle after the redesigned bar lands.
 const status_bar_todo = [_][]const u8{
@@ -323,326 +72,6 @@ const status_bar_todo = [_][]const u8{
     "filetype / encoding / line endings",
     "macro recording indicator",
 };
-
-const Style = struct {
-    fg: ?u8 = null,
-    bg: ?u8 = null,
-    bold: bool = false,
-    dim: bool = false,
-};
-
-const Theme = struct {
-    name: []const u8,
-    content_bg: ?u8,
-    border: u8,
-    text: u8,
-    muted: u8,
-    line_no: u8,
-    line_no_active: u8,
-    accent: u8,
-    accent_alt: u8,
-    prompt_bg: u8,
-    prompt_fg: u8,
-    status_bg: u8,
-    status_fg: u8,
-    contrast_fg: u8,
-    search_bg: u8,
-    search_fg: u8,
-    visual_bg: u8,
-    visual_fg: u8,
-    blur: bool,
-    opacity: usize,
-
-    fn beam(content_bg: ?u8, blur: bool, opacity: usize) Theme {
-        return .{
-            .name = "beam",
-            .content_bg = content_bg,
-            .border = 60,
-            .text = 252,
-            .muted = 246,
-            .line_no = 244,
-            .line_no_active = 81,
-            .accent = 81,
-            .accent_alt = 45,
-            .prompt_bg = 235,
-            .prompt_fg = 252,
-            .status_bg = 235,
-            .status_fg = 252,
-            .contrast_fg = 16,
-            .search_bg = 221,
-            .search_fg = 16,
-            .visual_bg = 81,
-            .visual_fg = 16,
-            .blur = blur,
-            .opacity = opacity,
-        };
-    }
-
-    fn nvchad(content_bg: ?u8, blur: bool, opacity: usize) Theme {
-        return .{
-            .name = "nvchad",
-            .content_bg = content_bg,
-            .border = 81,
-            .text = 252,
-            .muted = 245,
-            .line_no = 244,
-            .line_no_active = 81,
-            .accent = 81,
-            .accent_alt = 45,
-            .prompt_bg = 235,
-            .prompt_fg = 252,
-            .status_bg = 235,
-            .status_fg = 252,
-            .contrast_fg = 16,
-            .search_bg = 221,
-            .search_fg = 16,
-            .visual_bg = 81,
-            .visual_fg = 16,
-            .blur = blur,
-            .opacity = opacity,
-        };
-    }
-
-    fn resolve(name: []const u8, background_color: []const u8, blur: bool, opacity: usize) Theme {
-        const content_bg = resolveBackgroundColor(background_color, opacity);
-        if (std.ascii.eqlIgnoreCase(name, "nvchad") or std.ascii.eqlIgnoreCase(name, "chad")) {
-            return Theme.nvchad(content_bg, blur, opacity);
-        }
-        return Theme.beam(content_bg, blur, opacity);
-    }
-
-    fn modeStyle(self: Theme, mode: Mode) Style {
-        return switch (mode) {
-            .normal => .{ .fg = self.contrast_fg, .bg = self.accent, .bold = true },
-            .insert => .{ .fg = self.contrast_fg, .bg = self.accent_alt, .bold = true },
-            .command => .{ .fg = self.contrast_fg, .bg = self.prompt_bg, .bold = true },
-            .search => .{ .fg = self.contrast_fg, .bg = self.search_bg, .bold = true },
-            .visual => .{ .fg = self.contrast_fg, .bg = self.visual_bg, .bold = true },
-        };
-    }
-
-    fn textStyle(self: Theme, active: bool) Style {
-        return .{
-            .fg = if (active) self.text else self.muted,
-            .bg = self.contentBg(),
-            .dim = self.glassMode(),
-        };
-    }
-
-    fn lineNumberStyle(self: Theme, active: bool) Style {
-        return .{
-            .fg = if (active) self.line_no_active else if (self.glassMode()) self.muted else self.line_no,
-            .bg = self.contentBg(),
-            .dim = self.glassMode(),
-        };
-    }
-
-    fn searchStyle(self: Theme) Style {
-        return .{ .fg = if (self.glassMode()) self.muted else self.search_fg, .bg = self.search_bg, .bold = !self.glassMode(), .dim = self.glassMode() };
-    }
-
-    fn visualStyle(self: Theme) Style {
-        return .{ .fg = if (self.glassMode()) self.muted else self.visual_fg, .bg = self.visual_bg, .bold = !self.glassMode(), .dim = self.glassMode() };
-    }
-
-    fn separatorStyle(self: Theme) Style {
-        return .{ .fg = if (self.glassMode()) self.muted else self.border, .bg = self.contentBg(), .dim = self.glassMode() };
-    }
-
-    fn statusStyle(self: Theme) Style {
-        return .{ .fg = self.status_fg, .bg = self.status_bg };
-    }
-
-    fn promptStyle(self: Theme) Style {
-        return .{ .fg = self.prompt_fg, .bg = self.prompt_bg };
-    }
-
-    fn contentBg(self: Theme) ?u8 {
-        if (self.content_bg) |bg| return blendOpacity(bg, self.opacity);
-        return null;
-    }
-
-    fn glassMode(self: Theme) bool {
-        return self.blur or self.opacity < 100;
-    }
-};
-
-fn resolveBackgroundColor(spec: []const u8, opacity: usize) ?u8 {
-    if (opacity == 0) return null;
-    if (std.mem.eql(u8, spec, "") or std.mem.eql(u8, spec, "terminal") or std.mem.eql(u8, spec, "inherit") or std.mem.eql(u8, spec, "default")) {
-        return null;
-    }
-    if (parseNamedColor(spec)) |color| return color;
-    if (spec.len > 0 and spec[0] == '#') {
-        return rgbToXterm(spec[1..]) orelse null;
-    }
-    const numeric = std.fmt.parseUnsigned(u16, spec, 10) catch return null;
-    if (numeric > 255) return null;
-    return @as(u8, @intCast(numeric));
-}
-
-fn parseNamedColor(spec: []const u8) ?u8 {
-    return if (std.ascii.eqlIgnoreCase(spec, "black")) 0 else if (std.ascii.eqlIgnoreCase(spec, "red")) 1 else if (std.ascii.eqlIgnoreCase(spec, "green")) 2 else if (std.ascii.eqlIgnoreCase(spec, "yellow")) 3 else if (std.ascii.eqlIgnoreCase(spec, "blue")) 4 else if (std.ascii.eqlIgnoreCase(spec, "magenta")) 5 else if (std.ascii.eqlIgnoreCase(spec, "cyan")) 6 else if (std.ascii.eqlIgnoreCase(spec, "white")) 7 else if (std.ascii.eqlIgnoreCase(spec, "bright_black") or std.ascii.eqlIgnoreCase(spec, "gray") or std.ascii.eqlIgnoreCase(spec, "grey")) 8 else if (std.ascii.eqlIgnoreCase(spec, "bright_red")) 9 else if (std.ascii.eqlIgnoreCase(spec, "bright_green")) 10 else if (std.ascii.eqlIgnoreCase(spec, "bright_yellow")) 11 else if (std.ascii.eqlIgnoreCase(spec, "bright_blue")) 12 else if (std.ascii.eqlIgnoreCase(spec, "bright_magenta")) 13 else if (std.ascii.eqlIgnoreCase(spec, "bright_cyan")) 14 else if (std.ascii.eqlIgnoreCase(spec, "bright_white")) 15 else null;
-}
-
-fn rgbToXterm(spec: []const u8) ?u8 {
-    if (spec.len != 6) return null;
-    const r = std.fmt.parseUnsigned(u8, spec[0..2], 16) catch return null;
-    const g = std.fmt.parseUnsigned(u8, spec[2..4], 16) catch return null;
-    const b = std.fmt.parseUnsigned(u8, spec[4..6], 16) catch return null;
-    return rgbToXtermIndex(r, g, b);
-}
-
-fn rgbToXtermIndex(r: u8, g: u8, b: u8) u8 {
-    const gray = @as(u16, @intCast((@as(u16, r) + @as(u16, g) + @as(u16, b)) / 3));
-    if (@max(@max(r, g), b) == @min(@min(r, g), b)) {
-        const level: u8 = @as(u8, @intCast(@min(@as(u16, 23), gray / 11)));
-        return @as(u8, @intCast(232 + level));
-    }
-    const rc: u8 = @as(u8, @intCast(@min(@as(u16, 5), (@as(u16, r) * 5 + 127) / 255)));
-    const gc: u8 = @as(u8, @intCast(@min(@as(u16, 5), (@as(u16, g) * 5 + 127) / 255)));
-    const bc: u8 = @as(u8, @intCast(@min(@as(u16, 5), (@as(u16, b) * 5 + 127) / 255)));
-    return @as(u8, @intCast(16 + 36 * rc + 6 * gc + bc));
-}
-
-fn blendOpacity(color: u8, opacity: usize) u8 {
-    if (opacity >= 100) return color;
-    const percent = @as(u16, @intCast(opacity));
-    const rgb = xtermToRgb(color);
-    const r = @as(u8, @intCast((@as(u16, rgb.r) * percent) / 100));
-    const g = @as(u8, @intCast((@as(u16, rgb.g) * percent) / 100));
-    const b = @as(u8, @intCast((@as(u16, rgb.b) * percent) / 100));
-    return rgbToXtermIndex(r, g, b);
-}
-
-const Rgb = struct { r: u8, g: u8, b: u8 };
-
-fn xtermToRgb(color: u8) Rgb {
-    if (color < 16) {
-        return switch (color) {
-            0 => .{ .r = 0, .g = 0, .b = 0 },
-            1 => .{ .r = 205, .g = 0, .b = 0 },
-            2 => .{ .r = 0, .g = 205, .b = 0 },
-            3 => .{ .r = 205, .g = 205, .b = 0 },
-            4 => .{ .r = 0, .g = 0, .b = 238 },
-            5 => .{ .r = 205, .g = 0, .b = 205 },
-            6 => .{ .r = 0, .g = 205, .b = 205 },
-            7 => .{ .r = 229, .g = 229, .b = 229 },
-            8 => .{ .r = 127, .g = 127, .b = 127 },
-            9 => .{ .r = 255, .g = 0, .b = 0 },
-            10 => .{ .r = 0, .g = 255, .b = 0 },
-            11 => .{ .r = 255, .g = 255, .b = 0 },
-            12 => .{ .r = 92, .g = 92, .b = 255 },
-            13 => .{ .r = 255, .g = 0, .b = 255 },
-            14 => .{ .r = 0, .g = 255, .b = 255 },
-            else => .{ .r = 255, .g = 255, .b = 255 },
-        };
-    }
-    if (color >= 232) {
-        const level = @as(u8, @intCast(8 + (color - 232) * 10));
-        return .{ .r = level, .g = level, .b = level };
-    }
-    const idx = color - 16;
-    const r = idx / 36;
-    const g = (idx % 36) / 6;
-    const b = idx % 6;
-    const component = struct {
-        fn level(v: u8) u8 {
-            return if (v == 0) 0 else @as(u8, @intCast(55 + v * 40));
-        }
-    };
-    return .{ .r = component.level(r), .g = component.level(g), .b = component.level(b) };
-}
-
-fn writeStyle(writer: anytype, style: Style) !void {
-    try writer.writeAll("\x1b[0m");
-    if (style.fg) |fg| {
-        try writer.print("\x1b[38;5;{d}m", .{fg});
-    }
-    if (style.bg) |bg| {
-        try writer.print("\x1b[48;5;{d}m", .{bg});
-    }
-    if (style.bold) {
-        try writer.writeAll("\x1b[1m");
-    }
-    if (style.dim) {
-        try writer.writeAll("\x1b[2m");
-    }
-}
-
-fn writeStyledText(writer: anytype, style: Style, text: []const u8) !void {
-    try writeStyle(writer, style);
-    try writer.writeAll(text);
-}
-
-fn utf8CharLen(byte: u8) usize {
-    return if (byte < 0x80) 1 else if ((byte & 0xe0) == 0xc0) 2 else if ((byte & 0xf0) == 0xe0) 3 else if ((byte & 0xf8) == 0xf0) 4 else 1;
-}
-
-fn displayWidth(text: []const u8) usize {
-    var width: usize = 0;
-    var idx: usize = 0;
-    while (idx < text.len) {
-        const len = utf8CharLen(text[idx]);
-        idx += @min(len, text.len - idx);
-        width += 1;
-    }
-    return width;
-}
-
-fn clipText(text: []const u8, width: usize) []const u8 {
-    if (width == 0) return "";
-    var idx: usize = 0;
-    var used: usize = 0;
-    while (idx < text.len and used < width) {
-        const len = utf8CharLen(text[idx]);
-        if (idx + len > text.len) break;
-        idx += len;
-        used += 1;
-    }
-    return text[0..idx];
-}
-
-fn modeIconText(self: *App, mode: Mode) []const u8 {
-    return switch (mode) {
-        .normal => if (std.mem.eql(u8, self.config.status_bar_icon, "default")) "\u{e795}" else self.config.status_bar_icon,
-        .insert => self.config.status_bar_insert_icon,
-        .command => "",
-        .search => "",
-        .visual => self.config.status_bar_visual_icon,
-    };
-}
-
-fn modeLabel(mode: Mode) []const u8 {
-    return switch (mode) {
-        .normal => "NORMAL",
-        .insert => "INSERT",
-        .command => "COMMAND",
-        .search => "SEARCH",
-        .visual => "VISUAL",
-    };
-}
-
-fn normalActionHelp(sequence: []const u8) ?[]const u8 {
-    for (normal_bindings) |binding| {
-        if (std.mem.eql(u8, binding.sequence, sequence)) return binding.help;
-    }
-    return null;
-}
-
-fn normalActionHasPrefix(prefix: []const u8) bool {
-    for (normal_bindings) |binding| {
-        if (binding.sequence.len > prefix.len and std.mem.startsWith(u8, binding.sequence, prefix)) return true;
-    }
-    return false;
-}
-
-fn normalActionFor(sequence: []const u8) ?NormalAction {
-    for (normal_bindings) |binding| {
-        if (std.mem.eql(u8, binding.sequence, sequence)) return binding.action;
-    }
-    return null;
-}
 
 pub const App = struct {
     allocator: std.mem.Allocator,
@@ -692,8 +121,10 @@ pub const App = struct {
     visual_pending: ?VisualPending = null,
     last_visual_state: ?VisualState = null,
     visual_block_insert: ?VisualBlockInsert = null,
+    close_confirm: ?CloseTarget = null,
     search_highlight: ?[]u8 = null,
     search_preview_highlight: ?[]u8 = null,
+    search_forward: bool = true,
     last_find: ?FindState = null,
     last_normal_action: ?NormalAction = null,
     last_normal_count: usize = 1,
@@ -703,6 +134,7 @@ pub const App = struct {
     const VisualMode = enum { none, character, line, block };
     const VisualPending = enum { ctrl_backslash, g_prefix, replace_char, textobject_outer, textobject_inner };
     const PendingPrefix = enum { none, register, replace_char, find_forward, find_forward_before, find_backward, find_backward_before, macro_record, macro_run, mark_set, mark_jump, mark_jump_exact };
+    const CloseTarget = enum { split, tab, buffer };
     const FindState = struct {
         char: u8,
         forward: bool,
@@ -929,6 +361,9 @@ pub const App = struct {
 
     fn handleByte(self: *App, byte: u8, stdin_file: std.fs.File) !void {
         _ = stdin_file;
+        const start_buffer = self.activeBuffer();
+        const start_cursor = start_buffer.cursor;
+        defer self.syncViewportIfCursorMoved(start_buffer, start_cursor);
         switch (self.mode) {
             .insert => switch (byte) {
                 0x1b => {
@@ -968,6 +403,14 @@ pub const App = struct {
                 },
                 else => try self.handleInsertByte(byte),
             },
+            .replace => switch (byte) {
+                0x1b, 0x03 => self.mode = .normal,
+                0x12 => self.insert_register_prefix = true,
+                0x17 => try self.deleteInsertPreviousWord(),
+                0x7f => try self.activeBuffer().backspace(),
+                '\r', '\n' => try self.activeBuffer().insertByte('\n'),
+                else => try self.handleReplaceByte(byte),
+            },
             .command => switch (byte) {
                 0x1b => self.clearPrompt(.command),
                 0x7f => {
@@ -992,11 +435,15 @@ pub const App = struct {
                 },
             },
             .visual => try self.handleVisualByte(byte),
+            .select => try self.handleVisualByte(byte),
             .normal => try self.handleNormalByte(byte),
         }
     }
 
     fn handleInsertByte(self: *App, byte: u8) !void {
+        const start_buffer = self.activeBuffer();
+        const start_cursor = start_buffer.cursor;
+        defer self.syncViewportIfCursorMoved(start_buffer, start_cursor);
         if (self.visual_block_insert) |*block| {
             if (self.insert_register_prefix) {
                 self.insert_register_prefix = false;
@@ -1014,6 +461,38 @@ pub const App = struct {
             return;
         }
         try self.activeBuffer().insertByte(byte);
+    }
+
+    fn handleReplaceByte(self: *App, byte: u8) !void {
+        const start_buffer = self.activeBuffer();
+        const start_cursor = start_buffer.cursor;
+        defer self.syncViewportIfCursorMoved(start_buffer, start_cursor);
+        if (self.visual_block_insert) |*block| {
+            if (self.insert_register_prefix) {
+                self.insert_register_prefix = false;
+                const value = self.registers.get(byte) orelse "";
+                try block.text.appendSlice(value);
+                return;
+            }
+            try block.text.append(byte);
+            return;
+        }
+
+        if (self.insert_register_prefix) {
+            self.insert_register_prefix = false;
+            const value = self.registers.get(byte) orelse "";
+            try self.activeBuffer().insertTextAtCursor(value);
+            return;
+        }
+
+        const buf = self.activeBuffer();
+        const line = buf.lines.items[buf.cursor.row];
+        if (buf.cursor.col < line.len) {
+            try buf.replaceCurrentCharacter(byte);
+            buf.moveRight();
+        } else {
+            try buf.insertByte(byte);
+        }
     }
 
     fn clearPrompt(self: *App, mode: Mode) void {
@@ -1294,8 +773,41 @@ pub const App = struct {
     }
 
     fn handleNormalByte(self: *App, byte: u8) anyerror!void {
+        const start_buffer = self.activeBuffer();
+        const start_cursor = start_buffer.cursor;
+        defer self.syncViewportIfCursorMoved(start_buffer, start_cursor);
+        if (self.close_confirm) |target| {
+            switch (byte) {
+                'y', 'Y' => {
+                    self.close_confirm = null;
+                    try self.executeCloseConfirm(target);
+                },
+                'n', 'N', 0x1b, 0x03 => {
+                    self.close_confirm = null;
+                    try self.setStatus("close cancelled");
+                },
+                else => {
+                    self.close_confirm = null;
+                    try self.setStatus("close cancelled");
+                },
+            }
+            return;
+        }
         if (self.pending_prefix != .none) {
             try self.handlePendingPrefix(byte);
+            return;
+        }
+
+        if (byte == 0x1b or byte == 0x03) {
+            self.resetNormalInput();
+            self.visual_mode = .none;
+            self.visual_anchor = null;
+            return;
+        }
+
+        if (self.normal_sequence.items.len > 0) {
+            try self.normal_sequence.append(byte);
+            try self.resolveNormalSequence();
             return;
         }
 
@@ -1304,12 +816,6 @@ pub const App = struct {
         }
 
         switch (byte) {
-            0x1b, 0x03 => {
-                self.resetNormalInput();
-                self.visual_mode = .none;
-                self.visual_anchor = null;
-                return;
-            },
             ':' => {
                 self.resetNormalInput();
                 self.mode = .command;
@@ -1319,6 +825,14 @@ pub const App = struct {
             '/' => {
                 self.resetNormalInput();
                 self.mode = .search;
+                self.search_forward = true;
+                self.search_buffer.clearRetainingCapacity();
+                return;
+            },
+            '?' => {
+                self.resetNormalInput();
+                self.mode = .search;
+                self.search_forward = false;
                 self.search_buffer.clearRetainingCapacity();
                 return;
             },
@@ -1421,6 +935,9 @@ pub const App = struct {
     }
 
     fn handleVisualByte(self: *App, byte: u8) !void {
+        const start_buffer = self.activeBuffer();
+        const start_cursor = start_buffer.cursor;
+        defer self.syncViewportIfCursorMoved(start_buffer, start_cursor);
         if (self.visual_pending) |pending| {
             self.visual_pending = null;
             switch (pending) {
@@ -1477,12 +994,19 @@ pub const App = struct {
             0x1b, 0x03 => self.exitVisual(),
             0x1c => self.visual_pending = .ctrl_backslash,
             0x07 => {
-                self.visual_select_mode = !self.visual_select_mode;
+                if (self.mode == .select) {
+                    self.mode = .visual;
+                    self.visual_select_mode = false;
+                } else {
+                    self.mode = .select;
+                    self.visual_select_mode = true;
+                }
                 self.visual_select_restore = false;
-                try self.setStatus(if (self.visual_select_mode) "select mode" else "visual mode");
+                try self.setStatus(if (self.mode == .select) "select mode" else "visual mode");
             },
             0x0f => {
-                if (self.visual_select_mode) {
+                if (self.mode == .select) {
+                    self.mode = .visual;
                     self.visual_select_mode = false;
                     self.visual_select_restore = true;
                     try self.setStatus("visual mode");
@@ -1498,23 +1022,23 @@ pub const App = struct {
                     self.exitVisual();
                 } else {
                     self.visual_mode = .block;
-                    self.visual_select_mode = false;
+                    if (self.mode == .visual) self.visual_select_mode = false;
                 }
             },
             'v' => {
-                if (self.visual_mode == .character) {
+                if (self.visual_mode == .character and self.mode == .visual) {
                     self.exitVisual();
                 } else {
                     self.visual_mode = .character;
-                    self.visual_select_mode = false;
+                    if (self.mode == .visual) self.visual_select_mode = false;
                 }
             },
             'V' => {
-                if (self.visual_mode == .line) {
+                if (self.visual_mode == .line and self.mode == .visual) {
                     self.exitVisual();
                 } else {
                     self.visual_mode = .line;
-                    self.visual_select_mode = false;
+                    if (self.mode == .visual) self.visual_select_mode = false;
                 }
             },
             'g' => self.visual_pending = .g_prefix,
@@ -1573,10 +1097,17 @@ pub const App = struct {
             },
             0x01 => try self.visualAdjustNumber(true, 1),
             0x18 => try self.visualAdjustNumber(false, 1),
-            else => try self.setStatus("visual command not implemented"),
+            else => {
+                if (self.mode == .select and byte >= 0x20 and byte != 0x7f) {
+                    try self.selectReplaceByte(byte);
+                } else {
+                    try self.setStatus("visual command not implemented");
+                }
+            },
         }
         if (self.visual_select_restore and self.mode == .visual and self.visual_pending == null) {
             self.visual_select_restore = false;
+            self.mode = .select;
             self.visual_select_mode = true;
             try self.setStatus("select mode");
         }
@@ -1645,8 +1176,8 @@ pub const App = struct {
         const sequence = self.normal_sequence.items;
         if (sequence.len == 0) return;
 
-        if (normalActionFor(sequence)) |action| {
-            if (normalActionHasPrefix(sequence)) return;
+        if (normalActionFor(sequence, self.config.keymap.leader, self.config.keymap.leader_bindings.items)) |action| {
+            if (normalActionHasPrefix(sequence, self.config.keymap.leader, self.config.keymap.leader_bindings.items)) return;
             const count = self.consumeCount();
             self.normal_sequence.clearRetainingCapacity();
             try self.performNormalAction(action, count);
@@ -1657,7 +1188,7 @@ pub const App = struct {
             return;
         }
 
-        if (normalActionHasPrefix(sequence)) {
+        if (normalActionHasPrefix(sequence, self.config.keymap.leader, self.config.keymap.leader_bindings.items)) {
             return;
         }
 
@@ -1684,6 +1215,7 @@ pub const App = struct {
 
     fn performNormalAction(self: *App, action: NormalAction, count: usize) !void {
         const buf = self.activeBuffer();
+        const start_buffer = buf;
         const start_cursor = self.activeBuffer().cursor;
         var text_changed = false;
         var record_jump = true;
@@ -1714,6 +1246,7 @@ pub const App = struct {
                 } else {
                     buf.moveToDocumentStart();
                 }
+                self.setViewport(.top);
             },
             .move_doc_middle => {
                 const middle = if (buf.lineCount() > 0) (buf.lineCount() - 1) / 2 else 0;
@@ -1725,6 +1258,7 @@ pub const App = struct {
                 } else {
                     buf.moveToDocumentEnd();
                 }
+                self.setViewport(.bottom);
             },
             .tab_next => try self.switchFocusedBuffer(true, count),
             .tab_prev => try self.switchFocusedBuffer(false, count),
@@ -1826,6 +1360,10 @@ pub const App = struct {
                 self.pending_prefix = .replace_char;
                 try self.setStatus("replace a single character");
             },
+            .replace_mode => {
+                self.mode = .replace;
+                self.visual_select_mode = false;
+            },
             .substitute_char => {
                 try buf.deleteForward();
                 self.mode = .insert;
@@ -1858,6 +1396,14 @@ pub const App = struct {
                 try buf.insertNewline();
                 buf.moveUp();
                 self.mode = .insert;
+            },
+            .insert_line_below => {
+                var i: usize = 0;
+                while (i < count) : (i += 1) try buf.insertBlankLineBelow();
+            },
+            .insert_line_above => {
+                var i: usize = 0;
+                while (i < count) : (i += 1) try buf.insertBlankLineAbove();
             },
             .delete_line => {
                 const removed = try buf.deleteLine(count);
@@ -1998,6 +1544,7 @@ pub const App = struct {
             .reload_config => try self.reloadConfig(),
             .quit => try self.requestQuit(false),
             .force_quit => try self.requestQuit(true),
+            .close_prompt => try self.requestCloseConfirm(),
             .visual_char => self.startVisual(.character),
             .visual_line => self.startVisual(.line),
             .visual_block => {
@@ -2016,6 +1563,7 @@ pub const App = struct {
             .tab_only => try self.tabOnlyCurrent(),
             .tab_move => try self.setStatus("use :tabmove N"),
         }
+        self.syncViewportIfCursorMoved(start_buffer, start_cursor);
         if (text_changed or actionIsEditing(action)) try self.recordChange(start_cursor);
         if (action == .scroll_up or action == .scroll_down or action == .jump_history_forward or action == .jump_history_backward or action == .switch_previous_buffer or action == .repeat_last_command) {
             record_jump = false;
@@ -2120,7 +1668,7 @@ pub const App = struct {
                 .mode = self.visual_mode,
                 .anchor = anchor,
                 .cursor = self.activeBuffer().cursor,
-                .select_mode = self.visual_select_mode,
+                .select_mode = self.mode == .select,
                 .select_restore = self.visual_select_restore,
             };
         }
@@ -2185,7 +1733,7 @@ pub const App = struct {
             try self.setStatus("no previous visual area");
             return;
         };
-        self.mode = .visual;
+        self.mode = if (saved.select_mode) .select else .visual;
         self.visual_mode = saved.mode;
         self.visual_anchor = saved.anchor;
         self.activeBuffer().cursor = saved.cursor;
@@ -2301,6 +1849,16 @@ pub const App = struct {
         const removed = try self.activeBuffer().deleteRange(selection.start, selection.end);
         defer self.allocator.free(removed);
         try self.storeRegisterForDelete(removed);
+        self.exitVisual();
+        self.mode = .insert;
+    }
+
+    fn selectReplaceByte(self: *App, byte: u8) !void {
+        const selection = self.visualSelection() orelse return self.setStatus("no selection");
+        const removed = try self.activeBuffer().deleteRange(selection.start, selection.end);
+        defer self.allocator.free(removed);
+        try self.storeRegisterForDelete(removed);
+        try self.activeBuffer().replaceRangeWithText(selection.start, selection.start, &[_]u8{byte});
         self.exitVisual();
         self.mode = .insert;
     }
@@ -2971,7 +2529,7 @@ pub const App = struct {
     }
 
     fn showReferenceHelp(self: *App) !void {
-        try self.setStatus("help: :help keyword | :w | :wq | :q | :q! | :saveas PATH | :close | :terminal | :edit PATH | :open PATH | :bd | :bn | :bp | :buffer N|PATH | :buffers | :split PATH | :sp PATH | :vs PATH | :tabnew | :tabclose | :tabonly | :tabmove N | :vimgrep /pat/ [path] | :grep PAT [path] | :sort [u] | :!cmd | :cn | :cp | :cope | :ccl | :marks | :delmarks! | :zf | :za | :zo | :zc | :zE | :zr | :zm | :zi | :diffthis | :diffoff | :diffupdate | :diffget | :diffput | ]c/[c | () | n/N | * / # | m/'/` | Ctrl+u/d/i/o/^ | Ctrl+w s/v/n/q/x/+/-/</>/\\/|/_/=/T | :registers");
+        try self.setStatus("help: :help keyword | :w | :wq | :q | :q! | :saveas PATH | :close | :terminal | :edit PATH | :open PATH | :bd | :bn | :bp | :buffer N|PATH | :buffers | :split PATH | :sp PATH | :vs PATH | :tabnew | :tabclose | :tabonly | :tabmove N | :vimgrep /pat/ [path] | :grep PAT [path] | :sort [u] | :!cmd | :cn | :cp | :cope | :ccl | :marks | :delmarks! | :zf | :za | :zo | :zc | :zE | :zr | :zm | :zi | :diffthis | :diffoff | :diffupdate | :diffget | :diffput | ]c/[c | () | n/N | * / # | m/'/` | Ctrl+u/d/i/o/^ | Ctrl+w s/v/n/q/x/+/-/</>/\\/|/_/=/T | leader x | :registers");
     }
 
     fn showHelpForCurrentWord(self: *App) !void {
@@ -3046,9 +2604,37 @@ pub const App = struct {
 
     fn actionIsEditing(action: NormalAction) bool {
         return switch (action) {
-            .delete_char, .replace_char, .substitute_char, .substitute_line, .insert_before, .insert_at_bol, .append_after, .append_eol, .open_below, .open_above, .delete_line, .yank_line, .paste_after, .paste_before, .paste_after_keep_cursor, .paste_before_keep_cursor, .delete_word, .yank_word, .delete_to_eol, .change_word, .change_line, .change_to_eol, .join_line_space, .join_line_nospace, .indent_line, .dedent_line, .toggle_case_char, .toggle_case_word, .lowercase_word, .uppercase_word, .diff_get, .diff_put, .visual_yank, .visual_delete => true,
+            .delete_char, .replace_char, .replace_mode, .substitute_char, .substitute_line, .insert_before, .insert_at_bol, .append_after, .append_eol, .open_below, .open_above, .insert_line_below, .insert_line_above, .delete_line, .yank_line, .paste_after, .paste_before, .paste_after_keep_cursor, .paste_before_keep_cursor, .delete_word, .yank_word, .delete_to_eol, .change_word, .change_line, .change_to_eol, .join_line_space, .join_line_nospace, .indent_line, .dedent_line, .toggle_case_char, .toggle_case_word, .lowercase_word, .uppercase_word, .diff_get, .diff_put, .visual_yank, .visual_delete => true,
             else => false,
         };
+    }
+
+    fn syncViewportIfCursorMoved(self: *App, start_buffer: *buffer_mod.Buffer, start_cursor: buffer_mod.Position) void {
+        const current_buffer = self.activeBuffer();
+        if (current_buffer != start_buffer or current_buffer.cursor.row != start_cursor.row or current_buffer.cursor.col != start_cursor.col) {
+            self.ensureCursorVisible();
+        }
+    }
+
+    fn ensureCursorVisible(self: *App) void {
+        const buf = self.activeBuffer();
+        const line_count = buf.lineCount();
+        if (line_count == 0) {
+            buf.scroll_row = 0;
+            return;
+        }
+        const height = self.last_render_height;
+        if (height == 0 or height >= line_count) {
+            buf.scroll_row = 0;
+            return;
+        }
+        if (buf.cursor.row < buf.scroll_row) {
+            buf.scroll_row = buf.cursor.row;
+        } else if (buf.cursor.row >= buf.scroll_row + height) {
+            buf.scroll_row = buf.cursor.row + 1 - height;
+        }
+        const max_scroll = line_count - height;
+        if (buf.scroll_row > max_scroll) buf.scroll_row = max_scroll;
     }
 
     fn setViewport(self: *App, mode: enum { top, middle, bottom }) void {
@@ -3061,8 +2647,12 @@ pub const App = struct {
             .middle => if (height > 0) cursor_row -| (height / 2) else cursor_row,
             .bottom => if (height > 0) cursor_row -| (height - 1) else cursor_row,
         };
-        buf.scroll_row = if (line_count == 0) 0 else @min(target, line_count - 1);
-        if (line_count == 0) buf.scroll_row = 0;
+        if (line_count == 0 or height == 0) {
+            buf.scroll_row = 0;
+            return;
+        }
+        const max_scroll = if (line_count > height) line_count - height else 0;
+        buf.scroll_row = @min(target, max_scroll);
     }
 
     fn startMacroRecording(self: *App, key: u8) !void {
@@ -3258,6 +2848,35 @@ pub const App = struct {
         }
         self.active_index = 0;
         try self.setStatus("buffer closed");
+    }
+
+    fn requestCloseConfirm(self: *App) !void {
+        const target = self.closeConfirmTarget();
+        self.close_confirm = target;
+        try self.setStatus(self.closeConfirmPrompt(target));
+    }
+
+    fn executeCloseConfirm(self: *App, target: CloseTarget) !void {
+        switch (target) {
+            .split => try self.closeCurrentPane(),
+            .tab => try self.tabCloseCurrent(),
+            .buffer => try self.closeCurrentPane(),
+        }
+    }
+
+    fn closeConfirmTarget(self: *const App) CloseTarget {
+        if (self.split_index != null) return .split;
+        if (self.buffers.items.len > 1) return .tab;
+        return .buffer;
+    }
+
+    fn closeConfirmPrompt(self: *const App, target: CloseTarget) []const u8 {
+        _ = self;
+        return switch (target) {
+            .split => "close split? [y/N]",
+            .tab => "close tab? [y/N]",
+            .buffer => "close buffer? [y/N]",
+        };
     }
 
     fn focusedBufferIndex(self: *const App) usize {
@@ -3609,7 +3228,8 @@ pub const App = struct {
         const buf = self.activeBuffer();
         const step = @max(@as(usize, 1), self.last_render_height / 2);
         const amount = step * count;
-        const max_scroll = if (buf.lineCount() > 0) buf.lineCount() - 1 else 0;
+        const height = self.last_render_height;
+        const max_scroll = if (buf.lineCount() > height) buf.lineCount() - height else 0;
         if (down) {
             buf.scroll_row = @min(buf.scroll_row +| amount, max_scroll);
         } else {
@@ -3663,6 +3283,7 @@ pub const App = struct {
         else
             findWordOccurrence(text, word, cursor_offset, false);
         if (found) |offset| {
+            self.search_forward = forward;
             try self.updateSearchHighlight(&self.search_highlight, word);
             buf.cursor = self.offsetToPosition(text, offset);
         } else {
@@ -3679,12 +3300,14 @@ pub const App = struct {
         const text = try buf.serialize();
         defer self.allocator.free(text);
         const cursor_offset = self.positionToOffset(buf.cursor, text);
-        const found = findSubstringOccurrence(text, needle, cursor_offset, forward);
+        const actual_forward = if (forward) self.search_forward else !self.search_forward;
+        const found = findSubstringOccurrence(text, needle, cursor_offset, actual_forward);
         if (found) |offset| {
             buf.cursor = self.offsetToPosition(text, offset);
         } else {
             try self.setStatus("not found");
         }
+        self.search_forward = actual_forward;
     }
 
     fn openCursorPath(self: *App, link: bool) !void {
@@ -4201,7 +3824,13 @@ pub const App = struct {
     }
 
     fn tabCloseCurrent(self: *App) !void {
+        const had_split = self.split_index != null;
+        const had_multiple_tabs = self.buffers.items.len > 1;
+        const was_dirty = self.activeBuffer().dirty;
         try self.closeCurrentPane();
+        if (!was_dirty and !had_split and had_multiple_tabs) {
+            try self.setStatus("tab closed");
+        }
     }
 
     fn tabOnlyCurrent(self: *App) !void {
@@ -4264,7 +3893,11 @@ pub const App = struct {
             try self.setStatus("help: use :help keyword");
             return;
         }
-        if (normalActionHelp(stripped)) |doc| {
+        if (std.mem.eql(u8, stripped, "leader")) {
+            try self.setStatus("leader mappings live under [keymap.leader]; leader x confirms close of a split, tab, or buffer");
+            return;
+        }
+        if (normalActionHelp(stripped, self.config.keymap.leader, self.config.keymap.leader_bindings.items)) |doc| {
             try self.setStatus(doc);
             return;
         }
@@ -4539,29 +4172,19 @@ pub const App = struct {
         return std.ascii.isAlphanumeric(byte) or byte == '_';
     }
 
-    fn matchesCommand(head: []const u8, aliases: []const []const u8, configured: []const u8) bool {
-        const cfg = if (configured.len > 0 and configured[0] == ':') configured[1..] else configured;
-        if (std.mem.eql(u8, head, cfg) or std.mem.eql(u8, head, configured)) return true;
-        for (aliases) |alias| {
-            if (std.mem.eql(u8, head, alias)) return true;
-        }
-        return false;
-    }
-
-    fn stripVisualRangePrefix(command: []const u8) []const u8 {
-        if (std.mem.startsWith(u8, command, "'<,'>")) return std.mem.trimLeft(u8, command["'<,'>".len..], " \t");
-        if (std.mem.startsWith(u8, command, "'<,'")) return std.mem.trimLeft(u8, command["'<,'".len..], " \t");
-        return command;
-    }
-
     fn executeSearch(self: *App) !void {
         const needle = self.search_buffer.items;
         self.mode = .normal;
         self.clearSearchPreview();
         if (needle.len == 0) return;
         try self.updateSearchHighlight(&self.search_highlight, needle);
-        if (self.activeBuffer().search(needle)) |pos| {
-            self.activeBuffer().cursor = pos;
+        const buf = self.activeBuffer();
+        const text = try buf.serialize();
+        defer self.allocator.free(text);
+        const cursor_offset = self.positionToOffset(buf.cursor, text);
+        const found = findSubstringOccurrence(text, needle, cursor_offset, self.search_forward);
+        if (found) |offset| {
+            buf.cursor = self.offsetToPosition(text, offset);
             try self.setStatus("match found");
         } else {
             try self.setStatus("not found");
@@ -4676,8 +4299,10 @@ pub const App = struct {
 
         const buf = self.activeBuffer();
         const gutter_width: usize = if (self.config.show_line_numbers) 7 else 0;
-        const cursor_row: usize = if (render_height > 0)
-            @min(buf.cursor.row + 1, render_height)
+        const cursor_row: usize = if (render_height > 0) blk: {
+            const visible_row = buf.cursor.row -| buf.scroll_row;
+            break :blk @min(visible_row + 1, render_height);
+        }
         else if (size.rows > 0)
             1
         else
@@ -4765,9 +4390,10 @@ pub const App = struct {
     }
 
     fn renderPane(self: *App, writer: anytype, buffer: *buffer_mod.Buffer, x: usize, width: usize, height: usize, active: bool) !void {
-        const start_row = if (buffer.lines.items.len == 0) 0 else @min(buffer.scroll_row, buffer.lines.items.len - 1);
+        const max_scroll = if (buffer.lines.items.len > height) buffer.lines.items.len - height else 0;
+        const start_row = if (buffer.lines.items.len == 0) 0 else @min(buffer.scroll_row, max_scroll);
         const active_search = self.activeSearchHighlight(active);
-        const active_visual = if (active and self.mode == .visual) self.visualSelection() else null;
+            const active_visual = if (active and (self.mode == .visual or self.mode == .select)) self.visualSelection() else null;
         var screen_row: usize = 0;
         var row = start_row;
         while (screen_row < height and row < buffer.lines.items.len) {
@@ -5045,7 +4671,7 @@ pub const App = struct {
 
     fn promptBarText(self: *App, allocator: std.mem.Allocator) ![]u8 {
         const prompt = if (self.mode == .command) self.command_buffer.items else self.search_buffer.items;
-        const prefix: []const u8 = if (self.mode == .command) ":" else "/";
+        const prefix: []const u8 = if (self.mode == .command) ":" else if (self.search_forward) "/" else "?";
         return try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, prompt });
     }
 
@@ -5171,6 +4797,9 @@ pub const App = struct {
             \\  Ctrl+w w      switch windows
             \\  Ctrl+w q      quit a window
             \\  Ctrl+w T      move split into its own tab
+            \\  [keymap.leader] leader-prefixed normal-mode mappings
+            \\  ]<leader> / [<leader> add a blank line below / above without entering insert mode
+            \\  <leader>x     confirm close of the current split, tab, or buffer
             \\  :reload-config reload TOML config
             \\  :registers     list register contents
             \\  :plugin NAME   invoke a loaded plugin command
@@ -5205,6 +4834,42 @@ fn pressNormalKeys(app: *App, keys: []const u8) !void {
 
 fn setCursor(app: *App, row: usize, col: usize) void {
     app.activeBuffer().cursor = .{ .row = row, .col = col };
+}
+
+const LeaderBindingSeed = struct {
+    sequence: []const u8,
+    action: []const u8,
+};
+
+const exampleLeaderBindings = [_]LeaderBindingSeed{
+    .{ .sequence = "w", .action = "save" },
+    .{ .sequence = "q", .action = "quit" },
+    .{ .sequence = "Q", .action = "force_quit" },
+    .{ .sequence = "s", .action = "window_split_horizontal" },
+    .{ .sequence = "v", .action = "window_split_vertical" },
+    .{ .sequence = "h", .action = "window_left" },
+    .{ .sequence = "j", .action = "window_down" },
+    .{ .sequence = "k", .action = "window_up" },
+    .{ .sequence = "l", .action = "window_right" },
+    .{ .sequence = "t", .action = "tab_next" },
+    .{ .sequence = "T", .action = "tab_prev" },
+    .{ .sequence = "x", .action = "close_prompt" },
+};
+
+fn configureLeader(app: *App, leader: []const u8, bindings: []const LeaderBindingSeed) !void {
+    app.config.allocator.free(app.config.keymap.leader);
+    app.config.keymap.leader = try app.config.allocator.dupe(u8, leader);
+    for (app.config.keymap.leader_bindings.items) |binding| {
+        app.config.allocator.free(binding.sequence);
+        app.config.allocator.free(binding.action);
+    }
+    app.config.keymap.leader_bindings.clearRetainingCapacity();
+    for (bindings) |binding| {
+        try app.config.keymap.leader_bindings.append(.{
+            .sequence = try app.config.allocator.dupe(u8, binding.sequence),
+            .action = try app.config.allocator.dupe(u8, binding.action),
+        });
+    }
 }
 
 const VisualBindingStatus = enum { verified, todo };
@@ -5478,17 +5143,20 @@ test "declaration jumps search current word in the buffer" {
 }
 
 test "normal binding table exposes the implemented prefixes" {
-    try std.testing.expect(normalActionHasPrefix("g"));
-    try std.testing.expect(normalActionHasPrefix("z"));
-    try std.testing.expect(normalActionFor("gd") != null);
-    try std.testing.expect(normalActionFor("gf") != null);
-    try std.testing.expect(normalActionFor("gx") != null);
-    try std.testing.expect(normalActionFor("d0") != null);
-    try std.testing.expect(normalActionFor("(") != null);
-    try std.testing.expect(normalActionFor(")") != null);
-    try std.testing.expect(normalActionFor("n") != null);
-    try std.testing.expect(normalActionFor("N") != null);
-    try std.testing.expect(normalActionFor("K") != null);
+    var cfg = try config_mod.Config.init(std.testing.allocator);
+    defer cfg.deinit();
+
+    try std.testing.expect(normalActionHasPrefix("g", cfg.keymap.leader, cfg.keymap.leader_bindings.items));
+    try std.testing.expect(normalActionHasPrefix("z", cfg.keymap.leader, cfg.keymap.leader_bindings.items));
+    try std.testing.expect(normalActionFor("gd", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
+    try std.testing.expect(normalActionFor("gf", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
+    try std.testing.expect(normalActionFor("gx", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
+    try std.testing.expect(normalActionFor("d0", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
+    try std.testing.expect(normalActionFor("(", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
+    try std.testing.expect(normalActionFor(")", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
+    try std.testing.expect(normalActionFor("n", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
+    try std.testing.expect(normalActionFor("N", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
+    try std.testing.expect(normalActionFor("K", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
 }
 
 test "exact multi-key bindings execute once their sequence is complete" {
@@ -6164,6 +5832,57 @@ test "visual control keys toggle select mode and exit visual mode" {
     try std.testing.expectEqual(Mode.visual, app.mode);
 }
 
+test "select mode typing replaces the selection and enters insert mode" {
+    var app = try makeTestApp(std.testing.allocator, "alpha");
+    defer app.deinit();
+
+    try app.handleNormalByte('v');
+    try app.handleVisualByte('l');
+    try app.handleVisualByte('l');
+    try app.handleVisualByte(0x07);
+    try std.testing.expectEqual(Mode.select, app.mode);
+    try app.handleByte('X', std.fs.File.stdin());
+    try std.testing.expectEqual(Mode.insert, app.mode);
+
+    const text = try app.activeBuffer().serialize();
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Xpha", text);
+}
+
+test "replace mode overwrites characters in place" {
+    var app = try makeTestApp(std.testing.allocator, "abc");
+    defer app.deinit();
+
+    try app.handleNormalByte('R');
+    try std.testing.expectEqual(Mode.replace, app.mode);
+    try app.handleByte('X', std.fs.File.stdin());
+    try app.handleByte('Y', std.fs.File.stdin());
+    try std.testing.expectEqual(Mode.replace, app.mode);
+
+    const text = try app.activeBuffer().serialize();
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("XYc", text);
+}
+
+test "reverse search uses ? and repeats with n and N" {
+    var app = try makeTestApp(std.testing.allocator, "one two one");
+    defer app.deinit();
+
+    setCursor(&app, 0, 11);
+    try app.handleNormalByte('?');
+    try app.handleByte('o', std.fs.File.stdin());
+    try app.handleByte('n', std.fs.File.stdin());
+    try app.handleByte('e', std.fs.File.stdin());
+    try app.handleByte('\n', std.fs.File.stdin());
+    try std.testing.expectEqual(@as(usize, 8), app.activeBuffer().cursor.col);
+
+    try pressNormalKeys(&app, "n");
+    try std.testing.expectEqual(@as(usize, 0), app.activeBuffer().cursor.col);
+
+    try pressNormalKeys(&app, "N");
+    try std.testing.expectEqual(@as(usize, 8), app.activeBuffer().cursor.col);
+}
+
 test "visual binding checklist tracks verified and todo entries" {
     var verified: usize = 0;
     var todo: usize = 0;
@@ -6477,6 +6196,16 @@ test "status and prompt bars compose their text" {
     defer std.testing.allocator.free(visual_status);
     try std.testing.expect(std.mem.indexOf(u8, visual_status, "V VISUAL") != null);
 
+    app.mode = .select;
+    const select_status = try app.statusBarText(std.testing.allocator);
+    defer std.testing.allocator.free(select_status);
+    try std.testing.expect(std.mem.indexOf(u8, select_status, "V SELECT") != null);
+
+    app.mode = .replace;
+    const replace_status = try app.statusBarText(std.testing.allocator);
+    defer std.testing.allocator.free(replace_status);
+    try std.testing.expect(std.mem.indexOf(u8, replace_status, "I REPLACE") != null);
+
     app.mode = .command;
     try app.command_buffer.appendSlice("w");
     const command = try app.promptBarText(std.testing.allocator);
@@ -6486,9 +6215,10 @@ test "status and prompt bars compose their text" {
     app.mode = .search;
     app.search_buffer.clearRetainingCapacity();
     try app.search_buffer.appendSlice("needle");
+    app.search_forward = false;
     const search = try app.promptBarText(std.testing.allocator);
     defer std.testing.allocator.free(search);
-    try std.testing.expectEqualStrings("/needle", search);
+    try std.testing.expectEqualStrings("?needle", search);
 }
 
 test "status bar right side trims to keep a single line on narrow widths" {
@@ -6524,18 +6254,6 @@ test "default status bar icon uses nerd font glyph" {
     try std.testing.expect(std.mem.startsWith(u8, status, "\u{e795} NORMAL"));
 }
 
-test "theme resolution keeps beam default and recognizes nvchad" {
-    const beam_theme = Theme.resolve("beam", "terminal", false, 100);
-    const fallback_theme = Theme.resolve("unknown", "#101010", true, 80);
-    const nvchad_theme = Theme.resolve("nvchad", "81", false, 100);
-    try std.testing.expectEqualStrings("beam", beam_theme.name);
-    try std.testing.expectEqualStrings("beam", fallback_theme.name);
-    try std.testing.expectEqualStrings("nvchad", nvchad_theme.name);
-    try std.testing.expect(beam_theme.accent != nvchad_theme.accent);
-    try std.testing.expect(beam_theme.content_bg == null);
-    try std.testing.expect(fallback_theme.content_bg != null);
-}
-
 test "shift and case commands edit the current line and word" {
     var app = try makeTestApp(std.testing.allocator, "alpha\nMiXeD");
     defer app.deinit();
@@ -6563,6 +6281,179 @@ test "shift and case commands edit the current line and word" {
     try std.testing.expectEqualStrings("mixed", app.activeBuffer().lines.items[1]);
 }
 
+test "leader line bindings add blank lines without entering insert mode" {
+    var app = try makeTestApp(std.testing.allocator, "alpha\nbeta");
+    defer app.deinit();
+
+    setCursor(&app, 0, 5);
+    try configureLeader(&app, " ", &.{
+        .{ .sequence = "j", .action = "insert_line_below" },
+        .{ .sequence = "k", .action = "insert_line_above" },
+    });
+    try pressNormalKeys(&app, " j");
+    try std.testing.expectEqual(Mode.normal, app.mode);
+    try std.testing.expectEqual(@as(usize, 1), app.activeBuffer().cursor.row);
+    try std.testing.expectEqual(@as(usize, 0), app.activeBuffer().cursor.col);
+    try std.testing.expectEqualStrings("", app.activeBuffer().lines.items[1]);
+
+    var app2 = try makeTestApp(std.testing.allocator, "alpha\nbeta");
+    defer app2.deinit();
+
+    try configureLeader(&app2, " ", &.{});
+    setCursor(&app2, 1, 0);
+    try pressNormalKeys(&app2, "[ ");
+    try std.testing.expectEqual(Mode.normal, app2.mode);
+    try std.testing.expectEqual(@as(usize, 1), app2.activeBuffer().cursor.row);
+    try std.testing.expectEqual(@as(usize, 0), app2.activeBuffer().cursor.col);
+    try std.testing.expectEqualStrings("", app2.activeBuffer().lines.items[1]);
+}
+
+test "leader prefixes stay pending until they resolve or fail" {
+    var app = try makeTestApp(std.testing.allocator, "alpha");
+    defer app.deinit();
+    try configureLeader(&app, " ", &.{
+        .{ .sequence = "w", .action = "save" },
+    });
+
+    try app.handleNormalByte(' ');
+    try std.testing.expectEqual(@as(usize, 1), app.normal_sequence.items.len);
+    try std.testing.expectEqual(Mode.normal, app.mode);
+
+    try app.handleNormalByte('x');
+    try std.testing.expectEqual(@as(usize, 0), app.normal_sequence.items.len);
+    try std.testing.expectEqualStrings("unknown command", app.status.items);
+}
+
+test "leader x confirms close targets and rejects cancellation" {
+    var split_app = try makeTestApp(std.testing.allocator, "left");
+    defer split_app.deinit();
+    try configureLeader(&split_app, " ", &exampleLeaderBindings);
+    try pressNormalKeys(&split_app, " s");
+    try std.testing.expect(split_app.split_index != null);
+
+    try pressNormalKeys(&split_app, " x");
+    try std.testing.expectEqualStrings("close split? [y/N]", split_app.status.items);
+    try std.testing.expectEqual(@as(?App.CloseTarget, .split), split_app.close_confirm);
+    try split_app.handleNormalByte('n');
+    try std.testing.expect(split_app.split_index != null);
+    try std.testing.expectEqual(@as(?App.CloseTarget, null), split_app.close_confirm);
+    try std.testing.expectEqualStrings("close cancelled", split_app.status.items);
+
+    try pressNormalKeys(&split_app, " x");
+    try split_app.handleNormalByte('y');
+    try std.testing.expect(split_app.split_index == null);
+    try std.testing.expectEqualStrings("pane closed", split_app.status.items);
+
+    var tab_app = try makeTestApp(std.testing.allocator, "one");
+    defer tab_app.deinit();
+    try configureLeader(&tab_app, " ", &exampleLeaderBindings);
+    {
+        var buf = try buffer_mod.Buffer.initEmpty(std.testing.allocator);
+        errdefer buf.deinit();
+        try buf.setText("two");
+        try tab_app.buffers.append(buf);
+    }
+    try pressNormalKeys(&tab_app, " x");
+    try std.testing.expectEqualStrings("close tab? [y/N]", tab_app.status.items);
+    try std.testing.expectEqual(@as(?App.CloseTarget, .tab), tab_app.close_confirm);
+    try tab_app.handleNormalByte(0x1b);
+    try std.testing.expectEqual(@as(?App.CloseTarget, null), tab_app.close_confirm);
+    try std.testing.expectEqual(@as(usize, 2), tab_app.buffers.items.len);
+    try std.testing.expectEqualStrings("close cancelled", tab_app.status.items);
+
+    try pressNormalKeys(&tab_app, " x");
+    try tab_app.handleNormalByte('y');
+    try std.testing.expectEqual(@as(usize, 1), tab_app.buffers.items.len);
+    try std.testing.expectEqualStrings("tab closed", tab_app.status.items);
+
+    var buffer_app = try makeTestApp(std.testing.allocator, "alpha");
+    defer buffer_app.deinit();
+    try configureLeader(&buffer_app, " ", &exampleLeaderBindings);
+    try pressNormalKeys(&buffer_app, " x");
+    try std.testing.expectEqualStrings("close buffer? [y/N]", buffer_app.status.items);
+    try std.testing.expectEqual(@as(?App.CloseTarget, .buffer), buffer_app.close_confirm);
+    try buffer_app.handleNormalByte('y');
+    try std.testing.expectEqual(@as(usize, 1), buffer_app.buffers.items.len);
+    try std.testing.expectEqualStrings("", buffer_app.activeBuffer().currentLine());
+    try std.testing.expectEqualStrings("buffer closed", buffer_app.status.items);
+}
+
+test "example leader bindings dispatch end to end" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_cwd = try std.process.getCwdAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(old_cwd);
+    try tmp.dir.setAsCwd();
+    defer std.process.changeCurDir(old_cwd) catch {};
+
+    {
+        var f = try tmp.dir.createFile("leader-save.txt", .{});
+        defer f.close();
+        try f.writeAll("alpha");
+    }
+
+    var save_app = try makeTestApp(std.testing.allocator, "alpha");
+    defer save_app.deinit();
+    try configureLeader(&save_app, " ", &exampleLeaderBindings);
+    try save_app.activeBuffer().replacePath("leader-save.txt");
+    try save_app.activeBuffer().insertByte('!');
+    try pressNormalKeys(&save_app, " w");
+    const saved = try std.fs.cwd().readFileAlloc(std.testing.allocator, "leader-save.txt", 1 << 20);
+    defer std.testing.allocator.free(saved);
+    try std.testing.expectEqualStrings("!alpha", saved);
+    try std.testing.expect(!save_app.activeBuffer().dirty);
+
+    var quit_app = try makeTestApp(std.testing.allocator, "alpha");
+    defer quit_app.deinit();
+    try configureLeader(&quit_app, " ", &exampleLeaderBindings);
+    try pressNormalKeys(&quit_app, " q");
+    try std.testing.expect(quit_app.should_quit);
+
+    var force_quit_app = try makeTestApp(std.testing.allocator, "alpha");
+    defer force_quit_app.deinit();
+    try configureLeader(&force_quit_app, " ", &exampleLeaderBindings);
+    try force_quit_app.activeBuffer().insertByte('!');
+    try pressNormalKeys(&force_quit_app, " Q");
+    try std.testing.expect(force_quit_app.should_quit);
+
+    var split_app = try makeTestApp(std.testing.allocator, "left");
+    defer split_app.deinit();
+    try configureLeader(&split_app, " ", &exampleLeaderBindings);
+    try pressNormalKeys(&split_app, " s");
+    try std.testing.expect(split_app.split_index != null);
+    try std.testing.expectEqual(.right, split_app.split_focus);
+    try pressNormalKeys(&split_app, " h");
+    try std.testing.expectEqual(.left, split_app.split_focus);
+    try pressNormalKeys(&split_app, " l");
+    try std.testing.expectEqual(.right, split_app.split_focus);
+    try pressNormalKeys(&split_app, " j");
+    try std.testing.expectEqual(.right, split_app.split_focus);
+    try pressNormalKeys(&split_app, " k");
+    try std.testing.expectEqual(.left, split_app.split_focus);
+
+    var split_app_v = try makeTestApp(std.testing.allocator, "left");
+    defer split_app_v.deinit();
+    try configureLeader(&split_app_v, " ", &exampleLeaderBindings);
+    try pressNormalKeys(&split_app_v, " v");
+    try std.testing.expect(split_app_v.split_index != null);
+    try std.testing.expectEqual(.right, split_app_v.split_focus);
+
+    var tab_app = try makeTestApp(std.testing.allocator, "one");
+    defer tab_app.deinit();
+    try configureLeader(&tab_app, " ", &exampleLeaderBindings);
+    {
+        var buf = try buffer_mod.Buffer.initEmpty(std.testing.allocator);
+        errdefer buf.deinit();
+        try buf.setText("two");
+        try tab_app.buffers.append(buf);
+    }
+    try pressNormalKeys(&tab_app, " t");
+    try std.testing.expectEqual(@as(usize, 1), tab_app.active_index);
+    try pressNormalKeys(&tab_app, " T");
+    try std.testing.expectEqual(@as(usize, 0), tab_app.active_index);
+}
+
 test "viewport commands update scroll position" {
     var app = try makeTestApp(std.testing.allocator, "one\ntwo\nthree\nfour\nfive");
     defer app.deinit();
@@ -6575,6 +6466,46 @@ test "viewport commands update scroll position" {
     try std.testing.expectEqual(@as(usize, 1), app.activeBuffer().scroll_row);
     try pressNormalKeys(&app, "zz");
     try std.testing.expectEqual(@as(usize, 2), app.activeBuffer().scroll_row);
+}
+
+test "viewport scroll clamps to the last full screen" {
+    var app = try makeTestApp(std.testing.allocator, "one\ntwo\nthree\nfour\nfive");
+    defer app.deinit();
+
+    app.last_render_height = 3;
+    setCursor(&app, 4, 0);
+    try app.performNormalAction(.viewport_bottom, 1);
+    try std.testing.expectEqual(@as(usize, 2), app.activeBuffer().scroll_row);
+
+    try app.performNormalAction(.scroll_down, 10);
+    try std.testing.expectEqual(@as(usize, 2), app.activeBuffer().scroll_row);
+}
+
+test "cursor motion keeps the cursor visible" {
+    var app = try makeTestApp(std.testing.allocator, "one\ntwo\nthree\nfour\nfive");
+    defer app.deinit();
+
+    app.last_render_height = 3;
+    setCursor(&app, 0, 0);
+    try pressNormalKeys(&app, "jjjj");
+    try std.testing.expectEqual(@as(usize, 4), app.activeBuffer().cursor.row);
+    try std.testing.expectEqual(@as(usize, 2), app.activeBuffer().scroll_row);
+}
+
+test "gg and G pin the viewport to the top and bottom" {
+    var app = try makeTestApp(std.testing.allocator, "one\ntwo\nthree\nfour\nfive");
+    defer app.deinit();
+
+    app.last_render_height = 3;
+    setCursor(&app, 2, 0);
+    try pressNormalKeys(&app, "G");
+    try std.testing.expectEqual(@as(usize, 4), app.activeBuffer().cursor.row);
+    try std.testing.expectEqual(@as(usize, 2), app.activeBuffer().scroll_row);
+
+    setCursor(&app, 4, 0);
+    try pressNormalKeys(&app, "gg");
+    try std.testing.expectEqual(@as(usize, 0), app.activeBuffer().cursor.row);
+    try std.testing.expectEqual(@as(usize, 0), app.activeBuffer().scroll_row);
 }
 
 test "macro record and playback replays recorded keys" {
@@ -6610,27 +6541,7 @@ test "jump and change commands populate their history lists" {
 }
 
 test "editor command aliases" {
-    try std.testing.expect(App.matchesCommand("help", &.{ "h", "help" }, ":help"));
-    try std.testing.expect(App.matchesCommand("wq", &.{ "wq", "x" }, ":wq"));
-    try std.testing.expect(App.matchesCommand("q!", &.{"q!"}, ":q!"));
-}
-
-test "normal binding table" {
-    try std.testing.expect(normalActionHasPrefix("g"));
-    try std.testing.expect(normalActionHasPrefix("c"));
-    try std.testing.expect(normalActionFor("gg") != null);
-    try std.testing.expect(normalActionFor("gt") != null);
-    try std.testing.expect(normalActionFor("gT") != null);
-    try std.testing.expect(normalActionFor("\x17s") != null);
-    try std.testing.expect(normalActionFor("\x17=") != null);
-    try std.testing.expect(normalActionFor("\x17w") != null);
-    try std.testing.expect(normalActionFor("\x17T") != null);
-    try std.testing.expect(normalActionFor("zf") != null);
-    try std.testing.expect(normalActionFor("zE") != null);
-    try std.testing.expect(normalActionFor("do") != null);
-    try std.testing.expect(normalActionFor("dp") != null);
-    try std.testing.expect(normalActionFor("]c") != null);
-    try std.testing.expect(normalActionFor("[c") != null);
-    try std.testing.expect(normalActionFor("ciw") != null);
-    try std.testing.expect(normalActionFor("K") != null);
+    try std.testing.expect(matchesCommand("help", &.{ "h", "help" }, ":help"));
+    try std.testing.expect(matchesCommand("wq", &.{ "wq", "x" }, ":wq"));
+    try std.testing.expect(matchesCommand("q!", &.{"q!"}, ":q!"));
 }

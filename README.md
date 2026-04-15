@@ -78,13 +78,18 @@ The example config in `examples/beam.toml` shows the supported top-level section
 
 - `[editor]` for editor behavior such as tab width, line numbers, status bar settings, theme, and appearance
 - `[plugins]` for plugin loading options
-- `[keymap]` for command remapping
+- `[keymap]` for command remapping and the leader prefix
+- `[keymap.leader]` for leader-prefixed normal-mode mappings
+
+The `leader` value can be any byte sequence, and the `[keymap.leader]` table maps the keys that follow it to direct editor actions.
+The sample config includes `x = "close_prompt"` so `leader x` asks before closing a split, tab, or buffer.
 
 Key defaults to know:
 
 - config file default: `beam.toml`
 - plugin directory default: `.beam/plugins`
 - plugin auto-start default: enabled
+- leader default: `:`
 
 The sample config enables the `hello` plugin. To use it as-is, place the plugin file under the configured plugin directory, for example:
 
