@@ -1,0 +1,6 @@
+.DS_Store
+._*
+.zig-cache/
+.zig-cache-global/
+.zig-cache-local/
+zig-out/

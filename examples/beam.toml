@@ -1,0 +1,32 @@
+[editor]
+tab_width = 4
+show_line_numbers = true
+status_bar = true
+# "default" uses the Beam Nerd Font logo glyph.
+status_bar_icon = "default"
+status_bar_insert_icon = "󰘶"
+status_bar_visual_icon = "󰒉"
+split_ratio = 50
+background_color = "terminal"
+blur = false
+opacity = 100
+theme = "beam"
+
+[plugins]
+plugin_dir = ".beam/plugins"
+auto_start = true
+enabled = ["hello"]
+
+[keymap]
+leader = ":"
+help = ":help"
+save = ":w"
+save_as = ":saveas"
+close = ":close"
+terminal = ":terminal"
+quit = ":q"
+force_quit = ":q!"
+split = ":split"
+open = ":open"
+reload = ":reload-config"
+registers = ":registers"
