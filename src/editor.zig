@@ -65,6 +65,47 @@ const QuickfixEntry = struct {
 
 const SplitFocus = enum { left, right };
 
+const OperatorKind = enum { delete, change, yank };
+
+const MotionSpec = union(enum) {
+    line_start,
+    line_nonblank,
+    line_last_nonblank,
+    line_end,
+    doc_start,
+    doc_middle,
+    doc_end,
+    current_line,
+    left,
+    down,
+    up,
+    right,
+    word_forward: bool,
+    word_backward: bool,
+    word_end_forward: bool,
+    word_end_backward: bool,
+    paragraph_forward,
+    paragraph_backward,
+    sentence_forward,
+    sentence_backward,
+    matching_character,
+    find_forward: struct { needle: u8, before: bool },
+    find_backward: struct { needle: u8, before: bool },
+    text_object: struct { byte: u8, inner: bool },
+};
+
+const OperatorRecipe = struct {
+    kind: OperatorKind,
+    operator_count: usize = 1,
+    motion_count: usize = 1,
+    motion: MotionSpec,
+};
+
+const RepeatableEdit = union(enum) {
+    action: struct { action: NormalAction, count: usize },
+    operator: OperatorRecipe,
+};
+
 // First-pass gaps we will tackle after the redesigned bar lands.
 const status_bar_todo = [_][]const u8{
     "git branch / repository state",
@@ -95,6 +136,9 @@ pub const App = struct {
     file_to_open: ?[]u8 = null,
     draining_plugin_actions: bool = false,
     interactive_command_hook: ?*const fn (self: *App, argv: []const []const u8) bool = null,
+    clipboard_get_hook: ?*const fn (self: *App) ?[]const u8 = null,
+    clipboard_set_hook: ?*const fn (self: *App, text: []const u8) bool = null,
+    clipboard_contents: ?[]u8 = null,
     last_interactive_command: ?[]u8 = null,
     jump_history: std.array_list.Managed(buffer_mod.Position),
     jump_history_index: ?usize = null,
@@ -126,8 +170,7 @@ pub const App = struct {
     search_preview_highlight: ?[]u8 = null,
     search_forward: bool = true,
     last_find: ?FindState = null,
-    last_normal_action: ?NormalAction = null,
-    last_normal_count: usize = 1,
+    last_repeatable_edit: ?RepeatableEdit = null,
     registers: RegisterStore,
     marks: [26]?buffer_mod.Position = [_]?buffer_mod.Position{null} ** 26,
 
@@ -156,8 +199,13 @@ pub const App = struct {
     };
 
     const RegisterStore = struct {
+        const RegisterEntry = struct {
+            text: []u8,
+            linewise: bool = false,
+        };
+
         allocator: std.mem.Allocator,
-        values: [256]?[]u8 = [_]?[]u8{null} ** 256,
+        values: [256]?RegisterEntry = [_]?RegisterEntry{null} ** 256,
 
         fn init(allocator: std.mem.Allocator) RegisterStore {
             return .{ .allocator = allocator };
@@ -165,17 +213,29 @@ pub const App = struct {
 
         fn deinit(self: *RegisterStore) void {
             for (self.values) |item| {
-                if (item) |value| self.allocator.free(value);
+                if (item) |value| self.allocator.free(value.text);
             }
         }
 
         fn set(self: *RegisterStore, key: u8, value: []const u8) !void {
-            if (self.values[key]) |existing| self.allocator.free(existing);
-            self.values[key] = try self.allocator.dupe(u8, value);
+            try self.setWithKind(key, value, false);
+        }
+
+        fn setWithKind(self: *RegisterStore, key: u8, value: []const u8, linewise: bool) !void {
+            if (self.values[key]) |existing| self.allocator.free(existing.text);
+            self.values[key] = .{
+                .text = try self.allocator.dupe(u8, value),
+                .linewise = linewise,
+            };
         }
 
         fn get(self: *const RegisterStore, key: u8) ?[]const u8 {
-            return self.values[key];
+            if (self.values[key]) |entry| return entry.text;
+            return null;
+        }
+
+        fn isLinewise(self: *const RegisterStore, key: u8) bool {
+            return if (self.values[key]) |entry| entry.linewise else false;
         }
 
         fn formatSummary(self: *const RegisterStore, allocator: std.mem.Allocator) ![]u8 {
@@ -186,7 +246,7 @@ pub const App = struct {
                 if (item) |value| {
                     any = true;
                     if (out.items.len > 0) try out.appendSlice(" | ");
-                    const piece = try std.fmt.allocPrint(allocator, "\"{c}={s}", .{ @as(u8, @intCast(idx)), value });
+                    const piece = try std.fmt.allocPrint(allocator, "\"{c}={s}", .{ @as(u8, @intCast(idx)), value.text });
                     defer allocator.free(piece);
                     try out.appendSlice(piece);
                 }
@@ -279,6 +339,7 @@ pub const App = struct {
         if (self.search_highlight) |needle| self.allocator.free(needle);
         if (self.search_preview_highlight) |needle| self.allocator.free(needle);
         if (self.last_interactive_command) |cmd| self.allocator.free(cmd);
+        if (self.clipboard_contents) |text| self.allocator.free(text);
         if (self.visual_block_insert) |*block| {
             block.text.deinit();
             self.visual_block_insert = null;
@@ -961,6 +1022,26 @@ pub const App = struct {
                         try self.restoreLastVisual();
                         return;
                     },
+                    'g' => {
+                        self.activeBuffer().moveToDocumentStart();
+                        return;
+                    },
+                    '0' => {
+                        self.activeBuffer().moveLineStart();
+                        return;
+                    },
+                    '^' => {
+                        self.activeBuffer().moveToFirstNonBlank();
+                        return;
+                    },
+                    '$' => {
+                        self.activeBuffer().moveLineEnd();
+                        return;
+                    },
+                    '_' => {
+                        self.activeBuffer().moveToLastNonBlank();
+                        return;
+                    },
                     'J' => {
                         try self.visualJoin(false);
                         return;
@@ -1057,6 +1138,13 @@ pub const App = struct {
             'B' => self.activeBuffer().moveWordBackward(true),
             'e' => self.activeBuffer().moveWordEnd(false),
             'E' => self.activeBuffer().moveWordEnd(true),
+            'G' => self.activeBuffer().moveToDocumentEnd(),
+            'H' => self.activeBuffer().moveToDocumentStart(),
+            'M' => {
+                const middle = if (self.activeBuffer().lineCount() > 0) (self.activeBuffer().lineCount() - 1) / 2 else 0;
+                self.activeBuffer().moveToLine(middle);
+            },
+            'L' => self.activeBuffer().moveToDocumentEnd(),
             'o', 'O' => self.swapVisualCorners(),
             'y' => {
                 try self.visualYank();
@@ -1066,8 +1154,8 @@ pub const App = struct {
                 try self.visualYank();
                 self.exitVisual();
             },
-            'p' => try self.visualPaste(false, false),
-            'P' => try self.visualPaste(true, true),
+            'p' => try self.visualPaste(),
+            'P' => try self.visualPaste(),
             'd', 'D', 'x', 'X' => {
                 try self.visualDelete();
                 self.exitVisual();
@@ -1181,12 +1269,12 @@ pub const App = struct {
             const count = self.consumeCount();
             self.normal_sequence.clearRetainingCapacity();
             try self.performNormalAction(action, count);
-            if (action != .repeat_last_command) {
-                self.last_normal_action = action;
-                self.last_normal_count = count;
-            }
             return;
         }
+
+        if (try self.executeCompoundEditIfReady(sequence)) return;
+
+        if (self.compoundEditHasPrefix(sequence)) return;
 
         if (normalActionHasPrefix(sequence, self.config.keymap.leader, self.config.keymap.leader_bindings.items)) {
             return;
@@ -1408,19 +1496,19 @@ pub const App = struct {
             .delete_line => {
                 const removed = try buf.deleteLine(count);
                 defer self.allocator.free(removed);
-                try self.storeRegisterForDelete(removed);
+                try self.storeRegisterForDelete(removed, true);
                 try self.setStatus("deleted line");
             },
             .delete_to_bol => {
                 const removed = try buf.deleteToLineStart();
                 defer self.allocator.free(removed);
-                try self.storeRegisterForDelete(removed);
+                try self.storeRegisterForDelete(removed, false);
                 try self.setStatus("deleted line start");
             },
             .yank_line => {
                 const yanked = try buf.yankLine(count);
                 defer self.allocator.free(yanked);
-                try self.storeRegisterForYank(yanked);
+                try self.storeRegisterForYank(yanked, true);
                 try self.setStatus("yanked line");
             },
             .paste_after => {
@@ -1458,34 +1546,41 @@ pub const App = struct {
             .delete_word => {
                 const removed = try buf.deleteCurrentWord();
                 defer self.allocator.free(removed);
-                try self.storeRegisterForDelete(removed);
+                try self.storeRegisterForDelete(removed, false);
             },
             .change_word => {
                 const removed = try buf.deleteCurrentWord();
                 defer self.allocator.free(removed);
-                try self.storeRegisterForDelete(removed);
+                try self.storeRegisterForDelete(removed, false);
                 self.mode = .insert;
             },
             .change_line => {
                 const removed = try buf.deleteLine(count);
                 defer self.allocator.free(removed);
-                try self.storeRegisterForDelete(removed);
+                try self.storeRegisterForDelete(removed, true);
                 self.mode = .insert;
             },
             .change_to_eol => {
                 const removed = try buf.deleteToLineEnd();
                 defer self.allocator.free(removed);
-                try self.storeRegisterForDelete(removed);
+                try self.storeRegisterForDelete(removed, false);
                 self.mode = .insert;
             },
             .yank_word => {
                 const word = buf.currentWord();
-                try self.storeRegisterForYank(word);
+                try self.storeRegisterForYank(word, false);
+            },
+            .yank_to_eol => {
+                const line = buf.currentLine();
+                const start_col = @min(buf.cursor.col, line.len);
+                const yanked = try self.allocator.dupe(u8, line[start_col..]);
+                defer self.allocator.free(yanked);
+                try self.storeRegisterForYank(yanked, false);
             },
             .delete_to_eol => {
                 const removed = try buf.deleteToLineEnd();
                 defer self.allocator.free(removed);
-                try self.storeRegisterForDelete(removed);
+                try self.storeRegisterForDelete(removed, false);
             },
             .indent_line => {
                 try self.shiftCurrentLine(true, count);
@@ -1571,6 +1666,270 @@ pub const App = struct {
         const end_cursor = self.activeBuffer().cursor;
         if (record_jump and (end_cursor.row != start_cursor.row or end_cursor.col != start_cursor.col)) try self.recordJump(start_cursor);
         self.pending_register = null;
+        if (actionIsRepeatableChange(action)) {
+            self.last_repeatable_edit = .{ .action = .{ .action = action, .count = count } };
+        }
+    }
+
+    const CompoundParseStatus = enum { complete, prefix, invalid };
+    const ParsedMotion = struct {
+        motion: MotionSpec,
+        count: usize = 1,
+    };
+
+    const CompoundParseResult = struct {
+        status: CompoundParseStatus,
+        recipe: ?OperatorRecipe = null,
+    };
+
+    fn executeCompoundEditIfReady(self: *App, sequence: []const u8) !bool {
+        const parsed = try self.parseCompoundEdit(sequence);
+        switch (parsed.status) {
+            .complete => {
+                const count = self.consumeCount();
+                self.normal_sequence.clearRetainingCapacity();
+                var recipe = parsed.recipe.?;
+                recipe.operator_count *= count;
+                try self.performOperatorRecipe(recipe);
+                return true;
+            },
+            .prefix => return false,
+            .invalid => return false,
+        }
+    }
+
+    fn compoundEditHasPrefix(self: *App, sequence: []const u8) bool {
+        const parsed = self.parseCompoundEdit(sequence) catch return false;
+        return parsed.status == .prefix;
+    }
+
+    fn parseCompoundEdit(self: *App, sequence: []const u8) !CompoundParseResult {
+        if (sequence.len == 0) return .{ .status = .prefix };
+        const operator = switch (sequence[0]) {
+            'd' => OperatorKind.delete,
+            'c' => OperatorKind.change,
+            'y' => OperatorKind.yank,
+            else => return .{ .status = .invalid },
+        };
+        if (sequence.len == 1) return .{ .status = .prefix };
+        const motion = try self.parseMotionSequence(sequence[1..]);
+        return switch (motion.status) {
+            .complete => .{
+                .status = .complete,
+                .recipe = .{
+                    .kind = operator,
+                    .motion_count = motion.motion.?.count,
+                    .motion = motion.motion.?.motion,
+                },
+            },
+            .prefix => .{ .status = .prefix },
+            .invalid => .{ .status = .invalid },
+        };
+    }
+
+    fn parseMotionSequence(self: *App, sequence: []const u8) !struct { status: CompoundParseStatus, motion: ?ParsedMotion = null } {
+        if (sequence.len == 0) return .{ .status = .prefix };
+
+        if (sequence[0] >= '1' and sequence[0] <= '9') {
+            var idx: usize = 0;
+            var count: usize = 0;
+            while (idx < sequence.len and std.ascii.isDigit(sequence[idx])) : (idx += 1) {
+                count = count * 10 + @as(usize, sequence[idx] - '0');
+            }
+            if (idx == sequence.len) return .{ .status = .prefix };
+            const tail = try self.parseMotionSequence(sequence[idx..]);
+            return switch (tail.status) {
+                .complete => .{
+                    .status = .complete,
+                    .motion = .{
+                        .motion = tail.motion.?.motion,
+                        .count = @max(@as(usize, 1), count) * tail.motion.?.count,
+                    },
+                },
+                .prefix => .{ .status = .prefix },
+                .invalid => .{ .status = .invalid },
+            };
+        }
+
+        return switch (sequence[0]) {
+            'h' => .{ .status = .complete, .motion = .{ .motion = .left } },
+            'j' => .{ .status = .complete, .motion = .{ .motion = .down } },
+            'k' => .{ .status = .complete, .motion = .{ .motion = .up } },
+            'l' => .{ .status = .complete, .motion = .{ .motion = .right } },
+            '0' => .{ .status = .complete, .motion = .{ .motion = .line_start } },
+            '^' => .{ .status = .complete, .motion = .{ .motion = .line_nonblank } },
+            '$' => .{ .status = .complete, .motion = .{ .motion = .line_end } },
+            'w' => .{ .status = .complete, .motion = .{ .motion = .{ .word_forward = false } } },
+            'W' => .{ .status = .complete, .motion = .{ .motion = .{ .word_forward = true } } },
+            'b' => .{ .status = .complete, .motion = .{ .motion = .{ .word_backward = false } } },
+            'B' => .{ .status = .complete, .motion = .{ .motion = .{ .word_backward = true } } },
+            'e' => .{ .status = .complete, .motion = .{ .motion = .{ .word_end_forward = false } } },
+            'E' => .{ .status = .complete, .motion = .{ .motion = .{ .word_end_forward = true } } },
+            'g' => {
+                if (sequence.len < 2) return .{ .status = .prefix };
+                return switch (sequence[1]) {
+                    'g' => .{ .status = .complete, .motion = .{ .motion = .doc_start } },
+                    '_' => .{ .status = .complete, .motion = .{ .motion = .line_last_nonblank } },
+                    '0' => .{ .status = .complete, .motion = .{ .motion = .line_start } },
+                    '^' => .{ .status = .complete, .motion = .{ .motion = .line_nonblank } },
+                    '$' => .{ .status = .complete, .motion = .{ .motion = .line_end } },
+                    'e' => .{ .status = .complete, .motion = .{ .motion = .{ .word_end_backward = false } } },
+                    'E' => .{ .status = .complete, .motion = .{ .motion = .{ .word_end_backward = true } } },
+                    else => .{ .status = .invalid },
+                };
+            },
+            'G' => .{ .status = .complete, .motion = .{ .motion = .doc_end } },
+            'H' => .{ .status = .complete, .motion = .{ .motion = .doc_start } },
+            'M' => .{ .status = .complete, .motion = .{ .motion = .doc_middle } },
+            'L' => .{ .status = .complete, .motion = .{ .motion = .doc_end } },
+            '}' => .{ .status = .complete, .motion = .{ .motion = .paragraph_forward } },
+            '{' => .{ .status = .complete, .motion = .{ .motion = .paragraph_backward } },
+            ')' => .{ .status = .complete, .motion = .{ .motion = .sentence_forward } },
+            '(' => .{ .status = .complete, .motion = .{ .motion = .sentence_backward } },
+            '%' => .{ .status = .complete, .motion = .{ .motion = .matching_character } },
+            'f' => if (sequence.len < 2) .{ .status = .prefix } else .{ .status = .complete, .motion = .{ .motion = .{ .find_forward = .{ .needle = sequence[1], .before = false } } } },
+            't' => if (sequence.len < 2) .{ .status = .prefix } else .{ .status = .complete, .motion = .{ .motion = .{ .find_forward = .{ .needle = sequence[1], .before = true } } } },
+            'F' => if (sequence.len < 2) .{ .status = .prefix } else .{ .status = .complete, .motion = .{ .motion = .{ .find_backward = .{ .needle = sequence[1], .before = false } } } },
+            'T' => if (sequence.len < 2) .{ .status = .prefix } else .{ .status = .complete, .motion = .{ .motion = .{ .find_backward = .{ .needle = sequence[1], .before = true } } } },
+            'a' => if (sequence.len < 2) .{ .status = .prefix } else .{ .status = .complete, .motion = .{ .motion = .{ .text_object = .{ .byte = sequence[1], .inner = false } } } },
+            'i' => if (sequence.len < 2) .{ .status = .prefix } else .{ .status = .complete, .motion = .{ .motion = .{ .text_object = .{ .byte = sequence[1], .inner = true } } } },
+            'd', 'c', 'y' => .{ .status = .complete, .motion = .{ .motion = .current_line } },
+            else => .{ .status = .invalid },
+        };
+    }
+
+    fn performOperatorRecipe(self: *App, recipe: OperatorRecipe) !void {
+        const buf = self.activeBuffer();
+        const start_buffer = buf;
+        const start_cursor = buf.cursor;
+        const total_count = recipe.operator_count * recipe.motion_count;
+        const range = try self.motionRange(recipe.motion, total_count);
+        defer self.syncViewportIfCursorMoved(start_buffer, start_cursor);
+        if (range == null) {
+            try self.setStatus("motion not found");
+            return;
+        }
+
+        var changed = false;
+        switch (recipe.kind) {
+            .delete => {
+                const removed = try buf.deleteRange(range.?.start, range.?.end);
+                defer self.allocator.free(removed);
+                try self.storeRegisterForDelete(removed, recipe.motion == .current_line);
+                changed = true;
+            },
+            .change => {
+                const removed = try buf.deleteRange(range.?.start, range.?.end);
+                defer self.allocator.free(removed);
+                try self.storeRegisterForDelete(removed, recipe.motion == .current_line);
+                self.mode = .insert;
+                changed = true;
+            },
+            .yank => {
+                const yanked = try self.selectedText(range.?.start, range.?.end);
+                defer self.allocator.free(yanked);
+                try self.storeRegisterForYank(yanked, recipe.motion == .current_line);
+            },
+        }
+
+        if (changed) try self.recordChange(start_cursor);
+        if (buf.cursor.row != start_cursor.row or buf.cursor.col != start_cursor.col) try self.recordJump(start_cursor);
+        self.pending_register = null;
+        if (recipe.kind != .yank) {
+            self.last_repeatable_edit = .{ .operator = recipe };
+        }
+    }
+
+    fn motionRange(self: *App, motion: MotionSpec, count: usize) !?struct { start: buffer_mod.Position, end: buffer_mod.Position } {
+        const buf = self.activeBuffer();
+        const start = buf.cursor;
+        switch (motion) {
+            .current_line => {
+                const line = buf.currentLine();
+                return .{
+                    .start = .{ .row = start.row, .col = 0 },
+                    .end = if (start.row + 1 < buf.lineCount())
+                        .{ .row = start.row + 1, .col = 0 }
+                    else
+                        .{ .row = start.row, .col = line.len },
+                };
+            },
+            .text_object => |obj| {
+                const range = try self.resolveVisualTextObject(obj.byte, obj.inner) orelse return null;
+                return .{ .start = range.start, .end = range.end };
+            },
+            .line_start, .line_nonblank, .line_last_nonblank, .line_end, .doc_start, .doc_middle, .doc_end, .left, .down, .up, .right, .word_forward, .word_backward, .word_end_forward, .word_end_backward, .paragraph_forward, .paragraph_backward, .sentence_forward, .sentence_backward, .matching_character, .find_forward, .find_backward => {
+                defer buf.cursor = start;
+                buf.cursor = start;
+                switch (motion) {
+                    .line_start => buf.moveLineStart(),
+                    .line_nonblank => buf.moveToFirstNonBlank(),
+                    .line_last_nonblank => buf.moveToLastNonBlank(),
+                    .line_end => buf.moveLineEnd(),
+                    .doc_start => buf.moveToDocumentStart(),
+                    .doc_middle => {
+                        const middle = if (buf.lineCount() > 0) (buf.lineCount() - 1) / 2 else 0;
+                        buf.moveToLine(middle);
+                    },
+                    .doc_end => {
+                        buf.moveToDocumentEnd();
+                        buf.cursor.col = buf.currentLine().len;
+                    },
+                    .left => {
+                        var i: usize = 0;
+                        while (i < count) : (i += 1) buf.moveLeft();
+                    },
+                    .down => {
+                        var i: usize = 0;
+                        while (i < count) : (i += 1) buf.moveDown();
+                    },
+                    .up => {
+                        var i: usize = 0;
+                        while (i < count) : (i += 1) buf.moveUp();
+                    },
+                    .right => {
+                        var i: usize = 0;
+                        while (i < count) : (i += 1) buf.moveRight();
+                    },
+                    .word_forward => |big| {
+                        var i: usize = 0;
+                        while (i < count) : (i += 1) buf.moveWordForward(big);
+                    },
+                    .word_backward => |big| {
+                        var i: usize = 0;
+                        while (i < count) : (i += 1) buf.moveWordBackward(big);
+                    },
+                    .word_end_forward => |big| {
+                        var i: usize = 0;
+                        while (i < count) : (i += 1) buf.moveWordEnd(big);
+                    },
+                    .word_end_backward => |big| {
+                        var i: usize = 0;
+                        while (i < count) : (i += 1) buf.moveWordEndBackward(big);
+                    },
+                    .paragraph_forward => {
+                        var i: usize = 0;
+                        while (i < count) : (i += 1) buf.moveParagraphForward();
+                    },
+                    .paragraph_backward => {
+                        var i: usize = 0;
+                        while (i < count) : (i += 1) buf.moveParagraphBackward();
+                    },
+                    .sentence_forward => try self.moveSentence(true, count),
+                    .sentence_backward => try self.moveSentence(false, count),
+                    .matching_character => try self.jumpToMatchingCharacter(),
+                    .find_forward => |find| try self.performFind(find.needle, true, find.before, count),
+                    .find_backward => |find| try self.performFind(find.needle, false, find.before, count),
+                    .current_line, .text_object => unreachable,
+                }
+                const end = buf.cursor;
+                if (start.row == end.row and start.col == end.col) return null;
+                return .{
+                    .start = if (start.row < end.row or (start.row == end.row and start.col <= end.col)) start else end,
+                    .end = if (start.row < end.row or (start.row == end.row and start.col <= end.col)) end else start,
+                };
+            },
+        }
     }
 
     fn performFind(self: *App, needle: u8, forward: bool, before: bool, count: usize) !void {
@@ -1762,7 +2121,7 @@ pub const App = struct {
         const selection = self.visualSelection() orelse return self.setStatus("no selection");
         const text = try self.selectedText(selection.start, selection.end);
         defer self.allocator.free(text);
-        try self.storeRegisterForYank(text);
+        try self.storeRegisterForYank(text, self.visual_mode == .line);
     }
 
     fn visualDelete(self: *App) !void {
@@ -1773,7 +2132,7 @@ pub const App = struct {
         const selection = self.visualSelection() orelse return self.setStatus("no selection");
         const removed = try self.activeBuffer().deleteRange(selection.start, selection.end);
         defer self.allocator.free(removed);
-        try self.storeRegisterForDelete(removed);
+        try self.storeRegisterForDelete(removed, self.visual_mode == .line);
     }
 
     fn visualReplaceChar(self: *App, byte: u8) !void {
@@ -1794,9 +2153,9 @@ pub const App = struct {
         self.exitVisual();
     }
 
-    fn visualPaste(self: *App, before: bool, preserve_registers: bool) !void {
+    fn visualPaste(self: *App) !void {
         if (self.visual_mode == .block) {
-            try self.visualBlockPaste(before);
+            try self.visualBlockPaste();
             return;
         }
         const selection = self.visualSelection() orelse return self.setStatus("no selection");
@@ -1805,19 +2164,14 @@ pub const App = struct {
             try self.setStatus("register empty");
             return;
         };
-        if (!preserve_registers) {
-            const removed = try self.activeBuffer().deleteRange(selection.start, selection.end);
-            defer self.allocator.free(removed);
-            try self.storeRegisterForDelete(removed);
-            try self.activeBuffer().replaceRangeWithText(selection.start, selection.start, value);
-        } else {
-            try self.activeBuffer().replaceRangeWithText(selection.start, selection.end, value);
-        }
+        const removed = try self.activeBuffer().deleteRange(selection.start, selection.end);
+        defer self.allocator.free(removed);
+        try self.storeRegisterForDelete(removed, self.visual_mode == .line);
+        try self.activeBuffer().replaceRangeWithText(selection.start, selection.start, value);
         self.exitVisual();
     }
 
-    fn visualBlockPaste(self: *App, before: bool) !void {
-        _ = before;
+    fn visualBlockPaste(self: *App) !void {
         const bounds = self.visualBlockBounds() orelse return self.setStatus("no selection");
         const key = self.pending_register orelse '"';
         const value = self.registers.get(key) orelse {
@@ -1840,7 +2194,7 @@ pub const App = struct {
         }
         const removed_text = try removed.toOwnedSlice();
         defer self.allocator.free(removed_text);
-        try self.storeRegisterForDelete(removed_text);
+        try self.storeRegisterForDelete(removed_text, false);
         self.exitVisual();
     }
 
@@ -1848,7 +2202,7 @@ pub const App = struct {
         const selection = self.visualSelection() orelse return self.setStatus("no selection");
         const removed = try self.activeBuffer().deleteRange(selection.start, selection.end);
         defer self.allocator.free(removed);
-        try self.storeRegisterForDelete(removed);
+        try self.storeRegisterForDelete(removed, self.visual_mode == .line);
         self.exitVisual();
         self.mode = .insert;
     }
@@ -1857,7 +2211,7 @@ pub const App = struct {
         const selection = self.visualSelection() orelse return self.setStatus("no selection");
         const removed = try self.activeBuffer().deleteRange(selection.start, selection.end);
         defer self.allocator.free(removed);
-        try self.storeRegisterForDelete(removed);
+        try self.storeRegisterForDelete(removed, self.visual_mode == .line);
         try self.activeBuffer().replaceRangeWithText(selection.start, selection.start, &[_]u8{byte});
         self.exitVisual();
         self.mode = .insert;
@@ -2055,7 +2409,7 @@ pub const App = struct {
         }
         const text = try out.toOwnedSlice();
         defer self.allocator.free(text);
-        try self.storeRegisterForYank(text);
+        try self.storeRegisterForYank(text, false);
     }
 
     fn visualBlockDelete(self: *App) !void {
@@ -2073,7 +2427,7 @@ pub const App = struct {
         }
         const removed = try out.toOwnedSlice();
         defer self.allocator.free(removed);
-        try self.storeRegisterForDelete(removed);
+        try self.storeRegisterForDelete(removed, false);
     }
 
     fn visualBlockReplaceChar(self: *App, byte: u8) !void {
@@ -2479,15 +2833,64 @@ pub const App = struct {
         return text.len;
     }
 
-    fn storeRegisterForYank(self: *App, bytes: []const u8) !void {
-        try self.registers.set('"', bytes);
-        try self.registers.set('0', bytes);
-        if (self.pending_register) |reg| try self.registers.set(reg, bytes);
+    fn normalizedLinewiseRegister(self: *App, bytes: []const u8) []const u8 {
+        _ = self;
+        return if (bytes.len > 0 and bytes[bytes.len - 1] == '\n') bytes[0 .. bytes.len - 1] else bytes;
     }
 
-    fn storeRegisterForDelete(self: *App, bytes: []const u8) !void {
-        try self.registers.set('"', bytes);
-        if (self.pending_register) |reg| try self.registers.set(reg, bytes);
+    fn clipboardRegisterKey(key: u8) bool {
+        return key == '+' or key == '*';
+    }
+
+    fn readSystemClipboard(self: *App) !?[]u8 {
+        if (self.clipboard_get_hook) |hook| {
+            if (hook(self)) |text| return try self.allocator.dupe(u8, text);
+            return null;
+        }
+
+        const command = switch (builtin.os.tag) {
+            .macos, .ios, .tvos, .watchos => "pbpaste",
+            .windows => "powershell -NoProfile -Command Get-Clipboard",
+            else => "wl-paste --no-newline 2>/dev/null || xclip -selection clipboard -o 2>/dev/null || xsel --clipboard --output 2>/dev/null",
+        };
+        return try self.runCommandWithInput(command, "");
+    }
+
+    fn writeSystemClipboard(self: *App, text: []const u8) !void {
+        if (self.clipboard_set_hook) |hook| {
+            if (hook(self, text)) return;
+            return error.SystemClipboardUnavailable;
+        }
+
+        const command = switch (builtin.os.tag) {
+            .macos, .ios, .tvos, .watchos => "pbcopy",
+            .windows => "clip",
+            else => "wl-copy 2>/dev/null || xclip -selection clipboard 2>/dev/null || xsel --clipboard --input 2>/dev/null",
+        };
+        _ = try self.runCommandWithInput(command, text);
+    }
+
+    fn storeRegisterForYank(self: *App, bytes: []const u8, linewise: bool) !void {
+        const value = if (linewise) self.normalizedLinewiseRegister(bytes) else bytes;
+        try self.registers.setWithKind('"', value, linewise);
+        try self.registers.setWithKind('0', value, linewise);
+        if (self.pending_register) |reg| try self.registers.setWithKind(reg, value, linewise);
+        if (self.pending_register) |reg| {
+            if (clipboardRegisterKey(reg)) self.writeSystemClipboard(value) catch {
+                try self.setStatus("clipboard unavailable");
+            };
+        }
+    }
+
+    fn storeRegisterForDelete(self: *App, bytes: []const u8, linewise: bool) !void {
+        const value = if (linewise) self.normalizedLinewiseRegister(bytes) else bytes;
+        try self.registers.setWithKind('"', value, linewise);
+        if (self.pending_register) |reg| try self.registers.setWithKind(reg, value, linewise);
+        if (self.pending_register) |reg| {
+            if (clipboardRegisterKey(reg)) self.writeSystemClipboard(value) catch {
+                try self.setStatus("clipboard unavailable");
+            };
+        }
     }
 
     fn pasteRegister(self: *App, before: bool) !void {
@@ -2496,15 +2899,33 @@ pub const App = struct {
     }
 
     fn pasteRegisterKey(self: *App, before: bool, key: u8) !void {
-        const value = self.registers.get(key) orelse {
-            try self.setStatus("register empty");
-            return;
+        var clipboard_text: ?[]u8 = null;
+        defer if (clipboard_text) |text| self.allocator.free(text);
+        const value = if (self.registers.get(key)) |existing| existing else blk: {
+            if (!clipboardRegisterKey(key)) {
+                try self.setStatus("register empty");
+                return;
+            }
+            const fetched = self.readSystemClipboard() catch {
+                try self.setStatus("clipboard unavailable");
+                return;
+            };
+            clipboard_text = fetched orelse {
+                try self.setStatus("clipboard empty");
+                return;
+            };
+            try self.registers.setWithKind(key, clipboard_text.?, false);
+            break :blk clipboard_text.?;
         };
-        if (before) {
-            try self.activeBuffer().insertTextAtCursor(value);
+        if (self.registers.isLinewise(key)) {
+            try self.activeBuffer().insertLinewiseText(before, value);
         } else {
-            self.activeBuffer().moveRight();
-            try self.activeBuffer().insertTextAtCursor(value);
+            if (before) {
+                try self.activeBuffer().insertTextAtCursor(value);
+            } else {
+                self.activeBuffer().moveRight();
+                try self.activeBuffer().insertTextAtCursor(value);
+            }
         }
     }
 
@@ -2604,7 +3025,14 @@ pub const App = struct {
 
     fn actionIsEditing(action: NormalAction) bool {
         return switch (action) {
-            .delete_char, .replace_char, .replace_mode, .substitute_char, .substitute_line, .insert_before, .insert_at_bol, .append_after, .append_eol, .open_below, .open_above, .insert_line_below, .insert_line_above, .delete_line, .yank_line, .paste_after, .paste_before, .paste_after_keep_cursor, .paste_before_keep_cursor, .delete_word, .yank_word, .delete_to_eol, .change_word, .change_line, .change_to_eol, .join_line_space, .join_line_nospace, .indent_line, .dedent_line, .toggle_case_char, .toggle_case_word, .lowercase_word, .uppercase_word, .diff_get, .diff_put, .visual_yank, .visual_delete => true,
+            .delete_char, .replace_char, .replace_mode, .substitute_char, .substitute_line, .insert_before, .insert_at_bol, .append_after, .append_eol, .open_below, .open_above, .insert_line_below, .insert_line_above, .delete_line, .yank_line, .yank_to_eol, .paste_after, .paste_before, .paste_after_keep_cursor, .paste_before_keep_cursor, .delete_word, .yank_word, .delete_to_eol, .change_word, .change_line, .change_to_eol, .join_line_space, .join_line_nospace, .indent_line, .dedent_line, .toggle_case_char, .toggle_case_word, .lowercase_word, .uppercase_word, .diff_get, .diff_put, .visual_yank, .visual_delete => true,
+            else => false,
+        };
+    }
+
+    fn actionIsRepeatableChange(action: NormalAction) bool {
+        return switch (action) {
+            .delete_char, .replace_char, .replace_mode, .substitute_char, .substitute_line, .insert_before, .insert_at_bol, .append_after, .append_eol, .open_below, .open_above, .insert_line_below, .insert_line_above, .delete_line, .paste_after, .paste_before, .paste_after_keep_cursor, .paste_before_keep_cursor, .delete_word, .delete_to_eol, .change_word, .change_line, .change_to_eol, .join_line_space, .join_line_nospace, .indent_line, .dedent_line, .toggle_case_char, .toggle_case_word, .lowercase_word, .uppercase_word, .diff_get, .diff_put, .visual_delete => true,
             else => false,
         };
     }
@@ -3539,11 +3967,14 @@ pub const App = struct {
     }
 
     fn repeatLastCommand(self: *App) anyerror!void {
-        const action = self.last_normal_action orelse {
+        const repeatable = self.last_repeatable_edit orelse {
             try self.setStatus("no repeatable command");
             return;
         };
-        try self.performNormalAction(action, self.last_normal_count);
+        switch (repeatable) {
+            .action => |entry| try self.performNormalAction(entry.action, entry.count),
+            .operator => |recipe| try self.performOperatorRecipe(recipe),
+        }
     }
 
     fn createFoldAtCursor(self: *App) !void {
@@ -4797,6 +5228,10 @@ pub const App = struct {
             \\  Ctrl+w w      switch windows
             \\  Ctrl+w q      quit a window
             \\  Ctrl+w T      move split into its own tab
+            \\  Normal mode   motions compose with operators and text objects
+            \\                examples: dw, ciw, d$, y$, VG
+            \\  Normal mode   line anchors: 0 ^ $ and g0 g^ g$
+            \\  Normal mode   local find motions: f/F/t/T with ; and ,
             \\  [keymap.leader] leader-prefixed normal-mode mappings
             \\  ]<leader> / [<leader> add a blank line below / above without entering insert mode
             \\  <leader>x     confirm close of the current split, tab, or buffer
@@ -4811,6 +5246,16 @@ pub const App = struct {
 fn testInteractiveCommandHook(app: *App, argv: []const []const u8) bool {
     if (app.last_interactive_command) |cmd| app.allocator.free(cmd);
     app.last_interactive_command = std.mem.join(app.allocator, "\t", argv) catch return false;
+    return true;
+}
+
+fn testClipboardGetHook(app: *App) ?[]const u8 {
+    return app.clipboard_contents;
+}
+
+fn testClipboardSetHook(app: *App, text: []const u8) bool {
+    if (app.clipboard_contents) |existing| app.allocator.free(existing);
+    app.clipboard_contents = app.allocator.dupe(u8, text) catch return false;
     return true;
 }
 
@@ -5152,6 +5597,10 @@ test "normal binding table exposes the implemented prefixes" {
     try std.testing.expect(normalActionFor("gf", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
     try std.testing.expect(normalActionFor("gx", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
     try std.testing.expect(normalActionFor("d0", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
+    try std.testing.expect(normalActionFor("g0", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
+    try std.testing.expect(normalActionFor("g^", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
+    try std.testing.expect(normalActionFor("g$", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
+    try std.testing.expect(normalActionFor("y$", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
     try std.testing.expect(normalActionFor("(", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
     try std.testing.expect(normalActionFor(")", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
     try std.testing.expect(normalActionFor("n", cfg.keymap.leader, cfg.keymap.leader_bindings.items) != null);
@@ -5198,6 +5647,15 @@ test "cursor motion keys move within the buffer" {
     setCursor(&app, 1, 1);
     try pressNormalKeys(&app, "g_");
     try std.testing.expectEqual(@as(usize, 3), app.activeBuffer().cursor.col);
+    setCursor(&app, 1, 4);
+    try pressNormalKeys(&app, "g0");
+    try std.testing.expectEqual(@as(usize, 0), app.activeBuffer().cursor.col);
+    setCursor(&app, 1, 4);
+    try pressNormalKeys(&app, "g^");
+    try std.testing.expectEqual(@as(usize, 0), app.activeBuffer().cursor.col);
+    setCursor(&app, 1, 4);
+    try pressNormalKeys(&app, "g$");
+    try std.testing.expectEqual(@as(usize, 5), app.activeBuffer().cursor.col);
 
     setCursor(&app, 2, 5);
     try pressNormalKeys(&app, "gg");
@@ -5206,6 +5664,20 @@ test "cursor motion keys move within the buffer" {
     try std.testing.expectEqual(@as(usize, 2), app.activeBuffer().cursor.row);
     try pressNormalKeys(&app, "M");
     try std.testing.expectEqual(@as(usize, 1), app.activeBuffer().cursor.row);
+}
+
+test "visual line mode can extend to the end of the file" {
+    var app = try makeTestApp(std.testing.allocator, "one\ntwo\nthree");
+    defer app.deinit();
+
+    setCursor(&app, 1, 1);
+    try app.handleNormalByte('V');
+    try app.handleVisualByte('G');
+    const selection = app.visualSelection().?;
+    try std.testing.expectEqual(@as(usize, 1), selection.start.row);
+    try std.testing.expectEqual(@as(usize, 0), selection.start.col);
+    try std.testing.expectEqual(@as(usize, 2), selection.end.row);
+    try std.testing.expectEqual(@as(usize, 5), selection.end.col);
 }
 
 test "sentence motions marks and bol delete are wired" {
@@ -5293,18 +5765,90 @@ test "find keys repeat forward and backward" {
     try std.testing.expectEqual(@as(usize, 2), app.activeBuffer().cursor.col);
 }
 
+test "compound operator motions and dot repeat work" {
+    var app = try makeTestApp(std.testing.allocator, "one two three four five six");
+    defer app.deinit();
+
+    setCursor(&app, 0, 0);
+    try pressNormalKeys(&app, "d3w");
+    try std.testing.expectEqualStrings("four five six", app.activeBuffer().currentLine());
+
+    try pressNormalKeys(&app, ".");
+    try std.testing.expectEqualStrings("", app.activeBuffer().currentLine());
+}
+
 test "yank paste and registers work together" {
     var app = try makeTestApp(std.testing.allocator, "alpha\nbeta");
     defer app.deinit();
 
     setCursor(&app, 0, 0);
-    try pressNormalKeys(&app, "yy");
+    try pressNormalKeys(&app, "yw");
     try std.testing.expectEqualStrings("alpha", app.registers.get('"').?);
     try std.testing.expectEqualStrings("alpha", app.registers.get('0').?);
 
     setCursor(&app, 1, 4);
     try pressNormalKeys(&app, "p");
     try std.testing.expectEqualStrings("betaalpha", app.activeBuffer().currentLine());
+}
+
+test "linewise paste inserts whole lines above and below" {
+    var app = try makeTestApp(std.testing.allocator, "alpha\nbeta\nomega");
+    defer app.deinit();
+
+    setCursor(&app, 0, 0);
+    try pressNormalKeys(&app, "yy");
+    try std.testing.expectEqualStrings("alpha", app.registers.get('"').?);
+
+    setCursor(&app, 1, 2);
+    try pressNormalKeys(&app, "p");
+    const after_below = try app.activeBuffer().serialize();
+    defer std.testing.allocator.free(after_below);
+    try std.testing.expectEqualStrings("alpha\nbeta\nalpha\nomega", after_below);
+
+    var app2 = try makeTestApp(std.testing.allocator, "alpha\nbeta\nomega");
+    defer app2.deinit();
+
+    setCursor(&app2, 0, 0);
+    try pressNormalKeys(&app2, "yy");
+    setCursor(&app2, 1, 2);
+    try pressNormalKeys(&app2, "P");
+    const after_above = try app2.activeBuffer().serialize();
+    defer std.testing.allocator.free(after_above);
+    try std.testing.expectEqualStrings("alpha\nalpha\nbeta\nomega", after_above);
+}
+
+test "clipboard registers copy and paste through the system clipboard hooks" {
+    var app = try makeTestApp(std.testing.allocator, "alpha beta");
+    defer app.deinit();
+    app.clipboard_get_hook = testClipboardGetHook;
+    app.clipboard_set_hook = testClipboardSetHook;
+
+    setCursor(&app, 0, 0);
+    try pressNormalKeys(&app, "\"+yw");
+    try std.testing.expectEqualStrings("alpha", app.clipboard_contents.?);
+    try std.testing.expectEqualStrings("alpha", app.registers.get('+').?);
+
+    var app2 = try makeTestApp(std.testing.allocator, "alpha beta");
+    defer app2.deinit();
+    app2.clipboard_get_hook = testClipboardGetHook;
+    app2.clipboard_contents = try app2.allocator.dupe(u8, "clip");
+
+    setCursor(&app2, 0, 0);
+    try pressNormalKeys(&app2, "\"+p");
+    try std.testing.expectEqualStrings("acliplpha beta", app2.activeBuffer().currentLine());
+}
+
+test "yank to end of line and yank whole line use the right motions" {
+    var app = try makeTestApp(std.testing.allocator, "alpha beta gamma");
+    defer app.deinit();
+
+    setCursor(&app, 0, 6);
+    try pressNormalKeys(&app, "y$");
+    try std.testing.expectEqualStrings("beta gamma", app.registers.get('\"').?);
+
+    setCursor(&app, 0, 0);
+    try pressNormalKeys(&app, "Y");
+    try std.testing.expectEqualStrings("alpha beta gamma", app.registers.get('\"').?);
 }
 
 test "delete and undo redo keys restore text" {
@@ -5988,6 +6532,32 @@ test "visual text objects cover paragraphs sentences and tags" {
     try expectVisualTextObjectYank("One. Two!", 0, 0, "is", "One.");
     try expectVisualTextObjectYank("<p>body</p>", 0, 0, "at", "<p>");
     try expectVisualTextObjectYank("<p>body</p>", 0, 0, "it", "p");
+}
+
+test "visual paste replaces the selection for both p and P" {
+    var app = try makeTestApp(std.testing.allocator, "alpha beta");
+    defer app.deinit();
+
+    try app.registers.set('"', "XYZ");
+    setCursor(&app, 0, 0);
+    try app.handleNormalByte('v');
+    try app.handleVisualByte('l');
+    try app.handleVisualByte('l');
+    try app.handleVisualByte('l');
+    try app.handleVisualByte('p');
+    try std.testing.expectEqualStrings("XYZ beta", app.activeBuffer().currentLine());
+
+    var app2 = try makeTestApp(std.testing.allocator, "alpha beta");
+    defer app2.deinit();
+
+    try app2.registers.set('"', "XYZ");
+    setCursor(&app2, 0, 0);
+    try app2.handleNormalByte('v');
+    try app2.handleVisualByte('l');
+    try app2.handleVisualByte('l');
+    try app2.handleVisualByte('l');
+    try app2.handleVisualByte('P');
+    try std.testing.expectEqualStrings("XYZ beta", app2.activeBuffer().currentLine());
 }
 
 test "visual mode can adjust numbers inside the selection" {

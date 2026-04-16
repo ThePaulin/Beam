@@ -72,6 +72,19 @@ zig build run -- --config examples/beam.toml path/to/file.txt
 
 If no config file is found, Beam falls back to built-in defaults.
 
+## Editing Grammar
+
+Beam's normal mode is built around composable motions and edits:
+
+- basic cursor movement: `h j k l`
+- line anchors: `0`, `^`, `$`, plus `g0`, `g^`, `g$`
+- local find motions: `f/F/t/T`, repeated with `;` and `,`
+- compound motion + operator edits: `dw`, `diw`, `d$`, `ciw`, `yap`
+- repeat last change: `.`
+- visual selections can be extended with compound motions too, for example `VG` selects from the current line to the end of the file
+
+Beam keeps the motion and editing grammar intentionally small, but the goal is for the pieces above to compose cleanly.
+
 ## Configuration
 
 The example config in `examples/beam.toml` shows the supported top-level sections:

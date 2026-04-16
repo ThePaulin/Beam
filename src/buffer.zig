@@ -410,6 +410,35 @@ pub const Buffer = struct {
         try self.replaceRange(start, start, bytes, text);
     }
 
+    pub fn insertLinewiseText(self: *Buffer, before: bool, text: []const u8) !void {
+        try self.pushUndoSnapshot();
+
+        const insert_row = if (before) self.cursor.row else @min(self.cursor.row + 1, self.lines.items.len);
+        var row = insert_row;
+        var inserted: usize = 0;
+        errdefer {
+            while (inserted > 0) : (inserted -= 1) {
+                const removed = self.lines.orderedRemove(insert_row);
+                self.allocator.free(removed);
+            }
+        }
+        if (text.len == 0) {
+            try self.lines.insert(row, try self.allocator.dupe(u8, ""));
+            inserted = 1;
+        } else {
+            var it = std.mem.splitScalar(u8, text, '\n');
+            while (it.next()) |line| : (row += 1) {
+                try self.lines.insert(row, try self.allocator.dupe(u8, line));
+                inserted += 1;
+            }
+        }
+
+        self.cursor.row = insert_row;
+        self.cursor.col = 0;
+        self.clearHistory(&self.redo_stack);
+        self.dirty = true;
+    }
+
     pub fn deleteRange(self: *Buffer, start: Position, end: Position) ![]u8 {
         const text = try self.serialize();
         defer self.allocator.free(text);
