@@ -19,7 +19,7 @@ pub fn main() !void {
 
 test {
     _ = @import("buffer.zig");
+    _ = @import("builtins.zig");
     _ = @import("config.zig");
-    _ = @import("plugin.zig");
     _ = @import("terminal.zig");
 }

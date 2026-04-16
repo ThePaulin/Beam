@@ -12,9 +12,7 @@ blur = false
 opacity = 100
 theme = "beam"
 
-[plugins]
-plugin_dir = ".beam/plugins"
-auto_start = true
+[builtins]
 enabled = ["hello"]
 
 [keymap]

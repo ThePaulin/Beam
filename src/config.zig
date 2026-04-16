@@ -21,9 +21,8 @@ pub const Config = struct {
     keywordprg: []u8,
     equalprg: []u8,
     theme: []u8,
-    plugin_dir: []u8,
     keymap: Keymap,
-    plugins: Plugins,
+    builtins: Builtins,
 
     pub const Keymap = struct {
         pub const LeaderBinding = struct {
@@ -46,8 +45,7 @@ pub const Config = struct {
         leader_bindings: std.array_list.Managed(LeaderBinding),
     };
 
-    pub const Plugins = struct {
-        auto_start: bool = true,
+    pub const Builtins = struct {
         enabled: std.array_list.Managed([]u8),
     };
 
@@ -61,7 +59,6 @@ pub const Config = struct {
             .keywordprg = try allocator.dupe(u8, "man"),
             .equalprg = try allocator.dupe(u8, "cat"),
             .theme = try allocator.dupe(u8, "beam"),
-            .plugin_dir = try allocator.dupe(u8, ".beam/plugins"),
             .keymap = .{
                 .leader = try allocator.dupe(u8, ":"),
                 .help = try allocator.dupe(u8, ":help"),
@@ -77,7 +74,7 @@ pub const Config = struct {
                 .registers = try allocator.dupe(u8, ":registers"),
                 .leader_bindings = std.array_list.Managed(Keymap.LeaderBinding).init(allocator),
             },
-            .plugins = .{
+            .builtins = .{
                 .enabled = std.array_list.Managed([]u8).init(allocator),
             },
         };
@@ -91,7 +88,6 @@ pub const Config = struct {
         self.allocator.free(self.theme);
         self.allocator.free(self.keywordprg);
         self.allocator.free(self.equalprg);
-        self.allocator.free(self.plugin_dir);
         self.allocator.free(self.keymap.leader);
         self.allocator.free(self.keymap.help);
         self.allocator.free(self.keymap.save);
@@ -109,10 +105,10 @@ pub const Config = struct {
             self.allocator.free(binding.action);
         }
         self.keymap.leader_bindings.deinit();
-        for (self.plugins.enabled.items) |item| {
+        for (self.builtins.enabled.items) |item| {
             self.allocator.free(item);
         }
-        self.plugins.enabled.deinit();
+        self.builtins.enabled.deinit();
     }
 };
 
@@ -211,15 +207,7 @@ fn apply(config: *Config, section: []const u8, key: []const u8, value: []const u
         }
     }
 
-    if (std.mem.eql(u8, section, "plugins")) {
-        if (std.mem.eql(u8, scope, "auto_start")) {
-            config.plugins.auto_start = try parseBool(value, line_no, diag);
-            return;
-        }
-        if (std.mem.eql(u8, scope, "plugin_dir")) {
-            try replaceString(config.allocator, &config.plugin_dir, value, line_no, diag);
-            return;
-        }
+    if (std.mem.eql(u8, section, "builtins")) {
         if (std.mem.eql(u8, scope, "enabled")) {
             try parseStringArray(config, value, diag, line_no);
             return;
@@ -301,7 +289,7 @@ fn parseStringArray(config: *Config, value: []const u8, diag: *Diagnostics, line
     var it = splitComma(inner);
     while (it.next()) |entry| {
         const parsed = try parseString(entry, line_no, diag);
-        try config.plugins.enabled.append(try config.allocator.dupe(u8, parsed));
+        try config.builtins.enabled.append(try config.allocator.dupe(u8, parsed));
     }
 }
 
@@ -379,7 +367,7 @@ test "config parse" {
         \\blur = true
         \\opacity = 75
         \\
-        \\[plugins]
+        \\[builtins]
         \\enabled = ["hello"]
     , &diag);
     try std.testing.expectEqual(@as(usize, 2), cfg.tab_width);
@@ -390,7 +378,7 @@ test "config parse" {
     try std.testing.expect(cfg.blur);
     try std.testing.expectEqual(@as(usize, 75), cfg.opacity);
     try std.testing.expectEqualStrings("terminal", cfg.background_color);
-    try std.testing.expectEqualStrings("hello", cfg.plugins.enabled.items[0]);
+    try std.testing.expectEqualStrings("hello", cfg.builtins.enabled.items[0]);
 }
 
 test "config parse status bar icon default sentinel" {

@@ -2,10 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const buffer_mod = @import("buffer.zig");
 const config_mod = @import("config.zig");
+const builtins_mod = @import("builtins.zig");
 const bindings_mod = @import("editor/bindings.zig");
 const commands_mod = @import("editor/commands.zig");
 const render_mod = @import("editor/render.zig");
-const plugin_mod = @import("plugin.zig");
 const terminal_mod = @import("terminal.zig");
 
 const NormalAction = bindings_mod.NormalAction;
@@ -131,10 +131,9 @@ pub const App = struct {
     normal_sequence: std.array_list.Managed(u8),
     status: std.array_list.Managed(u8),
     raw_mode: ?terminal_mod.RawMode = null,
-    plugin_host: plugin_mod.PluginHost,
+    builtins: builtins_mod.Registry,
     should_quit: bool = false,
     file_to_open: ?[]u8 = null,
-    draining_plugin_actions: bool = false,
     interactive_command_hook: ?*const fn (self: *App, argv: []const []const u8) bool = null,
     clipboard_get_hook: ?*const fn (self: *App) ?[]const u8 = null,
     clipboard_set_hook: ?*const fn (self: *App, text: []const u8) bool = null,
@@ -284,7 +283,7 @@ pub const App = struct {
         const config = config_mod.load(allocator, config_path, &diag) catch |err| {
             if (err == error.FileNotFound) {
                 const cfg = try config_mod.Config.init(allocator);
-                return .{
+                var app: App = .{
                     .allocator = allocator,
                     .args = args,
                     .config_path = config_path,
@@ -295,19 +294,22 @@ pub const App = struct {
                     .search_buffer = std.array_list.Managed(u8).init(allocator),
                     .normal_sequence = std.array_list.Managed(u8).init(allocator),
                     .status = std.array_list.Managed(u8).init(allocator),
-                    .plugin_host = plugin_mod.PluginHost.init(allocator, ".beam/plugins"),
+                    .builtins = builtins_mod.Registry.init(allocator),
                     .file_to_open = file_to_open,
                     .jump_history = std.array_list.Managed(buffer_mod.Position).init(allocator),
                     .change_history = std.array_list.Managed(buffer_mod.Position).init(allocator),
                     .quickfix_list = std.array_list.Managed(QuickfixEntry).init(allocator),
                     .registers = RegisterStore.init(allocator),
                 };
+                var host = app.builtinHost();
+                try app.builtins.rebuild(&host, app.config.builtins.enabled.items);
+                return app;
             }
             std.debug.print("{s}:{d}:{d}: {s}\n", .{ config_path, diag.line, diag.column, diag.message });
             return err;
         };
 
-        return .{
+        var app: App = .{
             .allocator = allocator,
             .args = args,
             .config_path = config_path,
@@ -318,13 +320,16 @@ pub const App = struct {
             .search_buffer = std.array_list.Managed(u8).init(allocator),
             .normal_sequence = std.array_list.Managed(u8).init(allocator),
             .status = std.array_list.Managed(u8).init(allocator),
-            .plugin_host = plugin_mod.PluginHost.init(allocator, config.plugin_dir),
+            .builtins = builtins_mod.Registry.init(allocator),
             .file_to_open = file_to_open,
             .jump_history = std.array_list.Managed(buffer_mod.Position).init(allocator),
             .change_history = std.array_list.Managed(buffer_mod.Position).init(allocator),
             .quickfix_list = std.array_list.Managed(QuickfixEntry).init(allocator),
             .registers = RegisterStore.init(allocator),
         };
+        var host = app.builtinHost();
+        try app.builtins.rebuild(&host, app.config.builtins.enabled.items);
+        return app;
     }
 
     pub fn deinit(self: *App) void {
@@ -335,7 +340,7 @@ pub const App = struct {
         self.search_buffer.deinit();
         self.normal_sequence.deinit();
         self.status.deinit();
-        self.plugin_host.deinit();
+        self.builtins.deinit();
         if (self.search_highlight) |needle| self.allocator.free(needle);
         if (self.search_preview_highlight) |needle| self.allocator.free(needle);
         if (self.last_interactive_command) |cmd| self.allocator.free(cmd);
@@ -363,7 +368,6 @@ pub const App = struct {
         defer self.exitTerminal() catch {};
 
         try self.loadInitialBuffers();
-        try self.plugin_host.discoverAndStart(self.config.plugins.enabled.items, self.config.plugins.auto_start);
         try self.setStatus("ready");
         try self.eventLoop();
     }
@@ -381,6 +385,7 @@ pub const App = struct {
         } else {
             try self.buffers.append(try buffer_mod.Buffer.initEmpty(self.allocator));
         }
+        self.emitBuiltinEvent("buffer_open", "{}");
     }
 
     fn initTerminal(self: *App) !void {
@@ -701,13 +706,11 @@ pub const App = struct {
         if (matchesCommand(head, &.{"open"}, self.config.keymap.open)) {
             if (tail.len == 0) return self.setStatus("open requires a path");
             try self.openPath(tail);
-            try self.maybeDrainPluginActions();
             return;
         }
         if (matchesCommand(head, &.{ "e", "edit" }, "edit")) {
             if (tail.len == 0) return self.setStatus("edit requires a path");
             try self.openPath(tail);
-            try self.maybeDrainPluginActions();
             return;
         }
         if (matchesCommand(head, &.{ "bn", "bnext" }, "bnext")) {
@@ -736,7 +739,6 @@ pub const App = struct {
         }
         if (matchesCommand(head, &.{"tabnew"}, "tabnew")) {
             try self.openNewTab(if (tail.len > 0) tail else null);
-            try self.maybeDrainPluginActions();
             return;
         }
         if (matchesCommand(head, &.{ "tabc", "tabclose" }, "tabclose")) {
@@ -757,28 +759,21 @@ pub const App = struct {
         }
         if (matchesCommand(head, &.{"split"}, self.config.keymap.split)) {
             try self.openSplitOrClone(tail);
-            try self.maybeDrainPluginActions();
             return;
         }
         if (matchesCommand(head, &.{ "sp", "split" }, "split")) {
             try self.openSplitOrClone(tail);
-            try self.maybeDrainPluginActions();
             return;
         }
         if (matchesCommand(head, &.{ "vs", "vsplit" }, "vsplit")) {
             try self.openSplitOrClone(tail);
-            try self.maybeDrainPluginActions();
             return;
         }
-        if (matchesCommand(head, &.{"plugin"}, "plugin")) {
-            if (tail.len == 0) return self.setStatus("plugin requires a command name");
-            const result = self.plugin_host.invokeCommand(tail, &.{}) catch {
-                try self.setStatus("unknown plugin command");
-                return;
-            };
-            defer self.allocator.free(result);
-            try self.setStatus(result);
-            try self.maybeDrainPluginActions();
+        if (matchesCommand(head, &.{"builtin"}, "builtin") or matchesCommand(head, &.{"plugin"}, "plugin")) {
+            if (tail.len == 0) return self.setStatus("builtin requires a command name");
+            if (!try self.invokeBuiltinCommand(tail, &.{})) {
+                try self.setStatus("unknown builtin command");
+            }
             return;
         }
         if (matchesCommand(head, &.{"reload-config"}, self.config.keymap.reload)) {
@@ -1977,9 +1972,8 @@ pub const App = struct {
             self.setStatus(@errorName(err)) catch {};
             return false;
         };
-        self.plugin_host.broadcastEvent("buffer_save", "{}");
+        self.emitBuiltinEvent("buffer_save", "{}");
         self.setStatus("saved") catch {};
-        self.maybeDrainPluginActions() catch {};
         return true;
     }
 
@@ -3349,7 +3343,7 @@ pub const App = struct {
         const buf = try buffer_mod.Buffer.initEmpty(self.allocator);
         try self.buffers.append(buf);
         self.focusBufferIndex(self.buffers.items.len - 1);
-        self.plugin_host.broadcastEvent("buffer_open", "{}");
+        self.emitBuiltinEvent("buffer_open", "{}");
     }
 
     fn cloneActiveBuffer(self: *App) !buffer_mod.Buffer {
@@ -3381,7 +3375,7 @@ pub const App = struct {
             self.split_index = self.buffers.items.len - 1;
         }
         self.split_focus = .right;
-        self.plugin_host.broadcastEvent("buffer_open", "{}");
+        self.emitBuiltinEvent("buffer_open", "{}");
     }
 
     fn openNewWindow(self: *App) !void {
@@ -3395,7 +3389,7 @@ pub const App = struct {
             self.split_index = self.buffers.items.len - 1;
         }
         self.split_focus = .right;
-        self.plugin_host.broadcastEvent("buffer_open", "{}");
+        self.emitBuiltinEvent("buffer_open", "{}");
         try self.setStatus("new window");
     }
 
@@ -3410,7 +3404,7 @@ pub const App = struct {
         self.split_index = null;
         self.split_focus = .left;
         self.active_index = self.buffers.items.len - 1;
-        self.plugin_host.broadcastEvent("buffer_open", "{}");
+        self.emitBuiltinEvent("buffer_open", "{}");
         try self.setStatus("split moved to tab");
     }
 
@@ -3753,7 +3747,6 @@ pub const App = struct {
             return;
         }
         try self.openPath(token);
-        try self.maybeDrainPluginActions();
     }
 
     fn pathTokenUnderCursor(self: *App, allow_url: bool) []const u8 {
@@ -4632,8 +4625,8 @@ pub const App = struct {
         };
         self.config.deinit();
         self.config = new_config;
-        self.plugin_host.plugin_dir = self.config.plugin_dir;
-        try self.plugin_host.discoverAndStart(self.config.plugins.enabled.items, self.config.plugins.auto_start);
+        var host = self.builtinHost();
+        try self.builtins.rebuild(&host, self.config.builtins.enabled.items);
         try self.setStatus("config reloaded");
     }
 
@@ -4649,7 +4642,7 @@ pub const App = struct {
         };
         try self.buffers.append(buf);
         self.focusBufferIndex(self.buffers.items.len - 1);
-        self.plugin_host.broadcastEvent("buffer_open", "{}");
+        self.emitBuiltinEvent("buffer_open", "{}");
     }
 
     fn openSplit(self: *App, path: []const u8) !void {
@@ -4670,7 +4663,7 @@ pub const App = struct {
             self.split_index = self.buffers.items.len - 1;
         }
         self.split_focus = .right;
-        self.plugin_host.broadcastEvent("buffer_open", "{}");
+        self.emitBuiltinEvent("buffer_open", "{}");
     }
 
     fn render(self: *App) !void {
@@ -5031,17 +5024,17 @@ pub const App = struct {
         defer allocator.free(progress);
 
         const app_status = self.status.items;
-        const plugin_status = self.plugin_host.statusText();
+        const builtin_status = self.builtins.statusText();
         const app_prefix = "󰞋 ";
-        const plugin_prefix = "󰒓 ";
+        const builtin_prefix = "󰒓 ";
         const app_width = if (app_status.len > 0) displayWidth(app_prefix) + displayWidth(app_status) else 0;
-        const plugin_width = if (plugin_status.len > 0) displayWidth(plugin_prefix) + displayWidth(plugin_status) else 0;
+        const builtin_width = if (builtin_status.len > 0) displayWidth(builtin_prefix) + displayWidth(builtin_status) else 0;
         const location_width = displayWidth(location);
         const progress_width = displayWidth(progress);
         const sep_width: usize = displayWidth(" │ ");
 
-        var include_app = app_width > 0 and max_width >= app_width + plugin_width + location_width + progress_width + (if (plugin_width > 0) sep_width else 0) + (if (location_width > 0 and progress_width > 0) sep_width else 0) + (if (app_width > 0 and (plugin_width > 0 or location_width > 0)) sep_width else 0);
-        var include_plugin = plugin_width > 0 and max_width >= plugin_width + location_width + progress_width + (if (location_width > 0 and progress_width > 0) sep_width else 0) + (if (plugin_width > 0 and location_width > 0) sep_width else 0);
+        var include_app = app_width > 0 and max_width >= app_width + builtin_width + location_width + progress_width + (if (builtin_width > 0) sep_width else 0) + (if (location_width > 0 and progress_width > 0) sep_width else 0) + (if (app_width > 0 and (builtin_width > 0 or location_width > 0)) sep_width else 0);
+        var include_builtin = builtin_width > 0 and max_width >= builtin_width + location_width + progress_width + (if (location_width > 0 and progress_width > 0) sep_width else 0) + (if (builtin_width > 0 and location_width > 0) sep_width else 0);
 
         const mandatory_width = location_width + progress_width + (if (location_width > 0 and progress_width > 0) sep_width else 0);
         if (mandatory_width > max_width) {
@@ -5065,10 +5058,10 @@ pub const App = struct {
             try out.appendSlice(app_prefix);
             try out.appendSlice(app_status);
         }
-        if (include_plugin) {
+        if (include_builtin) {
             if (out.items.len > 0) try out.appendSlice(" │ ");
-            try out.appendSlice(plugin_prefix);
-            try out.appendSlice(plugin_status);
+            try out.appendSlice(builtin_prefix);
+            try out.appendSlice(builtin_status);
         }
         if (out.items.len > 0) try out.appendSlice(" │ ");
         try out.appendSlice(location);
@@ -5083,10 +5076,10 @@ pub const App = struct {
         // Drop low-priority activity fields if the right side still overflows.
         out.clearRetainingCapacity();
         include_app = false;
-        include_plugin = plugin_width > 0 and max_width >= plugin_width + location_width + progress_width + sep_width * 2;
-        if (include_plugin) {
-            try out.appendSlice(plugin_prefix);
-            try out.appendSlice(plugin_status);
+        include_builtin = builtin_width > 0 and max_width >= builtin_width + location_width + progress_width + sep_width * 2;
+        if (include_builtin) {
+            try out.appendSlice(builtin_prefix);
+            try out.appendSlice(builtin_status);
             try out.appendSlice(" │ ");
         }
         try out.appendSlice(location);
@@ -5150,42 +5143,22 @@ pub const App = struct {
         try self.status.appendSlice(text);
     }
 
-    fn drainPluginActions(self: *App) !void {
-        var rounds: usize = 0;
-        while (rounds < 16) : (rounds += 1) {
-            const actions = try self.plugin_host.consumeActions();
-            defer self.allocator.free(actions);
-
-            if (actions.len == 0) return;
-
-            for (actions) |action| {
-                defer self.plugin_host.freeAction(action);
-                switch (action.kind) {
-                    .open_file => {
-                        const path = action.path orelse continue;
-                        try self.openPath(path);
-                    },
-                    .open_split => {
-                        const path = action.path orelse continue;
-                        try self.openSplit(path);
-                    },
-                    .quit => {
-                        self.should_quit = true;
-                    },
-                }
-            }
-        }
-
-        if (self.plugin_host.actions.items.len > 0) {
-            try self.setStatus("plugin action limit reached");
-        }
+    fn builtinHost(self: *App) builtins_mod.Host {
+        return .{
+            .ctx = self,
+            .set_status = builtinSetStatus,
+            .set_extension_status = builtinSetExtensionStatus,
+        };
     }
 
-    fn maybeDrainPluginActions(self: *App) !void {
-        if (self.draining_plugin_actions) return;
-        self.draining_plugin_actions = true;
-        defer self.draining_plugin_actions = false;
-        try self.drainPluginActions();
+    fn emitBuiltinEvent(self: *App, event: []const u8, payload: []const u8) void {
+        var host = self.builtinHost();
+        self.builtins.emit(&host, event, payload);
+    }
+
+    fn invokeBuiltinCommand(self: *App, name: []const u8, args: []const []const u8) !bool {
+        var host = self.builtinHost();
+        return try self.builtins.invokeCommand(&host, name, args);
     }
 
     fn printHelp() !void {
@@ -5237,11 +5210,21 @@ pub const App = struct {
             \\  <leader>x     confirm close of the current split, tab, or buffer
             \\  :reload-config reload TOML config
             \\  :registers     list register contents
-            \\  :plugin NAME   invoke a loaded plugin command
+            \\  :builtin NAME   invoke a registered native built-in command
             \\
         , .{});
     }
 };
+
+fn builtinSetStatus(ctx: *anyopaque, text: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    try app.setStatus(text);
+}
+
+fn builtinSetExtensionStatus(ctx: *anyopaque, text: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    try app.builtins.setStatus(text);
+}
 
 fn testInteractiveCommandHook(app: *App, argv: []const []const u8) bool {
     if (app.last_interactive_command) |cmd| app.allocator.free(cmd);
@@ -6747,14 +6730,14 @@ test "status and prompt bars compose their text" {
     app.config.allocator.free(app.config.status_bar_visual_icon);
     app.config.status_bar_visual_icon = try app.config.allocator.dupe(u8, "V");
     try app.setStatus("ready");
-    try app.plugin_host.setStatus("plugins idle");
+    try app.builtins.setStatus("builtins idle");
     try app.buffers.append(try buffer_mod.Buffer.initEmpty(std.testing.allocator));
     app.split_index = 1;
     app.split_focus = .left;
 
     const status = try app.statusBarText(std.testing.allocator);
     defer std.testing.allocator.free(status);
-    try std.testing.expectEqualStrings("N NORMAL | 󰈙 alpha [L] | 󰞋 ready │ 󰒓 plugins idle │  1:1 │ 100%", status);
+    try std.testing.expectEqualStrings("N NORMAL | 󰈙 alpha [L] | 󰞋 ready │ 󰒓 builtins idle │  1:1 │ 100%", status);
 
     app.mode = .insert;
     const insert_status = try app.statusBarText(std.testing.allocator);
@@ -6796,7 +6779,7 @@ test "status bar right side trims to keep a single line on narrow widths" {
     defer app.deinit();
 
     try app.setStatus("ready");
-    try app.plugin_host.setStatus("plugins idle");
+    try app.builtins.setStatus("builtins idle");
     try app.buffers.append(try buffer_mod.Buffer.initEmpty(std.testing.allocator));
 
     const status = try app.statusBarRightText(std.testing.allocator, 16);
@@ -6815,7 +6798,7 @@ test "default status bar icon uses nerd font glyph" {
     try std.testing.expectEqualStrings("\u{e795}", icon);
 
     try app.setStatus("ready");
-    try app.plugin_host.setStatus("plugins idle");
+    try app.builtins.setStatus("builtins idle");
     try app.buffers.append(try buffer_mod.Buffer.initEmpty(std.testing.allocator));
     app.split_index = 1;
     app.split_focus = .left;
