@@ -663,12 +663,21 @@ pub const App = struct {
         var input_buf: [1]u8 = undefined;
         while (!self.should_quit) {
             self.serviceLsp();
+            self.serviceJobs();
             try self.render();
             const n = stdin_file.read(&input_buf) catch break;
             if (n == 0) break;
             try self.handleByte(input_buf[0], stdin_file);
             self.syncActiveSyntax();
             self.serviceLsp();
+        }
+    }
+
+    fn serviceJobs(self: *App) void {
+        while (self.scheduler.popCompleted()) |result| {
+            var host = self.builtinHost();
+            self.builtins.emitJobResult(&host, result.job_id, result.request_generation, result.workspace_generation, result.success, result.payload);
+            self.allocator.free(result.payload);
         }
     }
 
@@ -6896,6 +6905,7 @@ pub const App = struct {
                 .tree_query = true,
                 .decoration = true,
                 .lsp = true,
+                .job_results = true,
             },
             .decoration_owner = "editor",
             .pane_owner = "editor",
@@ -6905,6 +6915,8 @@ pub const App = struct {
             .register_command = builtinRegisterCommand,
             .register_event = builtinRegisterEvent,
             .spawn_job = builtinSpawnJob,
+            .cancel_job = builtinCancelJob,
+            .register_job_result = builtinRegisterJobResult,
             .add_decoration = builtinAddDecoration,
             .clear_decorations = builtinClearDecorations,
             .clear_buffer_decorations = builtinClearBufferDecorations,
@@ -7048,6 +7060,16 @@ fn builtinRegisterEvent(ctx: *anyopaque, event: []const u8, handler: builtins_mo
 fn builtinSpawnJob(ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64 {
     const app: *App = @ptrCast(@alignCast(ctx));
     return try app.scheduler.spawn(kind, request_generation, workspace_generation);
+}
+
+fn builtinCancelJob(ctx: *anyopaque, job_id: u64) bool {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.scheduler.cancel(job_id);
+}
+
+fn builtinRegisterJobResult(ctx: *anyopaque, job_id: u64, request_generation: u64, workspace_generation: u64, handler: builtins_mod.JobResultHandler) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    try app.builtins.registerJobResultHandler(job_id, request_generation, workspace_generation, handler);
 }
 
 fn builtinAddDecoration(ctx: *anyopaque, owner: []const u8, decoration: diagnostics_mod.Decoration) anyerror!void {
@@ -7851,6 +7873,20 @@ test "exact multi-key bindings execute once their sequence is complete" {
     try pressNormalKeys(&app, "dd");
     try std.testing.expectEqual(@as(usize, 1), app.activeBuffer().lineCount());
     try std.testing.expectEqualStrings("two", app.activeBuffer().currentLine());
+}
+
+test "linewise delete keeps the viewport stable" {
+    var app = try makeTestApp(std.testing.allocator, "one\ntwo\nthree\nfour");
+    defer app.deinit();
+
+    app.last_render_height = 3;
+    app.activeBuffer().scroll_row = 1;
+    setCursor(&app, 1, 0);
+
+    try pressNormalKeys(&app, "dd");
+    try std.testing.expectEqual(@as(usize, 1), app.activeBuffer().scroll_row);
+    try std.testing.expectEqual(@as(usize, 3), app.activeBuffer().lineCount());
+    try std.testing.expectEqualStrings("three", app.activeBuffer().currentLine());
 }
 
 test "cursor motion keys move within the buffer" {

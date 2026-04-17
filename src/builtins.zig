@@ -9,6 +9,7 @@ pub const Manifest = plugin_mod.Manifest;
 
 pub const CommandHandler = plugin_mod.CommandHandler;
 pub const EventHandler = plugin_mod.EventHandler;
+pub const JobResultHandler = plugin_mod.JobResultHandler;
 
 pub const Command = struct {
     name: []u8,
@@ -21,6 +22,13 @@ pub const EventListener = struct {
     handler: EventHandler,
 };
 
+pub const JobResultListener = struct {
+    job_id: u64,
+    request_generation: u64,
+    workspace_generation: u64,
+    handler: JobResultHandler,
+};
+
 pub const Registry = struct {
     pub const api_version: u32 = 1;
 
@@ -29,6 +37,7 @@ pub const Registry = struct {
     extension_commands: std.array_list.Managed(Command),
     events: std.array_list.Managed(EventListener),
     extension_events: std.array_list.Managed(EventListener),
+    job_results: std.array_list.Managed(JobResultListener),
     status: std.array_list.Managed(u8),
 
     pub fn init(allocator: std.mem.Allocator) Registry {
@@ -38,6 +47,7 @@ pub const Registry = struct {
             .extension_commands = std.array_list.Managed(Command).init(allocator),
             .events = std.array_list.Managed(EventListener).init(allocator),
             .extension_events = std.array_list.Managed(EventListener).init(allocator),
+            .job_results = std.array_list.Managed(JobResultListener).init(allocator),
             .status = std.array_list.Managed(u8).init(allocator),
         };
     }
@@ -45,10 +55,12 @@ pub const Registry = struct {
     pub fn deinit(self: *Registry) void {
         self.clearRegistrations();
         self.clearExtensionRegistrations();
+        self.clearJobResults();
         self.commands.deinit();
         self.extension_commands.deinit();
         self.events.deinit();
         self.extension_events.deinit();
+        self.job_results.deinit();
         self.status.deinit();
     }
 
@@ -94,6 +106,29 @@ pub const Registry = struct {
             .event = event_copy,
             .handler = handler,
         });
+    }
+
+    pub fn registerJobResultHandler(self: *Registry, job_id: u64, request_generation: u64, workspace_generation: u64, handler: JobResultHandler) !void {
+        try self.job_results.append(.{
+            .job_id = job_id,
+            .request_generation = request_generation,
+            .workspace_generation = workspace_generation,
+            .handler = handler,
+        });
+    }
+
+    pub fn emitJobResult(self: *Registry, host: *Host, job_id: u64, request_generation: u64, workspace_generation: u64, success: bool, payload: []const u8) void {
+        for (self.job_results.items) |listener| {
+            if (listener.job_id != job_id) continue;
+            if (listener.request_generation != request_generation or listener.workspace_generation != workspace_generation) continue;
+            listener.handler(host, job_id, request_generation, workspace_generation, success, payload) catch |err| {
+                std.debug.print("[beam] job result handler failed: {s}\n", .{@errorName(err)});
+            };
+        }
+    }
+
+    pub fn clearJobResults(self: *Registry) void {
+        self.job_results.clearRetainingCapacity();
     }
 
     pub fn emit(self: *Registry, host: *Host, event: []const u8, payload: []const u8) void {

@@ -658,7 +658,9 @@ pub const Buffer = struct {
         try self.pushUndoSnapshot();
         const new_text = try self.buildReplacementText(original_text, start, end, replacement);
         defer self.allocator.free(new_text);
+        const scroll_row = self.scroll_row;
         try self.setText(new_text);
+        self.scroll_row = scroll_row;
         self.cursor = self.positionAfterReplacement(start, replacement);
         self.clearHistory(&self.redo_stack);
         self.bumpGeneration();
@@ -671,7 +673,9 @@ pub const Buffer = struct {
         errdefer self.allocator.free(removed);
         const new_text = try self.buildReplacementText(original_text, start, end, replacement);
         defer self.allocator.free(new_text);
+        const scroll_row = self.scroll_row;
         try self.setText(new_text);
+        self.scroll_row = scroll_row;
         self.cursor = self.positionAfterReplacement(start, replacement);
         self.clearHistory(&self.redo_stack);
         self.bumpGeneration();

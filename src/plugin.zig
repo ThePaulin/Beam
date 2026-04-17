@@ -23,6 +23,7 @@ pub const Capability = enum {
     tree_query,
     decoration,
     lsp,
+    job_results,
 };
 
 pub const Capabilities = struct {
@@ -40,6 +41,7 @@ pub const Capabilities = struct {
     tree_query: bool = false,
     decoration: bool = false,
     lsp: bool = false,
+    job_results: bool = false,
 
     pub fn allows(self: Capabilities, capability: Capability) bool {
         return switch (capability) {
@@ -57,6 +59,7 @@ pub const Capabilities = struct {
             .tree_query => self.tree_query,
             .decoration => self.decoration,
             .lsp => self.lsp,
+            .job_results => self.job_results,
         };
     }
 };
@@ -71,6 +74,7 @@ pub const Manifest = struct {
 pub const CommandHandler = *const fn (ctx: *anyopaque, args: []const []const u8) anyerror!void;
 pub const EventHandler = *const fn (ctx: *anyopaque, payload: []const u8) anyerror!void;
 pub const JobHandler = *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64;
+pub const JobResultHandler = *const fn (ctx: *anyopaque, job_id: u64, request_generation: u64, workspace_generation: u64, success: bool, payload: []const u8) anyerror!void;
 pub const DecorationHandler = *const fn (ctx: *anyopaque, owner: []const u8, decoration: diagnostics_mod.Decoration) anyerror!void;
 pub const DecorationClearHandler = *const fn (ctx: *anyopaque, owner: []const u8) anyerror!void;
 pub const DecorationBufferClearHandler = *const fn (ctx: *anyopaque, owner: []const u8, buffer_id: u64) anyerror!void;
@@ -111,6 +115,14 @@ fn defaultSetPluginActivity(_: *anyopaque, _: []const u8) anyerror!void {
 }
 
 fn defaultSpawnJob(_: *anyopaque, _: scheduler_mod.JobKind, _: u64, _: u64) anyerror!u64 {
+    return error.PermissionDenied;
+}
+
+fn defaultCancelJob(_: *anyopaque, _: u64) bool {
+    return false;
+}
+
+fn defaultRegisterJobResult(_: *anyopaque, _: u64, _: u64, _: u64, _: JobResultHandler) anyerror!void {
     return error.PermissionDenied;
 }
 
@@ -231,6 +243,8 @@ pub const Host = struct {
     register_command: *const fn (ctx: *anyopaque, name: []const u8, description: []const u8, handler: CommandHandler) anyerror!void = defaultRegisterCommand,
     register_event: *const fn (ctx: *anyopaque, event: []const u8, handler: EventHandler) anyerror!void = defaultRegisterEvent,
     spawn_job: *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64 = defaultSpawnJob,
+    cancel_job: *const fn (ctx: *anyopaque, job_id: u64) bool = defaultCancelJob,
+    register_job_result: *const fn (ctx: *anyopaque, job_id: u64, request_generation: u64, workspace_generation: u64, handler: JobResultHandler) anyerror!void = defaultRegisterJobResult,
     add_decoration: *const fn (ctx: *anyopaque, owner: []const u8, decoration: diagnostics_mod.Decoration) anyerror!void = defaultAddDecoration,
     clear_decorations: *const fn (ctx: *anyopaque, owner: []const u8) anyerror!void = defaultClearDecorations,
     clear_buffer_decorations: *const fn (ctx: *anyopaque, owner: []const u8, buffer_id: u64) anyerror!void = defaultClearBufferDecorations,
@@ -298,6 +312,15 @@ pub const Host = struct {
     pub fn spawnJob(self: *const Host, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) !u64 {
         try self.require(.jobs);
         return try self.spawn_job(self.ctx, kind, request_generation, workspace_generation);
+    }
+
+    pub fn cancelJob(self: *const Host, job_id: u64) bool {
+        return self.cancel_job(self.ctx, job_id);
+    }
+
+    pub fn registerJobResultHandler(self: *const Host, job_id: u64, request_generation: u64, workspace_generation: u64, handler: JobResultHandler) !void {
+        try self.require(.job_results);
+        try self.register_job_result(self.ctx, job_id, request_generation, workspace_generation, handler);
     }
 
     pub fn addDecoration(self: *const Host, decoration: diagnostics_mod.Decoration) !void {
