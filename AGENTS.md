@@ -5,8 +5,10 @@
 - The main application entrypoint lives in [`src/main.zig`](./src/main.zig).
 - Editor orchestration lives in [`src/editor.zig`](./src/editor.zig), with focused editor modules in [`src/editor/render.zig`](./src/editor/render.zig), [`src/editor/bindings.zig`](./src/editor/bindings.zig), and [`src/editor/commands.zig`](./src/editor/commands.zig).
 - Config parsing and defaults live in [`src/config.zig`](./src/config.zig).
-- Buffer editing behavior lives in [`src/buffer.zig`](./src/buffer.zig).
-- Plugin loading and the QuickJS bridge live in [`src/plugin.zig`](./src/plugin.zig), [`src/qjs_wrap.c`](./src/qjs_wrap.c), and [`src/qjs_wrap.h`](./src/qjs_wrap.h).
+- Buffer editing behavior, including undo/redo history, lives in [`src/buffer.zig`](./src/buffer.zig).
+- Plugin loading, discovery, and the QuickJS bridge live in [`src/plugin.zig`](./src/plugin.zig), [`src/plugin_catalog.zig`](./src/plugin_catalog.zig), [`src/qjs_wrap.c`](./src/qjs_wrap.c), and [`src/qjs_wrap.h`](./src/qjs_wrap.h).
+- Search, picker, diagnostics, LSP, and workspace state live in [`src/search.zig`](./src/search.zig), [`src/picker.zig`](./src/picker.zig), [`src/listpane.zig`](./src/listpane.zig), [`src/listsource.zig`](./src/listsource.zig), [`src/diagnostics.zig`](./src/diagnostics.zig), [`src/lsp.zig`](./src/lsp.zig), and [`src/workspace.zig`](./src/workspace.zig).
+- Example plugins live under [`examples/plugins`](./examples/plugins). Treat them as reference code when changing plugin behavior.
 - Vendored QuickJS sources are in [`deps/quickjs_clean`](./deps/quickjs_clean). Treat this as third-party code unless the task explicitly requires touching it.
 
 ## Working Style
@@ -16,6 +18,8 @@
   - normal-mode bindings and leader lookup in `src/editor/bindings.zig`
   - command parsing and command-string helpers in `src/editor/commands.zig`
   - orchestration, event flow, and cross-module wiring in `src/editor.zig`
+- When touching editing behavior, check `src/buffer.zig` for history and mutation helpers first, then update the matching editor tests in `src/editor.zig`.
+- When changing plugin behavior or the plugin catalog, update the example plugin manifest/code and any related smoke tests together.
 - Prefer updating tests close to the behavior you changed. Some coverage still lives in `src/editor.zig`, but new helper behavior should be tested beside the module that owns it.
 - When changing config keys, commands, or help text, update the user-facing docs and example config together so they stay aligned.
 - Keep generated artifacts out of source changes. Do not edit `zig-out/` by hand.
