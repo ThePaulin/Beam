@@ -1,11 +1,22 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const buffer_mod = @import("buffer.zig");
+const diagnostics_mod = @import("diagnostics.zig");
 const config_mod = @import("config.zig");
 const builtins_mod = @import("builtins.zig");
 const bindings_mod = @import("editor/bindings.zig");
 const commands_mod = @import("editor/commands.zig");
+const lsp_mod = @import("lsp.zig");
 const render_mod = @import("editor/render.zig");
+const pane_mod = @import("pane.zig");
+const listsource_mod = @import("listsource.zig");
+const listpane_mod = @import("listpane.zig");
+const picker_mod = @import("picker.zig");
+const plugin_catalog_mod = @import("plugin_catalog.zig");
+const search_mod = @import("search.zig");
+const scheduler_mod = @import("scheduler.zig");
+const syntax_mod = @import("treesitter.zig");
+const workspace_mod = @import("workspace.zig");
 const terminal_mod = @import("terminal.zig");
 
 const NormalAction = bindings_mod.NormalAction;
@@ -56,12 +67,6 @@ fn matchesCommand(head: []const u8, aliases: []const []const u8, configured: []c
 fn stripVisualRangePrefix(command: []const u8) []const u8 {
     return commands_mod.stripVisualRangePrefix(command);
 }
-
-const QuickfixEntry = struct {
-    path: []u8,
-    position: buffer_mod.Position,
-    line: []u8,
-};
 
 const SplitFocus = enum { left, right };
 
@@ -132,6 +137,31 @@ pub const App = struct {
     status: std.array_list.Managed(u8),
     raw_mode: ?terminal_mod.RawMode = null,
     builtins: builtins_mod.Registry,
+    plugin_catalog: plugin_catalog_mod.Catalog,
+    scheduler: scheduler_mod.Scheduler,
+    diagnostics: diagnostics_mod.Store,
+    lsp: lsp_mod.Session,
+    lsp_server: ?lsp_mod.ProcessServer,
+    syntax: syntax_mod.Service,
+    diagnostics_list: listpane_mod.ListPane,
+    picker: picker_mod.Picker,
+    plugins_list: listpane_mod.ListPane,
+    plugin_detail_rows: std.array_list.Managed(PluginDetailRow),
+    panes: pane_mod.Manager,
+    diagnostics_pane_id: ?u64 = null,
+    picker_pane_id: ?u64 = null,
+    plugins_pane_id: ?u64 = null,
+    plugin_details_pane_id: ?u64 = null,
+    plugin_detail_selected: usize = 0,
+    plugin_detail_context: ?[]u8 = null,
+    plugin_activity: std.array_list.Managed(u8),
+    picker_source_key: ?listsource_mod.SourceKey = null,
+    picker_source_spec: ?listsource_mod.SourceSpec = null,
+    picker_source_pattern: ?[]u8 = null,
+    picker_source_pathspec: ?[]u8 = null,
+    picker_job_id: ?u64 = null,
+    search: search_mod.SearchIndex,
+    workspace: workspace_mod.Workspace,
     should_quit: bool = false,
     file_to_open: ?[]u8 = null,
     interactive_command_hook: ?*const fn (self: *App, argv: []const []const u8) bool = null,
@@ -142,8 +172,7 @@ pub const App = struct {
     jump_history: std.array_list.Managed(buffer_mod.Position),
     jump_history_index: ?usize = null,
     change_history: std.array_list.Managed(buffer_mod.Position),
-    quickfix_list: std.array_list.Managed(QuickfixEntry),
-    quickfix_index: usize = 0,
+    quickfix_list: listpane_mod.ListPane,
     diff_peer_index: ?usize = null,
     diff_mode: bool = false,
     change_jump_index: ?usize = null,
@@ -177,6 +206,13 @@ pub const App = struct {
     const VisualPending = enum { ctrl_backslash, g_prefix, replace_char, textobject_outer, textobject_inner };
     const PendingPrefix = enum { none, register, replace_char, find_forward, find_forward_before, find_backward, find_backward_before, macro_record, macro_run, mark_set, mark_jump, mark_jump_exact };
     const CloseTarget = enum { split, tab, buffer };
+    const PluginDetailAction = enum { none, run_command };
+    const PluginDetailRow = struct {
+        label: []u8,
+        detail: ?[]u8 = null,
+        action: PluginDetailAction = .none,
+        command_name: ?[]u8 = null,
+    };
     const FindState = struct {
         char: u8,
         forward: bool,
@@ -256,6 +292,10 @@ pub const App = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, args: []const [:0]u8) !App {
+        var workspace = try workspace_mod.Workspace.init(allocator);
+        errdefer workspace.deinit();
+        var search = try search_mod.SearchIndex.init(allocator, workspace.root_path);
+        errdefer search.deinit();
         var config_path = try allocator.dupe(u8, "beam.toml");
         errdefer allocator.free(config_path);
         var file_to_open: ?[]u8 = null;
@@ -295,14 +335,40 @@ pub const App = struct {
                     .normal_sequence = std.array_list.Managed(u8).init(allocator),
                     .status = std.array_list.Managed(u8).init(allocator),
                     .builtins = builtins_mod.Registry.init(allocator),
+                    .plugin_catalog = plugin_catalog_mod.Catalog.init(allocator),
+                    .scheduler = scheduler_mod.Scheduler.init(allocator),
+                    .diagnostics = diagnostics_mod.Store.init(allocator),
+                    .lsp = lsp_mod.Session.init(allocator),
+                    .lsp_server = null,
+                    .syntax = syntax_mod.Service.init(allocator),
+                    .diagnostics_list = listpane_mod.ListPane.init(allocator),
+                    .picker = picker_mod.Picker.init(allocator),
+                    .plugins_list = listpane_mod.ListPane.init(allocator),
+                    .plugin_detail_rows = std.array_list.Managed(PluginDetailRow).init(allocator),
+                    .panes = pane_mod.Manager.init(allocator),
+                    .diagnostics_pane_id = null,
+                    .picker_pane_id = null,
+                    .plugins_pane_id = null,
+                    .plugin_details_pane_id = null,
+                    .plugin_detail_selected = 0,
+                    .plugin_detail_context = null,
+                    .plugin_activity = std.array_list.Managed(u8).init(allocator),
+                    .picker_source_key = null,
+                    .picker_source_spec = null,
+                    .search = search,
+                    .workspace = workspace,
                     .file_to_open = file_to_open,
                     .jump_history = std.array_list.Managed(buffer_mod.Position).init(allocator),
                     .change_history = std.array_list.Managed(buffer_mod.Position).init(allocator),
-                    .quickfix_list = std.array_list.Managed(QuickfixEntry).init(allocator),
+                    .quickfix_list = listpane_mod.ListPane.init(allocator),
                     .registers = RegisterStore.init(allocator),
                 };
                 var host = app.builtinHost();
-                try app.builtins.rebuild(&host, app.config.builtins.enabled.items);
+                app.builtins.clearExtensionRegistrations();
+                try app.plugin_catalog.rebuild(&host, app.config.builtins.enabled.items, app.config.plugins.root, app.config.plugins.enabled.items);
+                try app.builtins.rebuild(&host, app.config.builtins.api_version, app.plugin_catalog.manifests());
+                app.startConfiguredLsp();
+                _ = try app.panes.open(.editor, "editor");
                 return app;
             }
             std.debug.print("{s}:{d}:{d}: {s}\n", .{ config_path, diag.line, diag.column, diag.message });
@@ -321,26 +387,84 @@ pub const App = struct {
             .normal_sequence = std.array_list.Managed(u8).init(allocator),
             .status = std.array_list.Managed(u8).init(allocator),
             .builtins = builtins_mod.Registry.init(allocator),
+            .plugin_catalog = plugin_catalog_mod.Catalog.init(allocator),
+            .scheduler = scheduler_mod.Scheduler.init(allocator),
+            .diagnostics = diagnostics_mod.Store.init(allocator),
+            .lsp = lsp_mod.Session.init(allocator),
+            .lsp_server = null,
+            .syntax = syntax_mod.Service.init(allocator),
+            .diagnostics_list = listpane_mod.ListPane.init(allocator),
+            .picker = picker_mod.Picker.init(allocator),
+            .plugins_list = listpane_mod.ListPane.init(allocator),
+            .plugin_detail_rows = std.array_list.Managed(PluginDetailRow).init(allocator),
+            .panes = pane_mod.Manager.init(allocator),
+            .diagnostics_pane_id = null,
+            .picker_pane_id = null,
+            .plugins_pane_id = null,
+            .plugin_details_pane_id = null,
+            .plugin_detail_selected = 0,
+            .plugin_detail_context = null,
+            .plugin_activity = std.array_list.Managed(u8).init(allocator),
+            .picker_source_key = null,
+            .picker_source_spec = null,
+            .picker_job_id = null,
+            .search = search,
+            .workspace = workspace,
             .file_to_open = file_to_open,
             .jump_history = std.array_list.Managed(buffer_mod.Position).init(allocator),
             .change_history = std.array_list.Managed(buffer_mod.Position).init(allocator),
-            .quickfix_list = std.array_list.Managed(QuickfixEntry).init(allocator),
+            .quickfix_list = listpane_mod.ListPane.init(allocator),
             .registers = RegisterStore.init(allocator),
         };
         var host = app.builtinHost();
-        try app.builtins.rebuild(&host, app.config.builtins.enabled.items);
+        try app.plugin_catalog.rebuild(&host, app.config.builtins.enabled.items, app.config.plugins.root, app.config.plugins.enabled.items);
+        try app.builtins.rebuild(&host, app.config.builtins.api_version, app.plugin_catalog.manifests());
+        app.startConfiguredLsp();
+        _ = try app.panes.open(.editor, "editor");
         return app;
     }
 
     pub fn deinit(self: *App) void {
+        self.shutdownConfiguredLsp();
         self.exitTerminal() catch {};
+        self.syncWorkspaceSession() catch {};
         for (self.buffers.items) |*buf| buf.deinit();
         self.buffers.deinit();
         self.command_buffer.deinit();
         self.search_buffer.deinit();
         self.normal_sequence.deinit();
         self.status.deinit();
+        self.plugin_catalog.deinit();
         self.builtins.deinit();
+        self.scheduler.deinit();
+        self.diagnostics.deinit();
+        if (self.lsp_server) |*server| {
+            server.deinit();
+            self.lsp_server = null;
+        }
+        self.lsp.deinit();
+        self.syntax.deinit();
+        self.diagnostics_list.deinit();
+        self.picker.deinit();
+        self.plugins_list.deinit();
+        self.clearPluginDetailRows();
+        self.plugin_detail_rows.deinit();
+        self.panes.deinit();
+        self.plugin_details_pane_id = null;
+        if (self.plugin_detail_context) |text| self.allocator.free(text);
+        self.plugin_detail_context = null;
+        self.plugin_activity.deinit();
+        self.search.deinit();
+        self.picker_source_key = null;
+        self.picker_source_spec = null;
+        self.plugins_pane_id = null;
+        if (self.picker_job_id) |job_id| {
+            _ = self.scheduler.cancel(job_id);
+            self.picker_job_id = null;
+        }
+        if (self.picker_source_pattern) |pattern| self.allocator.free(pattern);
+        if (self.picker_source_pathspec) |pathspec| self.allocator.free(pathspec);
+        self.workspace.deinit();
         if (self.search_highlight) |needle| self.allocator.free(needle);
         if (self.search_preview_highlight) |needle| self.allocator.free(needle);
         if (self.last_interactive_command) |cmd| self.allocator.free(cmd);
@@ -363,16 +487,131 @@ pub const App = struct {
         if (self.file_to_open) |f| self.allocator.free(f);
     }
 
+    fn startConfiguredLsp(self: *App) void {
+        if (!self.config.lsp.enabled) return;
+        if (self.config.lsp.command.len == 0) {
+            self.setStatus("lsp not configured") catch {};
+            return;
+        }
+        if (self.lsp_server != null) return;
+        const argv_len = 1 + self.config.lsp.args.items.len;
+        const argv = self.allocator.alloc([]const u8, argv_len) catch {
+            self.setStatus("lsp unavailable") catch {};
+            return;
+        };
+        defer self.allocator.free(argv);
+        argv[0] = self.config.lsp.command;
+        for (self.config.lsp.args.items, 0..) |arg, idx| {
+            argv[idx + 1] = arg;
+        }
+        var server = lsp_mod.ProcessServer.start(self.allocator, argv) catch |err| {
+            self.setStatus(lspSpawnErrorMessage(err)) catch {};
+            return;
+        };
+        server.startReaderThread() catch |err| {
+            server.deinit();
+            self.setStatus(lspReaderErrorMessage(err)) catch {};
+            return;
+        };
+        self.lsp.attachTransport(server.transportHandle());
+        const initialize_payload = self.buildInitializePayload() catch {
+            server.deinit();
+            self.lsp.detachTransport();
+            return;
+        };
+        defer self.allocator.free(initialize_payload);
+        _ = self.lsp.initialize(initialize_payload) catch |err| {
+            self.setStatus(lspInitializeErrorMessage(err)) catch {};
+            self.lsp.detachTransport();
+            server.deinit();
+            return;
+        };
+        self.lsp_server = server;
+    }
+
+    fn serviceLsp(self: *App) void {
+        if (self.lsp_server) |*server| {
+            while (server.pollMessage()) |raw_message| {
+                var message = raw_message;
+                defer message.deinit(self.allocator);
+                self.lsp.handleMessage(message) catch |err| {
+                    if (err == error.InvalidJsonRpcMessage) {
+                        self.setStatus("lsp malformed JSON-RPC") catch {};
+                    } else {
+                        self.setStatus("lsp message error") catch {};
+                    }
+                };
+            }
+            if (server.takeMalformedJsonRpc()) {
+                self.setStatus("lsp malformed JSON-RPC") catch {};
+            }
+        }
+    }
+
+    fn shutdownConfiguredLsp(self: *App) void {
+        if (self.lsp_server) |*server| {
+            defer self.lsp.detachTransport();
+            self.serviceLsp();
+            if (self.lsp.initialized) {
+                _ = self.lsp.shutdown() catch {};
+                var attempts: usize = 0;
+                while (!self.lsp.shutdown_acknowledged and attempts < 100) : (attempts += 1) {
+                    self.serviceLsp();
+                    if (!self.lsp.shutdown_acknowledged) std.Thread.sleep(10 * std.time.ns_per_ms);
+                }
+                self.serviceLsp();
+            }
+            self.lsp.clear();
+            server.deinit();
+            self.lsp_server = null;
+        }
+    }
+
+    fn buildInitializePayload(self: *App) ![]u8 {
+        return try std.fmt.allocPrint(self.allocator,
+            "{{\"processId\":null,\"rootUri\":\"file://{s}\",\"workspaceFolders\":[{{\"uri\":\"file://{s}\",\"name\":\"Beam\"}}],\"clientInfo\":{{\"name\":\"Beam\",\"version\":\"1\"}},\"capabilities\":{{\"workspace\":{{\"workspaceFolders\":true,\"configuration\":true,\"applyEdit\":true}},\"textDocument\":{{\"publishDiagnostics\":{{\"relatedInformation\":true}},\"synchronization\":{{\"dynamicRegistration\":false,\"willSave\":false,\"willSaveWaitUntil\":false,\"didSave\":true}}}},\"window\":{{\"workDoneProgress\":true}},\"general\":{{\"positionEncodings\":[\"utf-8\"]}}}}}}",
+            .{ self.workspace.root_path, self.workspace.root_path },
+        );
+    }
+
+    fn lspSpawnErrorMessage(err: anyerror) []const u8 {
+        return switch (err) {
+            error.FileNotFound => "lsp executable not found",
+            error.AccessDenied => "lsp spawn denied",
+            error.PermissionDenied => "lsp spawn denied",
+            else => "lsp spawn failed",
+        };
+    }
+
+    fn lspReaderErrorMessage(_: anyerror) []const u8 {
+        return "lsp reader failed";
+    }
+
+    fn lspInitializeErrorMessage(_: anyerror) []const u8 {
+        return "lsp initialize failed";
+    }
+
     pub fn run(self: *App) !void {
         try self.initTerminal();
         defer self.exitTerminal() catch {};
 
         try self.loadInitialBuffers();
+        self.serviceLsp();
         try self.setStatus("ready");
         try self.eventLoop();
     }
 
     fn loadInitialBuffers(self: *App) !void {
+        if (self.file_to_open == null and self.workspace.session.open_buffers.items.len > 0) {
+            for (self.workspace.session.open_buffers.items) |path| {
+                try self.openPath(path);
+            }
+            self.active_index = @min(self.workspace.session.active_index, self.buffers.items.len - 1);
+            self.split_index = if (self.workspace.session.split_index) |idx| if (idx < self.buffers.items.len) idx else null else null;
+            self.split_focus = if (self.workspace.session.split_focus_right) .right else .left;
+            self.syncActiveSyntax();
+            return;
+        }
         if (self.file_to_open) |path| {
             try self.buffers.append(buffer_mod.Buffer.loadFile(self.allocator, path) catch |err| switch (err) {
                 error.FileNotFound => blk: {
@@ -382,8 +621,12 @@ pub const App = struct {
                 },
                 else => return err,
             });
+            try self.workspace.recordOpenBuffer(path);
+            try self.lsp.didOpenPath(path);
+            self.syncActiveSyntax();
         } else {
             try self.buffers.append(try buffer_mod.Buffer.initEmpty(self.allocator));
+            self.syncActiveSyntax();
         }
         self.emitBuiltinEvent("buffer_open", "{}");
     }
@@ -418,10 +661,12 @@ pub const App = struct {
         const stdin_file = std.fs.File.stdin();
         var input_buf: [1]u8 = undefined;
         while (!self.should_quit) {
+            self.serviceLsp();
             try self.render();
             const n = stdin_file.read(&input_buf) catch break;
             if (n == 0) break;
             try self.handleByte(input_buf[0], stdin_file);
+            self.serviceLsp();
         }
     }
 
@@ -634,6 +879,10 @@ pub const App = struct {
             try self.showRegisters();
             return;
         }
+        if (std.mem.eql(u8, head, "plugins")) {
+            try self.showPlugins();
+            return;
+        }
         if (matchesCommand(head, &.{ "ma", "marks" }, "marks")) {
             try self.showMarks();
             return;
@@ -655,6 +904,46 @@ pub const App = struct {
         }
         if (matchesCommand(head, &.{"grep"}, "grep")) {
             try self.runProjectSearch(tail);
+            return;
+        }
+        if (matchesCommand(head, &.{"pickgrep"}, "pickgrep")) {
+            try self.runPickerSearch(tail);
+            return;
+        }
+        if (matchesCommand(head, &.{"files"}, "files")) {
+            try self.runFilePickerSearch(tail);
+            return;
+        }
+        if (matchesCommand(head, &.{"symbols"}, "symbols")) {
+            try self.runSymbolPickerSearch(tail);
+            return;
+        }
+        if (matchesCommand(head, &.{"diagnostics"}, "diagnostics")) {
+            try self.showDiagnosticsPane();
+            return;
+        }
+        if (matchesCommand(head, &.{"dnext"}, "dnext")) {
+            try self.diagnosticsNext();
+            return;
+        }
+        if (matchesCommand(head, &.{"dprev"}, "dprev")) {
+            try self.diagnosticsPrev();
+            return;
+        }
+        if (matchesCommand(head, &.{"dopen"}, "dopen")) {
+            try self.openDiagnosticSelection();
+            return;
+        }
+        if (matchesCommand(head, &.{"pnext"}, "pnext")) {
+            try self.navigatePluginOrPicker(1);
+            return;
+        }
+        if (matchesCommand(head, &.{"pprev"}, "pprev")) {
+            try self.navigatePluginOrPicker(-1);
+            return;
+        }
+        if (matchesCommand(head, &.{"popen"}, "popen")) {
+            try self.openSelection();
             return;
         }
         if (matchesCommand(head, &.{"sort"}, "sort")) {
@@ -778,6 +1067,10 @@ pub const App = struct {
         }
         if (matchesCommand(head, &.{"reload-config"}, self.config.keymap.reload)) {
             try self.reloadConfig();
+            return;
+        }
+        if (matchesCommand(head, &.{"refresh-sources"}, "refresh-sources") or matchesCommand(head, &.{"refresh"}, "refresh")) {
+            try self.refreshDerivedSources();
             return;
         }
         if (matchesCommand(head, &.{"w"}, self.config.keymap.save)) {
@@ -1972,8 +2265,11 @@ pub const App = struct {
             self.setStatus(@errorName(err)) catch {};
             return false;
         };
+        if (self.activeBuffer().path) |path| self.lsp.didSavePath(path) catch {};
+        self.workspace.noteSessionChange();
         self.emitBuiltinEvent("buffer_save", "{}");
         self.setStatus("saved") catch {};
+        self.refreshDerivedSources() catch {};
         return true;
     }
 
@@ -1986,7 +2282,10 @@ pub const App = struct {
             self.setStatus(@errorName(err)) catch {};
             return false;
         };
+        self.lsp.didSavePath(actual) catch {};
+        self.workspace.noteSessionChange();
         self.setStatus("saved as") catch {};
+        self.refreshDerivedSources() catch {};
         return true;
     }
 
@@ -2943,8 +3242,14 @@ pub const App = struct {
         try self.setStatus(summary);
     }
 
+    fn showPlugins(self: *App) !void {
+        try self.ensurePluginsPane();
+        try self.syncPluginPane();
+        try self.setStatus("plugin catalog opened");
+    }
+
     fn showReferenceHelp(self: *App) !void {
-        try self.setStatus("help: :help keyword | :w | :wq | :q | :q! | :saveas PATH | :close | :terminal | :edit PATH | :open PATH | :bd | :bn | :bp | :buffer N|PATH | :buffers | :split PATH | :sp PATH | :vs PATH | :tabnew | :tabclose | :tabonly | :tabmove N | :vimgrep /pat/ [path] | :grep PAT [path] | :sort [u] | :!cmd | :cn | :cp | :cope | :ccl | :marks | :delmarks! | :zf | :za | :zo | :zc | :zE | :zr | :zm | :zi | :diffthis | :diffoff | :diffupdate | :diffget | :diffput | ]c/[c | () | n/N | * / # | m/'/` | Ctrl+u/d/i/o/^ | Ctrl+w s/v/n/q/x/+/-/</>/\\/|/_/=/T | leader x | :registers");
+        try self.setStatus("help: :help keyword | :w | :wq | :q | :q! | :saveas PATH | :close | :terminal | :edit PATH | :open PATH | :bd | :bn | :bp | :buffer N|PATH | :buffers | :split PATH | :sp PATH | :vs PATH | :tabnew | :tabclose | :tabonly | :tabmove N | :refresh-sources | :plugins | :vimgrep /pat/ [path] | :grep PAT [path] | :sort [u] | :!cmd | :cn | :cp | :cope | :ccl | :marks | :delmarks! | :zf | :za | :zo | :zc | :zE | :zr | :zm | :zi | :diffthis | :diffoff | :diffupdate | :diffget | :diffput | ]c/[c | () | n/N | * / # | m/'/` | Ctrl+u/d/i/o/^ | Ctrl+w s/v/n/q/x/+/-/</>/\\/|/_/=/T | leader x | :registers");
     }
 
     fn showHelpForCurrentWord(self: *App) !void {
@@ -3015,6 +3320,8 @@ pub const App = struct {
     fn recordChange(self: *App, pos: buffer_mod.Position) !void {
         try self.change_history.append(pos);
         self.change_jump_index = null;
+        self.syncActiveSyntax();
+        if (self.activeBuffer().path) |path| self.lsp.didChangePath(path) catch {};
     }
 
     fn actionIsEditing(action: NormalAction) bool {
@@ -3244,20 +3551,33 @@ pub const App = struct {
             return;
         }
         self.disableDiffMode();
+        var closed_path: ?[]const u8 = self.activeBuffer().path;
+        var closed_buffer_id: u64 = self.activeBuffer().id;
         if (self.split_index) |idx| {
             if (self.split_focus == .right) {
+                closed_path = self.buffers.items[idx].path;
+                closed_buffer_id = self.buffers.items[idx].id;
                 self.buffers.items[idx].deinit();
                 _ = self.buffers.orderedRemove(idx);
             } else {
+                closed_path = self.buffers.items[self.active_index].path;
+                closed_buffer_id = self.buffers.items[self.active_index].id;
                 self.buffers.items[self.active_index].deinit();
                 _ = self.buffers.orderedRemove(self.active_index);
             }
             self.split_index = null;
             self.split_focus = .left;
+            if (closed_path) |path| {
+                self.lsp.didClosePath(path) catch {};
+                self.lsp.clearPath(path);
+            }
+            self.syntax.clearBuffer(closed_buffer_id);
             if (self.buffers.items.len == 0) {
                 try self.buffers.append(try buffer_mod.Buffer.initEmpty(self.allocator));
             }
             self.active_index = 0;
+            self.workspace.noteSessionChange();
+            try self.refreshDerivedSources();
             try self.setStatus("pane closed");
             return;
         }
@@ -3268,7 +3588,12 @@ pub const App = struct {
             self.buffers.items[0].deinit();
             self.buffers.items[0] = try buffer_mod.Buffer.initEmpty(self.allocator);
         }
+        if (closed_path) |path| self.lsp.didClosePath(path) catch {};
+        if (closed_path) |path| self.lsp.clearPath(path);
+        self.syntax.clearBuffer(closed_buffer_id);
         self.active_index = 0;
+        self.workspace.noteSessionChange();
+        try self.refreshDerivedSources();
         try self.setStatus("buffer closed");
     }
 
@@ -3971,7 +4296,19 @@ pub const App = struct {
     }
 
     fn createFoldAtCursor(self: *App) !void {
-        try self.activeBuffer().createParagraphFold();
+        const buf = self.activeBuffer();
+        const snapshot = buf.readSnapshot() catch {
+            try buf.createParagraphFold();
+            try self.setStatus("fold created");
+            return;
+        };
+        defer buf.freeReadSnapshot(snapshot);
+        if (self.syntax.foldRangeForSnapshot(snapshot)) |range| {
+            try buf.createFoldRange(range.start_row, range.end_row);
+        } else {
+            try buf.createParagraphFold();
+        }
+        self.syntax.updateSnapshot(snapshot) catch {};
         try self.setStatus("fold created");
     }
 
@@ -4008,58 +4345,50 @@ pub const App = struct {
     }
 
     fn clearQuickfix(self: *App) void {
-        for (self.quickfix_list.items) |entry| {
-            self.allocator.free(entry.path);
-            self.allocator.free(entry.line);
-        }
-        self.quickfix_list.clearRetainingCapacity();
-        self.quickfix_index = 0;
+        self.quickfix_list.clear();
     }
 
     fn showQuickfix(self: *App) !void {
-        if (self.quickfix_list.items.len == 0) {
+        if (self.quickfix_list.items.items.len == 0) {
             try self.setStatus("quickfix empty");
             return;
         }
-        const entry = self.quickfix_list.items[@min(self.quickfix_index, self.quickfix_list.items.len - 1)];
+        const entry = self.quickfix_list.selectedItem() orelse return;
         const msg = try std.fmt.allocPrint(self.allocator, "{d}/{d} {s}:{d}:{d} {s}", .{
-            @min(self.quickfix_index + 1, self.quickfix_list.items.len),
-            self.quickfix_list.items.len,
-            entry.path,
-            entry.position.row + 1,
-            entry.position.col + 1,
-            entry.line,
+            @min(self.quickfix_list.selected + 1, self.quickfix_list.items.items.len),
+            self.quickfix_list.items.items.len,
+            entry.path orelse "[missing]",
+            entry.row + 1,
+            entry.col + 1,
+            entry.detail orelse "",
         });
         defer self.allocator.free(msg);
         try self.setStatus(msg);
     }
 
     fn quickfixNext(self: *App) !void {
-        if (self.quickfix_list.items.len == 0) {
+        if (self.quickfix_list.items.items.len == 0) {
             try self.setStatus("quickfix empty");
             return;
         }
-        self.quickfix_index = (self.quickfix_index + 1) % self.quickfix_list.items.len;
-        try self.openQuickfixEntry(self.quickfix_list.items[self.quickfix_index]);
+        self.quickfix_list.moveSelection(1);
+        try self.openQuickfixEntry(self.quickfix_list.selectedItem() orelse return);
     }
 
     fn quickfixPrev(self: *App) !void {
-        if (self.quickfix_list.items.len == 0) {
+        if (self.quickfix_list.items.items.len == 0) {
             try self.setStatus("quickfix empty");
             return;
         }
-        if (self.quickfix_index == 0) {
-            self.quickfix_index = self.quickfix_list.items.len - 1;
-        } else {
-            self.quickfix_index -= 1;
-        }
-        try self.openQuickfixEntry(self.quickfix_list.items[self.quickfix_index]);
+        self.quickfix_list.moveSelection(-1);
+        try self.openQuickfixEntry(self.quickfix_list.selectedItem() orelse return);
     }
 
-    fn openQuickfixEntry(self: *App, entry: QuickfixEntry) !void {
-        try self.openOrFocusPath(entry.path);
+    fn openQuickfixEntry(self: *App, entry: listpane_mod.Item) !void {
+        const path = entry.path orelse return;
+        try self.openOrFocusPath(path);
         const buf = self.activeBuffer();
-        buf.cursor = entry.position;
+        buf.cursor = .{ .row = entry.row, .col = entry.col };
         try self.setStatus("quickfix jump");
     }
 
@@ -4082,12 +4411,13 @@ pub const App = struct {
             return;
         };
         self.clearQuickfix();
-        try self.collectQuickfixMatches(parsed.pattern, parsed.pathspec);
-        if (self.quickfix_list.items.len == 0) {
+        const source_spec = listsource_mod.specForCommand("vimgrep").?;
+        try self.runPickerSource(source_spec, parsed.pattern, parsed.pathspec);
+        if (self.quickfix_list.items.items.len == 0) {
             try self.setStatus("no matches");
             return;
         }
-        self.quickfix_index = 0;
+        self.quickfix_list.selected = 0;
         try self.showQuickfix();
     }
 
@@ -4101,13 +4431,26 @@ pub const App = struct {
         const pattern = if (split) |idx| spec[0..idx] else spec;
         const pathspec = if (split) |idx| std.mem.trim(u8, spec[idx + 1 ..], " \t") else "";
         self.clearQuickfix();
-        try self.collectQuickfixMatches(pattern, pathspec);
-        if (self.quickfix_list.items.len == 0) {
+        const source_spec = listsource_mod.specForCommand("grep").?;
+        try self.runPickerSource(source_spec, pattern, pathspec);
+        if (self.quickfix_list.items.items.len == 0) {
             try self.setStatus("no matches");
             return;
         }
-        self.quickfix_index = 0;
+        self.quickfix_list.selected = 0;
         try self.showQuickfix();
+    }
+
+    fn runPickerSearch(self: *App, tail: []const u8) !void {
+        const spec = std.mem.trim(u8, tail, " \t");
+        if (spec.len == 0) {
+            try self.setStatus("pickgrep requires a pattern");
+            return;
+        }
+        const split = std.mem.indexOfScalar(u8, spec, ' ');
+        const pattern = if (split) |idx| spec[0..idx] else spec;
+        const pathspec = if (split) |idx| std.mem.trim(u8, spec[idx + 1 ..], " \t") else "";
+        try self.runPickerSource(.{ .command = "pickgrep", .kind = .search, .title = "picker", .emit_quickfix = true }, pattern, pathspec);
     }
 
     fn sortCurrentBuffer(self: *App, tail: []const u8) !void {
@@ -4193,6 +4536,54 @@ pub const App = struct {
         pathspec: []const u8,
     };
 
+    const SearchCollector = struct {
+        app: *App,
+        source: listsource_mod.AsyncListSource,
+        emit_quickfix: bool,
+        request_key: listsource_mod.SourceKey = .{},
+
+        fn init(app: *App, kind: listsource_mod.SourceKind, emit_quickfix: bool) SearchCollector {
+            return .{
+                .app = app,
+                .source = listsource_mod.AsyncListSource.init(app.allocator, kind),
+                .emit_quickfix = emit_quickfix,
+            };
+        }
+
+        fn deinit(self: *SearchCollector) void {
+            self.source.deinit();
+        }
+
+        fn emit(ctx: *anyopaque, result: search_mod.SearchResult) anyerror!void {
+            const self: *SearchCollector = @ptrCast(@alignCast(ctx));
+            defer result.deinit(self.app.allocator);
+            if (self.emit_quickfix and result.kind == .match) {
+                try self.app.appendQuickfixMatch(result.path, result.row, result.col, result.line);
+            }
+            try self.emitListItem(.{
+                .id = self.source.items.items.len + 1,
+                .path = try self.app.allocator.dupe(u8, result.path),
+                .row = result.row,
+                .col = result.col,
+                .label = try std.fmt.allocPrint(self.app.allocator, "{s}:{d}:{d}", .{ result.path, result.row + 1, result.col + 1 }),
+                .detail = try self.app.allocator.dupe(u8, result.line),
+                .score = @intCast(result.line.len),
+            });
+        }
+
+        fn emitListItem(self: *SearchCollector, item: listpane_mod.Item) !void {
+            self.source.append(self.request_key, item) catch |err| switch (err) {
+                error.StaleSource, error.Canceled => return,
+                else => return err,
+            };
+        }
+
+        fn emitListItemOpaque(ctx: *anyopaque, item: listpane_mod.Item) anyerror!void {
+            const self: *SearchCollector = @ptrCast(@alignCast(ctx));
+            try self.emitListItem(item);
+        }
+    };
+
     fn parseQuickfixSpec(spec: []const u8) ?QuickfixSpec {
         if (spec.len == 0 or spec[0] != '/') return null;
         const end = std.mem.indexOfScalarPos(u8, spec, 1, '/') orelse return null;
@@ -4201,50 +4592,725 @@ pub const App = struct {
         return .{ .pattern = pattern, .pathspec = pathspec };
     }
 
-    fn collectQuickfixMatches(self: *App, pattern: []const u8, pathspec: []const u8) !void {
-        var walker = try std.fs.cwd().walk(self.allocator);
-        defer walker.deinit();
-        while (try walker.next()) |entry| {
-            if (entry.kind != .file) continue;
-            if (pathspec.len > 0 and !quickfixPathMatches(entry.path, pathspec)) continue;
-            const text = std.fs.cwd().readFileAlloc(self.allocator, entry.path, 1 << 20) catch continue;
-            defer self.allocator.free(text);
-            var row: usize = 0;
-            var start: usize = 0;
-            while (start <= text.len) {
-                const rel_end = std.mem.indexOfScalar(u8, text[start..], '\n');
-                const end = if (rel_end) |idx| start + idx else text.len;
-                const line = text[start..end];
-                var search: usize = 0;
-                while (search <= line.len) {
-                    const hit = std.mem.indexOfPos(u8, line, search, pattern) orelse break;
-                    try self.appendQuickfixMatch(entry.path, row, hit, line);
-                    search = hit + @max(1, pattern.len);
-                }
-                if (end >= text.len) break;
-                start = end + 1;
-                row += 1;
-            }
+    fn runFilePickerSearch(self: *App, tail: []const u8) !void {
+        const pathspec = std.mem.trim(u8, tail, " \t");
+        try self.runPickerSource(.{ .command = "files", .kind = .files, .title = "files" }, "", pathspec);
+    }
+
+    fn runSymbolPickerSearch(self: *App, tail: []const u8) !void {
+        const pattern = std.mem.trim(u8, tail, " \t");
+        if (pattern.len == 0) {
+            try self.setStatus("symbols requires a pattern");
+            return;
+        }
+        try self.runPickerSource(.{ .command = "symbols", .kind = .symbols, .title = "symbols" }, pattern, "");
+    }
+
+    fn runPickerSource(self: *App, spec: listsource_mod.SourceSpec, pattern: []const u8, pathspec: []const u8) !void {
+        self.cancelActivePickerSource();
+        var collector = SearchCollector.init(self, spec.kind, spec.emit_quickfix);
+        defer collector.deinit();
+        const restored_picker_selection = self.workspace.session.selected_picker_index;
+        const job_kind: scheduler_mod.JobKind = switch (spec.kind) {
+            .search => .grep,
+            .files => .search,
+            .symbols => .symbols,
+            .diagnostics => .custom,
+            .custom => .custom,
+        };
+        const job_id = try self.scheduler.spawn(job_kind, self.workspace.session_generation, self.workspace.session_generation);
+        self.picker_job_id = job_id;
+        const key = listsource_mod.SourceKey{
+            .request_id = job_id,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        collector.request_key = key;
+        collector.source.begin(key);
+        self.picker_source_key = key;
+        self.picker_source_spec = spec;
+        self.picker_source_pattern = try self.allocator.dupe(u8, pattern);
+        self.picker_source_pathspec = try self.allocator.dupe(u8, pathspec);
+
+        self.picker.clear();
+        try self.picker.setQuery(if (pattern.len > 0) pattern else pathspec);
+        self.picker.setState(.loading);
+        try self.ensurePickerPane();
+        try self.syncPickerPaneTitle(spec.title);
+
+        const sink = search_mod.ResultSink{ .ctx = &collector, .emit = SearchCollector.emit };
+        const search_result = switch (spec.kind) {
+            .search => self.search.grep(pattern, pathspec, sink, std.math.maxInt(usize)),
+            .files => self.search.searchFiles(pathspec, sink, std.math.maxInt(usize)),
+            .symbols => blk: {
+                const lsp_sink = lsp_mod.ResultSink{ .ctx = &collector, .emit = SearchCollector.emitListItemOpaque };
+                const lsp_count = self.lsp.querySymbols(pattern, lsp_sink, std.math.maxInt(usize)) catch |err| switch (err) {
+                    error.StaleSource, error.Canceled => 0,
+                    else => return err,
+                };
+                if (lsp_count > 0) break :blk lsp_count;
+                break :blk self.search.symbols(pattern, sink, std.math.maxInt(usize));
+            },
+            else => error.Unsupported,
+        };
+        _ = search_result catch |err| {
+            try self.picker.setError(@errorName(err));
+            _ = self.scheduler.complete(job_id, @errorName(err), false) catch {};
+            if (self.picker_job_id == job_id) self.picker_job_id = null;
+            try self.setStatus(spec.failure_message);
+            return err;
+        };
+
+        collector.source.complete(key);
+        _ = self.scheduler.complete(job_id, "picker completed", true) catch {};
+        if (self.picker_job_id == job_id) self.picker_job_id = null;
+        try self.picker.setItems(collector.source.items.items);
+        self.picker.selected = if (self.picker.items.items.len == 0) 0 else @min(restored_picker_selection, self.picker.items.items.len - 1);
+        self.picker.setState(.ready);
+        try self.syncPickerPreview(spec);
+        if (collector.source.items.items.len == 0) {
+            try self.setStatus(spec.empty_message);
+            self.picker.clearPreview();
+        }
+        try self.syncPickerPaneTitle(spec.title);
+    }
+
+    fn cancelActivePickerSource(self: *App) void {
+        if (self.picker_source_key) |_| {
+            self.picker_source_key = null;
+            self.picker_source_spec = null;
+        }
+        if (self.picker_source_pattern) |pattern| self.allocator.free(pattern);
+        if (self.picker_source_pathspec) |pathspec| self.allocator.free(pathspec);
+        self.picker_source_pattern = null;
+        self.picker_source_pathspec = null;
+        self.picker.clearError();
+        self.picker.clearPreview();
+        self.picker.setState(.idle);
+    }
+
+    fn refreshDerivedSources(self: *App) !void {
+        _ = self.lsp.refreshDiagnostics() catch {};
+        _ = self.lsp.refreshSymbols() catch {};
+        if (self.picker_source_spec) |spec| {
+            const pattern = self.picker_source_pattern orelse "";
+            const pathspec = self.picker_source_pathspec orelse "";
+            const pattern_copy = try self.allocator.dupe(u8, pattern);
+            defer self.allocator.free(pattern_copy);
+            const pathspec_copy = try self.allocator.dupe(u8, pathspec);
+            defer self.allocator.free(pathspec_copy);
+            try self.runPickerSource(spec, pattern_copy, pathspec_copy);
+        }
+        if (self.diagnostics_pane_id != null) {
+            try self.syncDiagnosticsPane();
+        }
+        if (self.plugins_pane_id != null) {
+            try self.syncPluginPane();
+        }
+        if (self.plugin_details_pane_id != null) {
+            try self.syncPluginDetailPane();
         }
     }
 
     fn appendQuickfixMatch(self: *App, path: []const u8, row: usize, col: usize, line: []const u8) !void {
-        try self.quickfix_list.append(.{
+        try self.quickfix_list.appendOwnedItem(.{
+            .id = @intCast(self.quickfix_list.items.items.len + 1),
             .path = try self.allocator.dupe(u8, path),
-            .position = .{ .row = row, .col = col },
-            .line = try self.allocator.dupe(u8, line),
+            .row = row,
+            .col = col,
+            .label = try std.fmt.allocPrint(self.allocator, "{s}:{d}:{d}", .{ path, row + 1, col + 1 }),
+            .detail = try self.allocator.dupe(u8, line),
+            .score = @intCast(line.len),
         });
     }
 
-    fn quickfixPathMatches(path: []const u8, spec: []const u8) bool {
-        if (std.mem.eql(u8, spec, ".") or std.mem.eql(u8, spec, "**/*") or std.mem.eql(u8, spec, "*")) return true;
-        const cleaned = std.mem.trim(u8, spec, " \t");
-        if (cleaned.len == 0) return true;
-        if (std.mem.indexOf(u8, cleaned, "*") != null) {
-            const prefix = std.mem.trimRight(u8, cleaned, "*");
-            return std.mem.startsWith(u8, path, prefix);
+    fn showPickerSelection(self: *App) !void {
+        if (self.picker.items.items.len == 0) {
+            try self.setStatus("picker empty");
+            self.picker.clearPreview();
+            return;
         }
-        return std.mem.indexOf(u8, path, cleaned) != null;
+        const item = self.picker.items.items[@min(self.picker.selected, self.picker.items.items.len - 1)];
+        const msg = try std.fmt.allocPrint(self.allocator, "{d}/{d} {s}", .{
+            @min(self.picker.selected + 1, self.picker.items.items.len),
+            self.picker.items.items.len,
+            item.label,
+        });
+        defer self.allocator.free(msg);
+        try self.setStatus(msg);
+        try self.syncPickerPreviewForSelection(item);
+        try self.syncPickerPaneTitle(self.picker.query.items);
+    }
+
+    fn showDiagnosticsPane(self: *App) !void {
+        try self.ensureDiagnosticsPane();
+        try self.syncDiagnosticsPane();
+        try self.setStatus("diagnostics pane");
+    }
+
+    fn selectedDiagnostic(self: *const App) ?listpane_mod.Item {
+        return self.diagnostics_list.selectedItem();
+    }
+
+    fn diagnosticsNext(self: *App) !void {
+        if (self.diagnostics_list.items.items.len == 0) {
+            try self.setStatus("diagnostics empty");
+            return;
+        }
+        self.diagnostics_list.moveSelection(1);
+        try self.showDiagnosticsSelection();
+    }
+
+    fn diagnosticsPrev(self: *App) !void {
+        if (self.diagnostics_list.items.items.len == 0) {
+            try self.setStatus("diagnostics empty");
+            return;
+        }
+        self.diagnostics_list.moveSelection(-1);
+        try self.showDiagnosticsSelection();
+    }
+
+    fn showDiagnosticsSelection(self: *App) !void {
+        const diag = self.selectedDiagnostic() orelse {
+            try self.setStatus("diagnostics empty");
+            return;
+        };
+        const msg = try std.fmt.allocPrint(self.allocator, "{d}/{d} {s}", .{
+            @min(self.diagnostics_list.selected + 1, self.diagnostics_list.items.items.len),
+            self.diagnostics_list.items.items.len,
+            diag.label,
+        });
+        defer self.allocator.free(msg);
+        try self.setStatus(msg);
+        try self.syncDiagnosticsPane();
+    }
+
+    fn openDiagnosticSelection(self: *App) !void {
+        const diag = self.selectedDiagnostic() orelse {
+            try self.setStatus("diagnostics empty");
+            return;
+        };
+        const path = diag.path orelse {
+            try self.setStatus("diagnostic missing path");
+            return;
+        };
+        try self.openOrFocusPath(path);
+        const buf = self.activeBuffer();
+        buf.cursor = .{ .row = diag.row, .col = diag.col };
+        try self.setStatus("diagnostic jump");
+    }
+
+    fn pickerNext(self: *App) !void {
+        if (self.picker.items.items.len == 0) {
+            try self.setStatus("picker empty");
+            return;
+        }
+        self.picker.moveSelection(1);
+        try self.showPickerSelection();
+    }
+
+    fn pickerPrev(self: *App) !void {
+        if (self.picker.items.items.len == 0) {
+            try self.setStatus("picker empty");
+            return;
+        }
+        self.picker.moveSelection(-1);
+        try self.showPickerSelection();
+    }
+
+    fn openPickerSelection(self: *App) !void {
+        const item = self.picker.selectedItem() orelse {
+            try self.setStatus("picker empty");
+            return;
+        };
+        const path = item.path orelse {
+            try self.setStatus("picker item missing path");
+            return;
+        };
+        try self.openOrFocusPath(path);
+        const buf = self.activeBuffer();
+        buf.cursor = .{ .row = item.row, .col = item.col };
+        try self.setStatus("picker jump");
+    }
+
+    fn openSelection(self: *App) !void {
+        if (self.panes.focusedPaneKind()) |focused_kind| {
+            if (focused_kind == .custom or focused_kind == .plugin_details) {
+                try self.openPluginSelection();
+                return;
+            }
+        }
+        try self.openPickerSelection();
+    }
+
+    fn navigatePluginOrPicker(self: *App, delta: isize) !void {
+        if (self.panes.focusedPaneKind()) |focused_kind| {
+            if (focused_kind == .custom or focused_kind == .plugin_details) {
+                try self.pluginNextPrev(delta);
+                return;
+            }
+        }
+        if (self.picker.items.items.len == 0) {
+            try self.setStatus("picker empty");
+            return;
+        }
+        if (delta > 0) {
+            try self.pickerNext();
+        } else {
+            try self.pickerPrev();
+        }
+    }
+
+    fn ensurePickerPane(self: *App) !void {
+        if (self.picker_pane_id) |id| {
+            _ = self.panes.focus(id);
+            return;
+        }
+        if (self.panes.findByKind(.picker)) |id| {
+            self.picker_pane_id = id;
+            _ = self.panes.focus(id);
+            return;
+        }
+        const id = try self.panes.open(.picker, "picker");
+        self.picker_pane_id = id;
+        _ = self.panes.focus(id);
+    }
+
+    fn ensureDiagnosticsPane(self: *App) !void {
+        if (self.diagnostics_pane_id) |id| {
+            _ = self.panes.focus(id);
+            return;
+        }
+        if (self.panes.findByKind(.diagnostics)) |id| {
+            self.diagnostics_pane_id = id;
+            _ = self.panes.focus(id);
+            return;
+        }
+        const id = try self.panes.open(.diagnostics, "diagnostics");
+        self.diagnostics_pane_id = id;
+        _ = self.panes.focus(id);
+    }
+
+    fn ensurePluginsPane(self: *App) !void {
+        if (self.plugins_pane_id) |id| {
+            _ = self.panes.focus(id);
+            return;
+        }
+        if (self.panes.findByKind(.custom)) |id| {
+            self.plugins_pane_id = id;
+            _ = self.panes.focus(id);
+            return;
+        }
+        const id = try self.panes.open(.custom, "plugins");
+        self.plugins_pane_id = id;
+        _ = self.panes.focus(id);
+    }
+
+    fn ensurePluginDetailsPane(self: *App) !void {
+        if (self.plugin_details_pane_id) |id| {
+            _ = self.panes.focus(id);
+            return;
+        }
+        if (self.panes.findByKind(.plugin_details)) |id| {
+            self.plugin_details_pane_id = id;
+            _ = self.panes.focus(id);
+            return;
+        }
+        const id = try self.panes.open(.plugin_details, "plugin details");
+        self.plugin_details_pane_id = id;
+        _ = self.panes.focus(id);
+    }
+
+    fn syncPickerPaneTitle(self: *App, title_suffix: []const u8) !void {
+        const id = self.picker_pane_id orelse return;
+        const title = if (title_suffix.len == 0) "picker" else blk: {
+            break :blk try std.fmt.allocPrint(self.allocator, "picker: {s}", .{title_suffix});
+        };
+        defer if (title_suffix.len > 0) self.allocator.free(title);
+        _ = try self.panes.updateTitle(id, title);
+    }
+
+    fn syncPickerPreview(self: *App, spec: listsource_mod.SourceSpec) !void {
+        if (spec.preview == .none) {
+            self.picker.clearPreview();
+            return;
+        }
+        if (self.picker.selectedItem()) |item| {
+            try self.syncPickerPreviewForSelection(item);
+        } else {
+            self.picker.clearPreview();
+        }
+    }
+
+    fn syncPickerPreviewForSelection(self: *App, item: listpane_mod.Item) !void {
+        const spec = self.picker_source_spec orelse {
+            self.picker.clearPreview();
+            return;
+        };
+        switch (spec.preview) {
+            .none => self.picker.clearPreview(),
+            .detail => if (item.detail) |detail| try self.picker.setPreview(detail) else self.picker.clearPreview(),
+        }
+    }
+
+    fn syncDiagnosticsPane(self: *App) !void {
+        const id = self.diagnostics_pane_id orelse return;
+        self.diagnostics.clearDecorations();
+        const errors = self.diagnostics.count(.err);
+        const warnings = self.diagnostics.count(.warning);
+        const infos = self.diagnostics.count(.info);
+        const lsp_errors = self.lsp.diagnosticsCount(.err);
+        const lsp_warnings = self.lsp.diagnosticsCount(.warning);
+        const lsp_infos = self.lsp.diagnosticsCount(.info);
+        const restored_diagnostics_selection = self.workspace.session.selected_diagnostics_index;
+        var source = listsource_mod.AsyncListSource.init(self.allocator, .diagnostics);
+        defer source.deinit();
+        const key = listsource_mod.SourceKey{
+            .request_id = 1,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        source.begin(key);
+        for (self.diagnostics.diagnostics.items) |diag| {
+            const severity = switch (diag.severity) {
+                .err => "error",
+                .warning => "warning",
+                .info => "info",
+            };
+            const path = diag.path orelse "[buffer]";
+            const label = try std.fmt.allocPrint(self.allocator, "{s}:{d}:{d}", .{
+                path,
+                diag.row + 1,
+                diag.col + 1,
+            });
+            const detail = try std.fmt.allocPrint(self.allocator, "[{s}] {s}", .{ severity, diag.message });
+            self.diagnostics.addDiagnosticDecoration(diag) catch {};
+            try source.append(key, .{
+                .id = source.items.items.len + 1,
+                .path = if (diag.path) |p| try self.allocator.dupe(u8, p) else null,
+                .row = diag.row,
+                .col = diag.col,
+                .label = label,
+                .detail = detail,
+                .score = @intCast(diag.message.len),
+            });
+        }
+        for (self.lsp.diagnostics.items) |diag| {
+            const severity = switch (diag.severity) {
+                .err => "error",
+                .warning => "warning",
+                .info => "info",
+            };
+            const path = diag.path orelse "[buffer]";
+            const label = try std.fmt.allocPrint(self.allocator, "{s}:{d}:{d}", .{
+                path,
+                diag.row + 1,
+                diag.col + 1,
+            });
+            const detail = try std.fmt.allocPrint(self.allocator, "[lsp {s}] {s}", .{ severity, diag.message });
+            try source.append(key, .{
+                .id = source.items.items.len + 1,
+                .path = if (diag.path) |p| try self.allocator.dupe(u8, p) else null,
+                .row = diag.row,
+                .col = diag.col,
+                .label = label,
+                .detail = detail,
+                .score = @intCast(diag.message.len),
+            });
+        }
+        source.complete(key);
+        try self.diagnostics_list.setItems(source.items.items);
+        self.diagnostics_list.selected = if (self.diagnostics_list.items.items.len == 0) 0 else @min(restored_diagnostics_selection, self.diagnostics_list.items.items.len - 1);
+        const total = self.diagnostics_list.items.items.len;
+        const selected = if (total == 0) 0 else @min(self.diagnostics_list.selected + 1, total);
+        const title = try std.fmt.allocPrint(self.allocator, "diagnostics: E{d} W{d} I{d} | LSP E{d} W{d} I{d} {d}/{d}", .{ errors, warnings, infos, lsp_errors, lsp_warnings, lsp_infos, selected, total });
+        defer self.allocator.free(title);
+        try self.syncListPaneOverlay(id, title, &self.diagnostics_list, "no diagnostics");
+    }
+
+    fn syncPluginPane(self: *App) !void {
+        const id = self.plugins_pane_id orelse return;
+        try self.plugin_catalog.fillListPane(self.allocator, &self.plugins_list);
+        if (self.plugin_activity.items.len > 0) {
+            const label = try self.allocator.dupe(u8, "activity");
+            errdefer self.allocator.free(label);
+            const detail = try self.allocator.dupe(u8, self.plugin_activity.items);
+            errdefer self.allocator.free(detail);
+            try self.plugins_list.appendOwnedItem(.{
+                .id = 0,
+                .label = label,
+                .detail = detail,
+                .score = 100,
+            });
+        }
+        for (self.builtins.extensionCommands()) |command| {
+            const label = try std.fmt.allocPrint(self.allocator, "cmd {s}", .{command.name});
+            errdefer self.allocator.free(label);
+            const detail = try std.fmt.allocPrint(self.allocator, "{s}", .{command.description});
+            errdefer self.allocator.free(detail);
+            try self.plugins_list.appendOwnedItem(.{
+                .id = @intCast(self.plugins_list.items.items.len + 1),
+                .label = label,
+                .detail = detail,
+                .score = 80,
+            });
+        }
+        const title = try self.plugin_catalog.statusText(self.allocator);
+        defer self.allocator.free(title);
+        try self.syncListPaneOverlay(id, title, &self.plugins_list, "no plugins");
+        try self.syncPluginDetailPane();
+    }
+
+    fn pluginNextPrev(self: *App, delta: isize) !void {
+        const focused_kind = self.panes.focusedPaneKind();
+        if (focused_kind == .plugin_details) {
+            try self.movePluginDetailSelection(delta);
+            return;
+        }
+        if (self.plugins_list.items.items.len == 0) {
+            try self.setStatus("plugin pane empty");
+            return;
+        }
+        self.plugins_list.moveSelection(delta);
+        try self.syncPluginDetailPane();
+    }
+
+    fn movePluginDetailSelection(self: *App, delta: isize) !void {
+        if (self.plugin_detail_rows.items.len == 0) {
+            try self.setStatus("plugin detail pane empty");
+            return;
+        }
+        const current: isize = @intCast(self.plugin_detail_selected);
+        const max_index: isize = @intCast(self.plugin_detail_rows.items.len - 1);
+        const next = std.math.clamp(current + delta, 0, max_index);
+        self.plugin_detail_selected = @intCast(next);
+        try self.syncPluginDetailPane();
+    }
+
+    fn openPluginSelection(self: *App) !void {
+        if (self.panes.focusedPaneKind() == .plugin_details) {
+            try self.openSelectedPluginDetailRow();
+            return;
+        }
+        const item = self.plugins_list.selectedItem() orelse {
+            try self.setStatus("plugin pane empty");
+            return;
+        };
+        if (std.mem.eql(u8, item.label, "activity")) {
+            try self.showPluginDetail(item, "activity selected");
+            try self.setStatus(item.detail orelse "plugin activity");
+            return;
+        }
+        if (std.mem.startsWith(u8, item.label, "cmd ")) {
+            const command_name = item.label["cmd ".len..];
+            try self.showPluginDetail(item, "running command");
+            if (!try self.invokeBuiltinCommand(command_name, &.{})) {
+                try self.setStatus("unknown plugin command");
+            }
+            return;
+        }
+        try self.showPluginDetail(item, "plugin selected");
+        try self.setStatus(item.detail orelse "plugin item selected");
+    }
+
+    fn showPluginDetail(self: *App, item: listpane_mod.Item, action: []const u8) !void {
+        try self.ensurePluginDetailsPane();
+        const id = self.plugin_details_pane_id orelse return;
+        try self.rebuildPluginDetailRows(item);
+        _ = self.panes.clearStreaming(id);
+        const title = try self.pluginDetailTitle(action);
+        defer self.allocator.free(title);
+        _ = try self.panes.updateTitle(id, title);
+        try self.renderPluginDetailPane(id);
+    }
+
+    fn syncPluginDetailPane(self: *App) !void {
+        const id = self.plugin_details_pane_id orelse return;
+        const item = self.plugins_list.selectedItem() orelse {
+            self.clearPluginDetailRows();
+            _ = self.panes.clearStreaming(id);
+            _ = try self.panes.updateTitle(id, "plugin details");
+            _ = try self.panes.appendStreaming(id, "select a plugin row\n");
+            return;
+        };
+        try self.showPluginDetail(item, "preview");
+    }
+
+    fn openSelectedPluginDetailRow(self: *App) !void {
+        const row = self.selectedPluginDetailRow() orelse {
+            try self.setStatus("plugin detail pane empty");
+            return;
+        };
+        switch (row.action) {
+            .run_command => {
+                const command_name = row.command_name orelse {
+                    try self.setStatus("plugin command missing name");
+                    return;
+                };
+                try self.setStatus(row.detail orelse "running plugin command");
+                if (!try self.invokeBuiltinCommand(command_name, &.{})) {
+                    try self.setStatus("unknown plugin command");
+                }
+                try self.syncPluginDetailPane();
+            },
+            .none => {
+                try self.setStatus(row.detail orelse row.label);
+            },
+        }
+    }
+
+    fn rebuildPluginDetailRows(self: *App, item: listpane_mod.Item) !void {
+        const is_same_context = if (self.plugin_detail_context) |context| std.mem.eql(u8, context, item.label) else false;
+        const preserved_selection = self.plugin_detail_selected;
+        if (!is_same_context) {
+            if (self.plugin_detail_context) |text| self.allocator.free(text);
+            self.plugin_detail_context = try self.allocator.dupe(u8, item.label);
+        }
+        self.clearPluginDetailRows();
+        var default_selected: usize = 0;
+        try self.appendPluginDetailRow(item.label, item.detail, .none, null);
+        if (std.mem.eql(u8, item.label, "activity")) {
+            try self.appendPluginDetailRow("activity", if (self.plugin_activity.items.len > 0) self.plugin_activity.items else "none", .none, null);
+            try self.appendPluginDetailRow("source", "plugin activity", .none, null);
+            try self.appendPluginDetailRow("action", "preview", .none, null);
+        } else if (std.mem.startsWith(u8, item.label, "cmd ")) {
+            const command_name = item.label["cmd ".len..];
+            try self.appendPluginDetailRow("command", null, .none, null);
+            try self.appendPluginDetailRow("name", command_name, .none, null);
+            try self.appendPluginDetailRow("scope", "extension", .none, null);
+            default_selected = self.plugin_detail_rows.items.len;
+            try self.appendPluginDetailRow("action", "runnable", .run_command, command_name);
+            try self.appendPluginDetailRow("activity", if (self.plugin_activity.items.len > 0) self.plugin_activity.items else "none", .none, null);
+        } else if (item.label.len > 0) {
+            const manifest_name = pluginManifestNameForLabel(item.label);
+            if (manifest_name) |name| {
+                if (self.plugin_catalog.findEntry(name)) |entry| {
+                    try self.appendPluginDetailRow("manifest", null, .none, null);
+                    try self.appendPluginDetailRow("version", entry.manifest.version, .none, null);
+                    try self.appendPluginDetailRow("source", @tagName(entry.source), .none, null);
+                    try self.appendPluginDetailRow("state", @tagName(entry.state), .none, null);
+                    try self.appendPluginDetailRow("capabilities", null, .none, null);
+                    try self.appendPluginCapabilityRows(entry.manifest.capabilities);
+                }
+            }
+        }
+        if (!is_same_context) {
+            self.plugin_detail_selected = default_selected;
+        } else {
+            self.plugin_detail_selected = preserved_selection;
+        }
+        self.clampPluginDetailSelection();
+    }
+
+    fn appendPluginDetailRow(self: *App, label: []const u8, detail: ?[]const u8, action: PluginDetailAction, command_name: ?[]const u8) !void {
+        try self.plugin_detail_rows.append(.{
+            .label = try self.allocator.dupe(u8, label),
+            .detail = if (detail) |text| try self.allocator.dupe(u8, text) else null,
+            .action = action,
+            .command_name = if (command_name) |text| try self.allocator.dupe(u8, text) else null,
+        });
+    }
+
+    fn appendPluginCapabilityRows(self: *App, caps: builtins_mod.Capabilities) !void {
+        const capabilities = [_]struct { name: []const u8, enabled: bool }{
+            .{ .name = "command", .enabled = caps.command },
+            .{ .name = "event", .enabled = caps.event },
+            .{ .name = "status", .enabled = caps.status },
+            .{ .name = "buffer_read", .enabled = caps.buffer_read },
+            .{ .name = "buffer_edit", .enabled = caps.buffer_edit },
+            .{ .name = "jobs", .enabled = caps.jobs },
+            .{ .name = "workspace", .enabled = caps.workspace },
+            .{ .name = "diagnostics", .enabled = caps.diagnostics },
+            .{ .name = "picker", .enabled = caps.picker },
+            .{ .name = "pane", .enabled = caps.pane },
+            .{ .name = "fs_read", .enabled = caps.fs_read },
+        };
+        var any = false;
+        for (capabilities) |cap| {
+            if (!cap.enabled) continue;
+            any = true;
+            try self.appendPluginDetailRow(cap.name, "enabled", .none, null);
+        }
+        if (!any) {
+            try self.appendPluginDetailRow("none", null, .none, null);
+        }
+    }
+
+    fn selectedPluginDetailRow(self: *const App) ?PluginDetailRow {
+        if (self.plugin_detail_rows.items.len == 0) return null;
+        return self.plugin_detail_rows.items[self.plugin_detail_selected];
+    }
+
+    fn clampPluginDetailSelection(self: *App) void {
+        if (self.plugin_detail_rows.items.len == 0) {
+            self.plugin_detail_selected = 0;
+            return;
+        }
+        if (self.plugin_detail_selected >= self.plugin_detail_rows.items.len) {
+            self.plugin_detail_selected = self.plugin_detail_rows.items.len - 1;
+        }
+    }
+
+    fn clearPluginDetailRows(self: *App) void {
+        for (self.plugin_detail_rows.items) |row| {
+            self.allocator.free(row.label);
+            if (row.detail) |detail| self.allocator.free(detail);
+            if (row.command_name) |name| self.allocator.free(name);
+        }
+        self.plugin_detail_rows.clearRetainingCapacity();
+        self.plugin_detail_selected = 0;
+    }
+
+    fn pluginManifestNameForLabel(label: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, label, "activity")) return null;
+        if (std.mem.startsWith(u8, label, "cmd ")) return null;
+        const end = std.mem.indexOfScalar(u8, label, ' ') orelse label.len;
+        return label[0..end];
+    }
+
+    fn pluginDetailTitle(self: *const App, action: []const u8) ![]u8 {
+        const total = self.plugin_detail_rows.items.len;
+        const selected = if (total == 0) 0 else @min(self.plugin_detail_selected + 1, total);
+        if (action.len == 0 or std.mem.eql(u8, action, "preview")) {
+            return try std.fmt.allocPrint(self.allocator, "plugin details [{d}/{d}]", .{ selected, total });
+        }
+        return try std.fmt.allocPrint(self.allocator, "plugin details [{d}/{d}] {s}", .{ selected, total, action });
+    }
+
+    fn renderPluginDetailPane(self: *App, id: u64) !void {
+        _ = self.panes.clearStreaming(id);
+        const total = self.plugin_detail_rows.items.len;
+        if (total == 0) {
+            _ = try self.panes.appendStreaming(id, "no plugin details\n");
+            return;
+        }
+        for (self.plugin_detail_rows.items, 0..) |row, idx| {
+            const prefix = if (idx == self.plugin_detail_selected) "> " else "  ";
+            if (row.detail) |detail| {
+                const line = try std.fmt.allocPrint(self.allocator, "{s}{s}: {s}", .{ prefix, row.label, detail });
+                defer self.allocator.free(line);
+                _ = try self.panes.appendStreaming(id, line);
+            } else {
+                const line = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, row.label });
+                defer self.allocator.free(line);
+                _ = try self.panes.appendStreaming(id, line);
+            }
+            _ = try self.panes.appendStreaming(id, "\n");
+        }
+    }
+
+    fn syncListPaneOverlay(self: *App, id: u64, title: []const u8, list: *const listpane_mod.ListPane, empty_message: []const u8) !void {
+        _ = try self.panes.updateTitle(id, title);
+        _ = self.panes.clearStreaming(id);
+        if (list.items.items.len == 0) {
+            _ = try self.panes.appendStreaming(id, empty_message);
+            _ = try self.panes.appendStreaming(id, "\n");
+            return;
+        }
+        for (list.items.items, 0..) |item, idx| {
+            const prefix = if (idx == list.selected) "> " else "  ";
+            const line = try std.fmt.allocPrint(self.allocator, "{s}{s} {s}\n", .{ prefix, item.label, item.detail orelse "" });
+            defer self.allocator.free(line);
+            _ = try self.panes.appendStreaming(id, line);
+        }
     }
 
     fn tabCloseCurrent(self: *App) !void {
@@ -4253,6 +5319,8 @@ pub const App = struct {
         const was_dirty = self.activeBuffer().dirty;
         try self.closeCurrentPane();
         if (!was_dirty and !had_split and had_multiple_tabs) {
+            self.workspace.noteSessionChange();
+            try self.refreshDerivedSources();
             try self.setStatus("tab closed");
         }
     }
@@ -4274,6 +5342,8 @@ pub const App = struct {
         self.split_index = null;
         self.split_focus = .left;
         self.active_index = 0;
+        self.workspace.noteSessionChange();
+        try self.refreshDerivedSources();
         try self.setStatus("tab only");
     }
 
@@ -4308,6 +5378,8 @@ pub const App = struct {
                 idx.* += 1;
             }
         }
+        self.workspace.noteSessionChange();
+        try self.refreshDerivedSources();
         try self.setStatus("tab moved");
     }
 
@@ -4367,6 +5439,10 @@ pub const App = struct {
         }
         if (std.mem.eql(u8, stripped, "tabmove")) {
             try self.setStatus("move the current tab to a new index");
+            return;
+        }
+        if (std.mem.eql(u8, stripped, "refresh-sources") or std.mem.eql(u8, stripped, "refresh")) {
+            try self.setStatus("refresh picker and diagnostics sources");
             return;
         }
         if (std.mem.eql(u8, stripped, "marks")) {
@@ -4626,8 +5702,12 @@ pub const App = struct {
         self.config.deinit();
         self.config = new_config;
         var host = self.builtinHost();
-        try self.builtins.rebuild(&host, self.config.builtins.enabled.items);
+        self.builtins.clearExtensionRegistrations();
+        try self.plugin_catalog.rebuild(&host, self.config.builtins.enabled.items, self.config.plugins.root, self.config.plugins.enabled.items);
+        try self.builtins.rebuild(&host, self.config.builtins.api_version, self.plugin_catalog.manifests());
+        self.shutdownConfiguredLsp();
         try self.setStatus("config reloaded");
+        self.startConfiguredLsp();
     }
 
     fn openPath(self: *App, path: []const u8) !void {
@@ -4642,6 +5722,9 @@ pub const App = struct {
         };
         try self.buffers.append(buf);
         self.focusBufferIndex(self.buffers.items.len - 1);
+        try self.workspace.recordOpenBuffer(path);
+        try self.lsp.didOpenPath(path);
+        self.syncActiveSyntax();
         self.emitBuiltinEvent("buffer_open", "{}");
     }
 
@@ -4663,6 +5746,9 @@ pub const App = struct {
             self.split_index = self.buffers.items.len - 1;
         }
         self.split_focus = .right;
+        try self.workspace.recordOpenBuffer(path);
+        try self.lsp.didOpenPath(path);
+        self.syncActiveSyntax();
         self.emitBuiltinEvent("buffer_open", "{}");
     }
 
@@ -4678,7 +5764,40 @@ pub const App = struct {
 
         const show_bottom_bar = self.config.status_bar or self.mode == .command or self.mode == .search;
         const render_height = if (show_bottom_bar and size.rows > 0) size.rows - 1 else size.rows;
-        self.last_render_height = render_height;
+        var diagnostics_rows: usize = 0;
+        if (self.diagnostics_pane_id != null and self.diagnostics.diagnostics.items.len > 0) {
+            diagnostics_rows = @min(8, @max(3, self.diagnostics.diagnostics.items.len + 1));
+        }
+        var picker_rows: usize = 0;
+        if (self.picker_pane_id != null and self.picker.items.items.len > 0) {
+            const available_rows = render_height;
+            if (available_rows > 3) {
+                picker_rows = @min(8, @max(3, available_rows / 3));
+            }
+        }
+        var plugins_rows: usize = 0;
+        if (self.plugins_pane_id != null) {
+            const available_rows = render_height;
+            if (available_rows > 3) {
+                const item_rows = if (self.plugins_list.items.items.len == 0) 1 else self.plugins_list.items.items.len + 1;
+                plugins_rows = @min(8, @max(3, @min(available_rows / 3, item_rows)));
+            } else {
+                plugins_rows = available_rows;
+            }
+        }
+        var plugin_details_rows: usize = 0;
+        if (self.plugin_details_pane_id != null) {
+            const available_rows = render_height;
+            if (available_rows > 3) {
+                const detail_lines: usize = if (self.plugin_detail_rows.items.len == 0) 3 else self.plugin_detail_rows.items.len + 1;
+                plugin_details_rows = @min(8, @max(3, @min(available_rows / 3, detail_lines)));
+            } else {
+                plugin_details_rows = available_rows;
+            }
+        }
+        const overlay_rows = plugins_rows + plugin_details_rows + diagnostics_rows + picker_rows;
+        const content_height = if (render_height > overlay_rows) render_height - overlay_rows else 0;
+        self.last_render_height = content_height;
         const has_split = self.split_index != null and size.cols > 1;
         const separator_width: usize = if (has_split) 1 else 0;
         const available_width = if (size.cols > separator_width) size.cols - separator_width else size.cols;
@@ -4700,12 +5819,38 @@ pub const App = struct {
             left_width = available_width;
         }
 
-        try self.renderPane(writer, self.activeBuffer(), 0, left_width, render_height, self.split_focus == .left);
+        try self.renderPane(writer, self.activeBuffer(), 0, left_width, content_height, self.split_focus == .left);
         if (has_split and right_width > 0) {
-            try self.renderPaneSeparator(writer, left_width, render_height);
+            try self.renderPaneSeparator(writer, left_width, content_height);
             if (self.split_index) |idx| {
-                try self.renderPane(writer, &self.buffers.items[idx], right_x, right_width, render_height, self.split_focus == .right);
+                try self.renderPane(writer, &self.buffers.items[idx], right_x, right_width, content_height, self.split_focus == .right);
             }
+        }
+
+        if (plugins_rows > 0) {
+            if (self.plugins_pane_id) |id| {
+                if (self.findPaneById(id)) |pane| {
+                    try self.renderTextOverlayPane(writer, size.cols, content_height + 1, plugins_rows, pane.title, pane.streaming.items);
+                }
+            }
+        }
+        if (plugin_details_rows > 0) {
+            if (self.plugin_details_pane_id) |id| {
+                if (self.findPaneById(id)) |pane| {
+                    try self.renderTextOverlayPane(writer, size.cols, content_height + 1 + plugins_rows, plugin_details_rows, pane.title, pane.streaming.items);
+                }
+            }
+        }
+        if (diagnostics_rows > 0) {
+            if (self.diagnostics_pane_id) |id| {
+                if (self.findPaneById(id)) |pane| {
+                    try self.renderTextOverlayPane(writer, size.cols, content_height + 1 + plugins_rows + plugin_details_rows, diagnostics_rows, pane.title, pane.streaming.items);
+                }
+            }
+        }
+        if (picker_rows > 0) {
+            const picker_row = content_height + plugins_rows + plugin_details_rows + diagnostics_rows + 1;
+            try self.renderPickerPane(writer, size.cols, picker_row, picker_rows);
         }
 
         if (show_bottom_bar and size.rows > 0) {
@@ -4840,7 +5985,7 @@ pub const App = struct {
                     try writeStyle(writer, self.theme.textStyle(active));
                     const suffix = "  [+fold]";
                     const room = if (available > suffix.len) available - suffix.len else 0;
-                    try self.renderHighlightedLine(writer, line[0..@min(line.len, room)], row, available, active_search, active_visual, active);
+                    try self.renderHighlightedLine(writer, line[0..@min(line.len, room)], row, available, active_search, active_visual, self.rowDecorationForBuffer(buffer, row), active);
                     try writeStyle(writer, self.theme.separatorStyle());
                     try writer.writeAll(suffix);
                     try writer.writeAll("\x1b[0m");
@@ -4859,13 +6004,125 @@ pub const App = struct {
             const line = buffer.lines.items[row];
             const gutter_width: usize = if (self.config.show_line_numbers) 7 else 0;
             const available = if (width > gutter_width) width - gutter_width else 0;
-            try self.renderHighlightedLine(writer, line, row, available, active_search, active_visual, active);
+            try self.renderHighlightedLine(writer, line, row, available, active_search, active_visual, self.rowDecorationForBuffer(buffer, row), active);
             screen_row += 1;
             row += 1;
         }
     }
 
-    const HighlightKind = enum { base, search, visual };
+    fn renderPickerPane(self: *App, writer: anytype, cols: usize, row: usize, height: usize) !void {
+        if (height == 0) return;
+        const pane_style = self.theme.statusStyle();
+        const title = if (self.picker.state == .loading)
+            "picker loading"
+        else if (self.picker.state == .failed)
+            self.picker.error_message orelse "picker"
+        else
+            "picker";
+        try writer.print("\x1b[{d};1H", .{row});
+        try writeStyle(writer, pane_style);
+        try writer.writeByte(' ');
+        try writer.writeAll("󰌑 ");
+        try writeStyledText(writer, pane_style, title);
+        while (displayWidth(title) + 3 < cols) {
+            try writer.writeByte(' ');
+            if (displayWidth("picker") + 3 >= cols) break;
+        }
+        try writer.writeAll("\x1b[0m");
+
+        if (height < 2) return;
+        const visible_rows = height - 1;
+        const total_items = self.picker.items.items.len;
+        const selected = if (total_items == 0) 0 else @min(self.picker.selected, total_items - 1);
+        const scroll = if (selected >= visible_rows and visible_rows > 0) selected - visible_rows + 1 else 0;
+        var idx: usize = 0;
+        while (idx < visible_rows) : (idx += 1) {
+            const item_index = scroll + idx;
+            const current_row = row + idx + 1;
+            try writer.print("\x1b[{d};1H", .{current_row});
+            if (item_index >= total_items) {
+                try writeStyle(writer, pane_style);
+                while (idx < visible_rows) : (idx += 1) {
+                    try writer.print("\x1b[{d};1H", .{row + idx + 1});
+                    try writeStyle(writer, pane_style);
+                    try writer.writeByte(' ');
+                    while (displayWidth("") + 1 < cols) {
+                        try writer.writeByte(' ');
+                        if (cols <= 1) break;
+                        break;
+                    }
+                    try writer.writeAll("\x1b[0m");
+                }
+                break;
+            }
+            const item = self.picker.items.items[item_index];
+            const active = item_index == selected;
+            const prefix = if (active) ">" else " ";
+            const prefix_style = if (active) self.theme.visualStyle() else pane_style;
+            try writeStyle(writer, prefix_style);
+            try writer.writeByte(' ');
+            try writer.writeAll(prefix);
+            try writer.writeByte(' ');
+            const label_budget = if (cols > 4) cols - 4 else 0;
+            const label = clipText(item.label, label_budget);
+            try writeStyledText(writer, prefix_style, label);
+            if (item.detail) |detail| {
+                const room = if (cols > displayWidth(label) + 7) cols - displayWidth(label) - 7 else 0;
+                if (room > 0) {
+                    try writeStyledText(writer, pane_style, " │ ");
+                    try writeStyledText(writer, pane_style, clipText(detail, room));
+                }
+            }
+            while (displayWidth(label) + 4 < cols) {
+                try writer.writeByte(' ');
+                if (displayWidth(label) + 4 >= cols) break;
+            }
+            try writer.writeAll("\x1b[0m");
+        }
+    }
+
+    fn renderTextOverlayPane(self: *App, writer: anytype, cols: usize, row: usize, height: usize, title: []const u8, text: []const u8) !void {
+        if (height == 0) return;
+        const pane_style = self.theme.statusStyle();
+        try writer.print("\x1b[{d};1H", .{row});
+        try writeStyle(writer, pane_style);
+        try writer.writeByte(' ');
+        try writer.writeAll(title);
+        while (displayWidth(title) + 1 < cols) {
+            try writer.writeByte(' ');
+            if (cols <= displayWidth(title) + 1) break;
+        }
+        try writer.writeAll("\x1b[0m");
+
+        if (height < 2) return;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        var current_row: usize = row + 1;
+        while (current_row < row + height) : (current_row += 1) {
+            try writer.print("\x1b[{d};1H", .{current_row});
+            try writeStyle(writer, pane_style);
+            if (lines.next()) |line| {
+                try writer.writeByte(' ');
+                try writer.writeAll(clipText(line, if (cols > 1) cols - 1 else 0));
+            } else {
+                try writer.writeByte(' ');
+            }
+            while (displayWidth("") + 1 < cols) {
+                try writer.writeByte(' ');
+                if (cols <= 1) break;
+                break;
+            }
+            try writer.writeAll("\x1b[0m");
+        }
+    }
+
+    fn findPaneById(self: *App, id: u64) ?*pane_mod.Pane {
+        for (self.panes.panes.items) |*pane| {
+            if (pane.id == id) return pane;
+        }
+        return null;
+    }
+
+    const HighlightKind = enum { base, search, visual, hint };
     const TextRange = struct { start: usize, end: usize };
 
     fn renderHighlightedLine(
@@ -4876,6 +6133,7 @@ pub const App = struct {
         available: usize,
         search: ?[]const u8,
         visual: ?VisualSelection,
+        decoration: ?[]const u8,
         active: bool,
     ) !void {
         const limit = @min(line.len, available);
@@ -4905,10 +6163,21 @@ pub const App = struct {
                     .base => try writeStyle(writer, base_style),
                     .search => try writeStyle(writer, self.theme.searchStyle()),
                     .visual => try writeStyle(writer, self.theme.visualStyle()),
+                    .hint => try writeStyle(writer, self.theme.separatorStyle()),
                 }
                 current = kind;
             }
             try writer.writeByte(line[col]);
+        }
+        if (decoration) |hint| {
+            if (limit < available and hint.len > 0) {
+                const remaining = available - limit;
+                if (remaining > 3) {
+                    try writeStyle(writer, self.theme.separatorStyle());
+                    try writer.writeAll(" │ ");
+                    try writeStyledText(writer, self.theme.separatorStyle(), clipText(hint, remaining - 3));
+                }
+            }
         }
         try writer.writeAll("\x1b[0m");
     }
@@ -4918,6 +6187,28 @@ pub const App = struct {
         if (needle.len == 0 or start > line.len) return null;
         const hit = std.mem.indexOfPos(u8, line, start, needle) orelse return null;
         return .{ .start = hit, .end = hit + needle.len };
+    }
+
+    fn rowDecorationForBuffer(self: *App, buffer: *buffer_mod.Buffer, row: usize) ?[]const u8 {
+        for (self.diagnostics.decorations.items) |decoration| {
+            if (decoration.buffer_id == buffer.id and decoration.row == row) {
+                if (decoration.text) |text| return text;
+            }
+        }
+        for (self.diagnostics.diagnostics.items) |diagnostic| {
+            if (diagnostic.buffer_id == buffer.id and diagnostic.row == row) {
+                return diagnostic.message;
+            }
+        }
+        const path = buffer.path orelse return null;
+        for (self.lsp.diagnostics.items) |diagnostic| {
+            if (diagnostic.row == row) {
+                if (diagnostic.path) |diag_path| {
+                    if (std.mem.eql(u8, diag_path, path)) return diagnostic.message;
+                }
+            }
+        }
+        return null;
     }
 
     fn visualRangeForRow(self: *App, selection: VisualSelection, row: usize, line_len: usize) ?TextRange {
@@ -5025,16 +6316,48 @@ pub const App = struct {
 
         const app_status = self.status.items;
         const builtin_status = self.builtins.statusText();
+        const plugin_status_local = try self.plugin_catalog.statusText(self.allocator);
+        defer self.allocator.free(plugin_status_local);
+        const builtin_status_combined = if (builtin_status.len == 0) plugin_status_local else if (plugin_status_local.len == 0) builtin_status else blk: {
+            break :blk try std.fmt.allocPrint(self.allocator, "{s} | {s}", .{ builtin_status, plugin_status_local });
+        };
+        defer if (builtin_status_combined.len > 0 and builtin_status_combined.ptr != builtin_status.ptr and builtin_status_combined.ptr != plugin_status_local.ptr) self.allocator.free(builtin_status_combined);
+        const diagnostics_status_local = try self.diagnostics.statusText(self.allocator);
+        defer self.allocator.free(diagnostics_status_local);
+        const lsp_diagnostics_status = try self.lsp.statusText(self.allocator);
+        defer self.allocator.free(lsp_diagnostics_status);
+        const diagnostics_status = if (diagnostics_status_local.len == 0) lsp_diagnostics_status else if (lsp_diagnostics_status.len == 0) diagnostics_status_local else blk: {
+            break :blk try std.fmt.allocPrint(self.allocator, "{s} | LSP {s}", .{ diagnostics_status_local, lsp_diagnostics_status });
+        };
+        defer if (diagnostics_status.len > 0 and diagnostics_status.ptr != diagnostics_status_local.ptr and diagnostics_status.ptr != lsp_diagnostics_status.ptr) self.allocator.free(diagnostics_status);
+        const pane_status = if (self.panes.panes.items.len > 1) try self.panes.statusText(self.allocator) else try self.allocator.dupe(u8, "");
+        defer self.allocator.free(pane_status);
+        const picker_status = if (self.picker.query.items.len > 0 or self.picker.items.items.len > 0) try self.picker.statusText(self.allocator, "picker") else try self.allocator.dupe(u8, "");
+        defer self.allocator.free(picker_status);
+        const quickfix_status = if (self.quickfix_list.query.items.len > 0 or self.quickfix_list.items.items.len > 0) try self.quickfix_list.statusText(self.allocator, "quickfix") else try self.allocator.dupe(u8, "");
+        defer self.allocator.free(quickfix_status);
         const app_prefix = "󰞋 ";
         const builtin_prefix = "󰒓 ";
+        const diagnostics_prefix = "󰧑 ";
+        const pane_prefix = "󰓩 ";
+        const picker_prefix = "󰌑 ";
+        const quickfix_prefix = "󰜴 ";
         const app_width = if (app_status.len > 0) displayWidth(app_prefix) + displayWidth(app_status) else 0;
-        const builtin_width = if (builtin_status.len > 0) displayWidth(builtin_prefix) + displayWidth(builtin_status) else 0;
+        const builtin_width = if (builtin_status_combined.len > 0) displayWidth(builtin_prefix) + displayWidth(builtin_status_combined) else 0;
+        const diagnostics_width = if (diagnostics_status.len > 0) displayWidth(diagnostics_prefix) + displayWidth(diagnostics_status) else 0;
+        const pane_width = if (pane_status.len > 0) displayWidth(pane_prefix) + displayWidth(pane_status) else 0;
+        const picker_width = if (picker_status.len > 0) displayWidth(picker_prefix) + displayWidth(picker_status) else 0;
+        const quickfix_width = if (quickfix_status.len > 0) displayWidth(quickfix_prefix) + displayWidth(quickfix_status) else 0;
         const location_width = displayWidth(location);
         const progress_width = displayWidth(progress);
         const sep_width: usize = displayWidth(" │ ");
 
-        var include_app = app_width > 0 and max_width >= app_width + builtin_width + location_width + progress_width + (if (builtin_width > 0) sep_width else 0) + (if (location_width > 0 and progress_width > 0) sep_width else 0) + (if (app_width > 0 and (builtin_width > 0 or location_width > 0)) sep_width else 0);
-        var include_builtin = builtin_width > 0 and max_width >= builtin_width + location_width + progress_width + (if (location_width > 0 and progress_width > 0) sep_width else 0) + (if (builtin_width > 0 and location_width > 0) sep_width else 0);
+        var include_app = app_width > 0 and max_width >= app_width + builtin_width + diagnostics_width + pane_width + picker_width + quickfix_width + location_width + progress_width;
+        var include_builtin = builtin_width > 0 and max_width >= builtin_width + diagnostics_width + pane_width + picker_width + quickfix_width + location_width + progress_width;
+        var include_diagnostics = diagnostics_width > 0 and max_width >= diagnostics_width + pane_width + picker_width + quickfix_width + location_width + progress_width;
+        var include_pane = pane_width > 0 and max_width >= pane_width + picker_width + quickfix_width + location_width + progress_width;
+        var include_picker = picker_width > 0 and max_width >= picker_width + quickfix_width + location_width + progress_width;
+        const include_quickfix = quickfix_width > 0 and max_width >= quickfix_width + location_width + progress_width;
 
         const mandatory_width = location_width + progress_width + (if (location_width > 0 and progress_width > 0) sep_width else 0);
         if (mandatory_width > max_width) {
@@ -5061,7 +6384,27 @@ pub const App = struct {
         if (include_builtin) {
             if (out.items.len > 0) try out.appendSlice(" │ ");
             try out.appendSlice(builtin_prefix);
-            try out.appendSlice(builtin_status);
+            try out.appendSlice(builtin_status_combined);
+        }
+        if (include_diagnostics) {
+            if (out.items.len > 0) try out.appendSlice(" │ ");
+            try out.appendSlice(diagnostics_prefix);
+            try out.appendSlice(diagnostics_status);
+        }
+        if (include_pane) {
+            if (out.items.len > 0) try out.appendSlice(" │ ");
+            try out.appendSlice(pane_prefix);
+            try out.appendSlice(pane_status);
+        }
+        if (include_picker) {
+            if (out.items.len > 0) try out.appendSlice(" │ ");
+            try out.appendSlice(picker_prefix);
+            try out.appendSlice(picker_status);
+        }
+        if (include_quickfix) {
+            if (out.items.len > 0) try out.appendSlice(" │ ");
+            try out.appendSlice(quickfix_prefix);
+            try out.appendSlice(quickfix_status);
         }
         if (out.items.len > 0) try out.appendSlice(" │ ");
         try out.appendSlice(location);
@@ -5077,9 +6420,12 @@ pub const App = struct {
         out.clearRetainingCapacity();
         include_app = false;
         include_builtin = builtin_width > 0 and max_width >= builtin_width + location_width + progress_width + sep_width * 2;
+        include_diagnostics = false;
+        include_pane = false;
+        include_picker = false;
         if (include_builtin) {
             try out.appendSlice(builtin_prefix);
-            try out.appendSlice(builtin_status);
+            try out.appendSlice(builtin_status_combined);
             try out.appendSlice(" │ ");
         }
         try out.appendSlice(location);
@@ -5143,11 +6489,40 @@ pub const App = struct {
         try self.status.appendSlice(text);
     }
 
+    fn syncWorkspaceSession(self: *App) !void {
+        for (self.workspace.session.open_buffers.items) |path| {
+            self.allocator.free(path);
+        }
+        self.workspace.session.open_buffers.clearRetainingCapacity();
+        for (self.buffers.items) |buf| {
+            if (buf.path) |path| {
+                try self.workspace.session.open_buffers.append(try self.allocator.dupe(u8, path));
+            }
+        }
+        self.workspace.session.active_index = @min(self.active_index, if (self.buffers.items.len == 0) 0 else self.buffers.items.len - 1);
+        self.workspace.session.split_index = if (self.split_index) |idx| idx else null;
+        self.workspace.session.split_focus_right = self.split_focus == .right;
+        self.workspace.session.split_ratio = self.config.split_ratio;
+        self.workspace.session.selected_picker_index = if (self.picker.items.items.len == 0) 0 else @min(self.picker.selected, self.picker.items.items.len - 1);
+        self.workspace.session.selected_diagnostics_index = if (self.diagnostics_list.items.items.len == 0) 0 else @min(self.diagnostics_list.selected, self.diagnostics_list.items.items.len - 1);
+    }
+
+    fn syncActiveSyntax(self: *App) void {
+        const buf = self.activeBuffer();
+        const snapshot = buf.readSnapshot() catch return;
+        defer buf.freeReadSnapshot(snapshot);
+        self.syntax.updateSnapshot(snapshot) catch {};
+    }
+
     fn builtinHost(self: *App) builtins_mod.Host {
         return .{
             .ctx = self,
+            .caps = .{ .command = true, .event = true, .status = true },
             .set_status = builtinSetStatus,
             .set_extension_status = builtinSetExtensionStatus,
+            .set_plugin_activity = builtinSetPluginActivity,
+            .register_command = builtinRegisterCommand,
+            .register_event = builtinRegisterEvent,
         };
     }
 
@@ -5187,8 +6562,16 @@ pub const App = struct {
             \\  :tabclose      close current tab
             \\  :tabonly       keep only the current tab
             \\  :tabmove N     move current tab to index N
+            \\  :refresh-sources refresh picker and diagnostics sources
+            \\  :plugins        show loaded plugin manifests
             \\  :vimgrep /pat/ [path] search files for a pattern
+            \\  :pickgrep /pat/ [path] search files into the picker
+            \\  :files [path]   list files into the picker
+            \\  :symbols PAT    list symbols into the picker
+            \\  :diagnostics   open the diagnostics pane
+            \\  :dnext / :dprev / :dopen diagnostics navigation and jump
             \\  :cn / :cp      next / previous quickfix item
+            \\  :pnext / :pprev / :popen picker navigation and open
             \\  :cope / :ccl   show / clear quickfix results
             \\  :zf / :za / :zo / :zc / :zE / :zr / :zm / :zi fold commands
             \\  :diffthis / :diffoff / :diffupdate / :diffget / :diffput
@@ -5224,6 +6607,23 @@ fn builtinSetStatus(ctx: *anyopaque, text: []const u8) anyerror!void {
 fn builtinSetExtensionStatus(ctx: *anyopaque, text: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx));
     try app.builtins.setStatus(text);
+}
+
+fn builtinSetPluginActivity(ctx: *anyopaque, text: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    app.plugin_activity.clearRetainingCapacity();
+    try app.plugin_activity.appendSlice(text);
+    try app.syncPluginPane();
+}
+
+fn builtinRegisterCommand(ctx: *anyopaque, name: []const u8, description: []const u8, handler: builtins_mod.CommandHandler) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    try app.builtins.registerExtensionCommand(name, description, handler);
+}
+
+fn builtinRegisterEvent(ctx: *anyopaque, event: []const u8, handler: builtins_mod.EventHandler) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    try app.builtins.registerExtensionEvent(event, handler);
 }
 
 fn testInteractiveCommandHook(app: *App, argv: []const []const u8) bool {
@@ -5420,6 +6820,14 @@ fn expectVisualMode(app: *App, initial: App.VisualMode, bytes: []const u8, app_m
     }
 }
 
+fn pluginCommandSmoke(ctx: *anyopaque, args: []const []const u8) !void {
+    _ = args;
+    const app: *App = @ptrCast(@alignCast(ctx));
+    app.plugin_activity.clearRetainingCapacity();
+    try app.plugin_activity.appendSlice("plugin command invoked");
+    try app.syncPluginPane();
+}
+
 test "command help dispatches to the documented help text" {
     var app = try makeTestApp(std.testing.allocator, "hello world");
     defer app.deinit();
@@ -5429,6 +6837,228 @@ test "command help dispatches to the documented help text" {
     try app.command_buffer.appendSlice(":help saveas");
     try app.executeCommand();
     try std.testing.expectEqualStrings("save the current buffer under a new path", app.status.items);
+}
+
+test "plugin command dispatches through the user facing command path" {
+    var app = try makeTestApp(std.testing.allocator, "hello world");
+    defer app.deinit();
+
+    try app.builtins.registerExtensionCommand("hello-plugin", "announce that the hello plugin is loaded", pluginCommandSmoke);
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":plugins");
+    try app.executeCommand();
+
+    var command_index: ?usize = null;
+    for (app.plugins_list.items.items, 0..) |item, idx| {
+        if (std.mem.eql(u8, item.label, "cmd hello-plugin")) {
+            command_index = idx;
+            break;
+        }
+    }
+    try std.testing.expect(command_index != null);
+    app.plugins_list.selected = command_index.?;
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":popen");
+    try app.executeCommand();
+
+    try std.testing.expect(app.plugin_activity.items.len > 0);
+    try std.testing.expectEqualStrings("plugin command invoked", app.plugin_activity.items);
+    try std.testing.expect(app.plugin_details_pane_id != null);
+    const detail_pane_id = app.plugin_details_pane_id.?;
+    var found_detail = false;
+    for (app.panes.panes.items) |pane| {
+        if (pane.id != detail_pane_id) continue;
+        try std.testing.expectEqualStrings("plugin details", pane.title);
+        found_detail = std.mem.indexOf(u8, pane.streaming.items, "hello-plugin") != null;
+        break;
+    }
+    try std.testing.expect(found_detail);
+    var found = false;
+    for (app.plugins_list.items.items) |item| {
+        if (item.detail) |detail| {
+            if (std.mem.eql(u8, detail, "plugin command invoked")) {
+                found = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "plugin pane navigation updates the detail pane" {
+    var app = try makeTestApp(std.testing.allocator, "hello world");
+    defer app.deinit();
+
+    try app.builtins.registerExtensionCommand("hello-plugin", "announce that the hello plugin is loaded", pluginCommandSmoke);
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":plugins");
+    try app.executeCommand();
+
+    try std.testing.expect(app.plugins_list.items.items.len >= 2);
+    const before = app.plugins_list.selected;
+    try std.testing.expect(app.plugin_details_pane_id != null);
+    const detail_pane_id = app.plugin_details_pane_id.?;
+    var before_streaming: []const u8 = "";
+    for (app.panes.panes.items) |pane| {
+        if (pane.id != detail_pane_id) continue;
+        before_streaming = pane.streaming.items;
+        break;
+    }
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":pnext");
+    try app.executeCommand();
+    try std.testing.expectEqual(before, app.plugins_list.selected);
+    var saw_selected_label = false;
+    var saw_runnable_marker = false;
+    for (app.panes.panes.items) |pane| {
+        if (pane.id != detail_pane_id) continue;
+        saw_selected_label = std.mem.indexOf(u8, pane.streaming.items, "> manifest:") != null;
+        saw_runnable_marker = std.mem.indexOf(u8, before_streaming, "> manifest:") == null and std.mem.indexOf(u8, pane.streaming.items, "> manifest:") != null;
+        break;
+    }
+    try std.testing.expect(saw_selected_label);
+    try std.testing.expect(saw_runnable_marker);
+}
+
+test "plugin detail pane shows manifest metadata" {
+    var app = try makeTestApp(std.testing.allocator, "hello world");
+    defer app.deinit();
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":plugins");
+    try app.executeCommand();
+
+    var manifest_index: ?usize = null;
+    for (app.plugins_list.items.items, 0..) |item, idx| {
+        if (std.mem.eql(u8, item.label, "hello [filesystem]")) {
+            manifest_index = idx;
+            break;
+        }
+    }
+    try std.testing.expect(manifest_index != null);
+    app.plugins_list.selected = manifest_index.?;
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":popen");
+    try app.executeCommand();
+
+    try std.testing.expect(app.plugin_details_pane_id != null);
+    const detail_pane_id = app.plugin_details_pane_id.?;
+    var saw_version = false;
+    var saw_source = false;
+    var saw_state = false;
+    var saw_caps = false;
+    for (app.panes.panes.items) |pane| {
+        if (pane.id != detail_pane_id) continue;
+        saw_version = std.mem.indexOf(u8, pane.streaming.items, "version: 0.1.0") != null;
+        saw_source = std.mem.indexOf(u8, pane.streaming.items, "source: filesystem") != null;
+        saw_state = std.mem.indexOf(u8, pane.streaming.items, "state: loaded") != null;
+        saw_caps = std.mem.indexOf(u8, pane.streaming.items, "capabilities:") != null;
+        break;
+    }
+    try std.testing.expect(saw_version);
+    try std.testing.expect(saw_source);
+    try std.testing.expect(saw_state);
+    try std.testing.expect(saw_caps);
+}
+
+test "plugin detail pane popen reruns the selected plugin command" {
+    var app = try makeTestApp(std.testing.allocator, "hello world");
+    defer app.deinit();
+
+    try app.builtins.registerExtensionCommand("hello-plugin", "announce that the hello plugin is loaded", pluginCommandSmoke);
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":plugins");
+    try app.executeCommand();
+
+    var command_index: ?usize = null;
+    for (app.plugins_list.items.items, 0..) |item, idx| {
+        if (std.mem.eql(u8, item.label, "cmd hello-plugin")) {
+            command_index = idx;
+            break;
+        }
+    }
+    try std.testing.expect(command_index != null);
+    app.plugins_list.selected = command_index.?;
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":popen");
+    try app.executeCommand();
+    try std.testing.expectEqualStrings("plugin command invoked", app.plugin_activity.items);
+
+    var saw_runnable_marker = false;
+    for (app.panes.panes.items) |pane| {
+        if (pane.id != app.plugin_details_pane_id.?) continue;
+        saw_runnable_marker = std.mem.indexOf(u8, pane.streaming.items, "> action: runnable") != null;
+        break;
+    }
+    try std.testing.expect(saw_runnable_marker);
+
+    app.plugin_activity.clearRetainingCapacity();
+    try app.plugin_activity.appendSlice("stale");
+    try app.syncPluginPane();
+    try std.testing.expect(app.plugin_details_pane_id != null);
+    if (app.panes.focusedPaneId()) |focused_id| {
+        try std.testing.expectEqual(app.plugin_details_pane_id.?, focused_id);
+    }
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":popen");
+    try app.executeCommand();
+    try std.testing.expectEqualStrings("plugin command invoked", app.plugin_activity.items);
+    var found = false;
+    for (app.panes.panes.items) |pane| {
+        if (pane.id != app.plugin_details_pane_id.?) continue;
+        found = std.mem.indexOf(u8, pane.streaming.items, "plugin command invoked") != null;
+        break;
+    }
+    try std.testing.expect(found);
+}
+
+test "plugin detail pane refresh resets stale row selection" {
+    var app = try makeTestApp(std.testing.allocator, "hello world");
+    defer app.deinit();
+
+    try app.builtins.registerExtensionCommand("hello-plugin", "announce that the hello plugin is loaded", pluginCommandSmoke);
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":plugins");
+    try app.executeCommand();
+
+    var command_index: ?usize = null;
+    var manifest_index: ?usize = null;
+    for (app.plugins_list.items.items, 0..) |item, idx| {
+        if (std.mem.eql(u8, item.label, "cmd hello-plugin")) command_index = idx;
+        if (std.mem.eql(u8, item.label, "hello [filesystem]")) manifest_index = idx;
+    }
+    try std.testing.expect(command_index != null);
+    try std.testing.expect(manifest_index != null);
+
+    app.plugins_list.selected = command_index.?;
+    try app.syncPluginPane();
+    try std.testing.expect(app.plugin_details_pane_id != null);
+    const detail_pane_id = app.plugin_details_pane_id.?;
+    var saw_runnable = false;
+    for (app.panes.panes.items) |pane| {
+        if (pane.id != detail_pane_id) continue;
+        saw_runnable = std.mem.indexOf(u8, pane.streaming.items, "> action: runnable") != null;
+        break;
+    }
+    try std.testing.expect(saw_runnable);
+
+    app.plugins_list.selected = manifest_index.?;
+    try app.syncPluginPane();
+
+    var saw_manifest = false;
+    var saw_stale_runnable = false;
+    for (app.panes.panes.items) |pane| {
+        if (pane.id != detail_pane_id) continue;
+        saw_manifest = std.mem.indexOf(u8, pane.streaming.items, "> manifest:") != null;
+        saw_stale_runnable = std.mem.indexOf(u8, pane.streaming.items, "> action: runnable") != null;
+        break;
+    }
+    try std.testing.expect(saw_manifest);
+    try std.testing.expect(!saw_stale_runnable);
 }
 
 test "command saveas writes the buffer and updates the path" {
@@ -6166,7 +7796,7 @@ test "quickfix search collects matches and navigates them" {
     app.command_buffer.clearRetainingCapacity();
     try app.command_buffer.appendSlice(":vimgrep /needle/");
     try app.executeCommand();
-    try std.testing.expectEqual(@as(usize, 2), app.quickfix_list.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.quickfix_list.items.items.len);
     try std.testing.expect(std.mem.indexOf(u8, app.status.items, "1/2") != null);
 
     app.command_buffer.clearRetainingCapacity();
@@ -6178,12 +7808,289 @@ test "quickfix search collects matches and navigates them" {
     app.command_buffer.clearRetainingCapacity();
     try app.command_buffer.appendSlice(":cp");
     try app.executeCommand();
-    try std.testing.expectEqual(@as(usize, 0), app.quickfix_index);
+    try std.testing.expectEqual(@as(usize, 0), app.quickfix_list.selected);
 
     app.command_buffer.clearRetainingCapacity();
     try app.command_buffer.appendSlice(":ccl");
     try app.executeCommand();
-    try std.testing.expectEqual(@as(usize, 0), app.quickfix_list.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.quickfix_list.items.items.len);
+}
+
+test "picker search populates results and opens the selected match" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_cwd = try std.process.getCwdAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(old_cwd);
+    try tmp.dir.setAsCwd();
+    defer std.process.changeCurDir(old_cwd) catch {};
+
+    {
+        var f = try tmp.dir.createFile("picker.txt", .{});
+        defer f.close();
+        try f.writeAll("alpha\nneedle\nbeta needle\n");
+    }
+
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":pickgrep /needle/");
+    try app.executeCommand();
+    try std.testing.expectEqual(@as(usize, 2), app.picker.items.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, app.status.items, "1/2") != null);
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":pnext");
+    try app.executeCommand();
+    try std.testing.expectEqual(@as(usize, 1), app.picker.selected);
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":popen");
+    try app.executeCommand();
+    try std.testing.expectEqualStrings("picker.txt", app.activeBuffer().path.?);
+    try std.testing.expectEqual(@as(usize, 2), app.activeBuffer().cursor.row);
+    try std.testing.expectEqual(@as(usize, 5), app.activeBuffer().cursor.col);
+}
+
+test "file picker search lists files and opens the selected path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_cwd = try std.process.getCwdAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(old_cwd);
+    try tmp.dir.setAsCwd();
+    defer std.process.changeCurDir(old_cwd) catch {};
+
+    {
+        var f = try tmp.dir.createFile("alpha.txt", .{});
+        defer f.close();
+        try f.writeAll("alpha\n");
+    }
+    {
+        var f = try tmp.dir.createFile("beta.md", .{});
+        defer f.close();
+        try f.writeAll("beta\n");
+    }
+
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":files .txt");
+    try app.executeCommand();
+    try std.testing.expectEqual(@as(usize, 1), app.picker.items.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, app.status.items, "1/1") != null);
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":popen");
+    try app.executeCommand();
+    try std.testing.expectEqualStrings("alpha.txt", app.activeBuffer().path.?);
+}
+
+test "symbol picker search lists symbols and opens the selected result" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_cwd = try std.process.getCwdAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(old_cwd);
+    try tmp.dir.setAsCwd();
+    defer std.process.changeCurDir(old_cwd) catch {};
+
+    {
+        var f = try tmp.dir.createFile("symbols.zig", .{});
+        defer f.close();
+        try f.writeAll(
+            \\pub fn alpha() void {}
+            \\fn beta() void {}
+        );
+    }
+
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":symbols alpha");
+    try app.executeCommand();
+    try std.testing.expect(app.picker.items.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, app.status.items, "1/") != null);
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":popen");
+    try app.executeCommand();
+    try std.testing.expectEqualStrings("symbols.zig", app.activeBuffer().path.?);
+    try std.testing.expectEqual(@as(usize, 0), app.activeBuffer().cursor.row);
+    try std.testing.expectEqual(@as(usize, 0), app.activeBuffer().cursor.col);
+}
+
+test "picker selection restores from workspace session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_cwd = try std.process.getCwdAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(old_cwd);
+    try tmp.dir.setAsCwd();
+    defer std.process.changeCurDir(old_cwd) catch {};
+
+    {
+        var f = try tmp.dir.createFile("picker.txt", .{});
+        defer f.close();
+        try f.writeAll("alpha\nneedle\nbeta needle\n");
+    }
+
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+    app.workspace.session.selected_picker_index = 1;
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":pickgrep /needle/");
+    try app.executeCommand();
+    try std.testing.expectEqual(@as(usize, 1), app.picker.selected);
+}
+
+test "refresh sources reruns the active picker search" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_cwd = try std.process.getCwdAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(old_cwd);
+    try tmp.dir.setAsCwd();
+    defer std.process.changeCurDir(old_cwd) catch {};
+
+    {
+        var f = try tmp.dir.createFile("refresh.txt", .{});
+        defer f.close();
+        try f.writeAll("needle\nplain\n");
+    }
+
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":pickgrep /needle/");
+    try app.executeCommand();
+    try std.testing.expectEqual(@as(usize, 1), app.picker.items.items.len);
+
+    try std.fs.cwd().writeFile(.{ .sub_path = "refresh.txt", .data = "needle\nplain\nneedle again\n" });
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":refresh-sources");
+    try app.executeCommand();
+    try std.testing.expectEqual(@as(usize, 2), app.picker.items.items.len);
+}
+
+test "diagnostics pane opens and reflects diagnostics counts" {
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    try app.diagnostics.add(.{
+        .buffer_id = 1,
+        .path = try std.testing.allocator.dupe(u8, "sample.txt"),
+        .row = 0,
+        .col = 1,
+        .severity = .err,
+        .message = try std.testing.allocator.dupe(u8, "boom"),
+    });
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":diagnostics");
+    try app.executeCommand();
+
+    try std.testing.expect(app.diagnostics_pane_id != null);
+    if (app.diagnostics_pane_id) |id| {
+        var found = false;
+        for (app.panes.panes.items) |pane| {
+            if (pane.id == id) {
+                found = true;
+                try std.testing.expect(std.mem.indexOf(u8, pane.title, "E1") != null);
+                try std.testing.expect(std.mem.indexOf(u8, pane.title, "1/1") != null);
+            }
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "diagnostics selection restores from workspace session" {
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    try app.diagnostics.add(.{
+        .buffer_id = 1,
+        .path = try std.testing.allocator.dupe(u8, "sample.txt"),
+        .row = 0,
+        .col = 1,
+        .severity = .warning,
+        .message = try std.testing.allocator.dupe(u8, "first"),
+    });
+    try app.diagnostics.add(.{
+        .buffer_id = 1,
+        .path = try std.testing.allocator.dupe(u8, "sample.txt"),
+        .row = 1,
+        .col = 2,
+        .severity = .err,
+        .message = try std.testing.allocator.dupe(u8, "second"),
+    });
+    app.workspace.session.selected_diagnostics_index = 1;
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":diagnostics");
+    try app.executeCommand();
+
+    try std.testing.expectEqual(@as(usize, 1), app.diagnostics_list.selected);
+}
+
+test "diagnostics navigation opens the selected diagnostic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_cwd = try std.process.getCwdAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(old_cwd);
+    try tmp.dir.setAsCwd();
+    defer std.process.changeCurDir(old_cwd) catch {};
+
+    {
+        var f = try tmp.dir.createFile("diag.txt", .{});
+        defer f.close();
+        try f.writeAll("alpha\nbeta\ngamma\n");
+    }
+
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    try app.diagnostics.add(.{
+        .buffer_id = 1,
+        .path = try std.testing.allocator.dupe(u8, "diag.txt"),
+        .row = 0,
+        .col = 0,
+        .severity = .warning,
+        .message = try std.testing.allocator.dupe(u8, "first"),
+    });
+    try app.diagnostics.add(.{
+        .buffer_id = 1,
+        .path = try std.testing.allocator.dupe(u8, "diag.txt"),
+        .row = 1,
+        .col = 2,
+        .severity = .err,
+        .message = try std.testing.allocator.dupe(u8, "second"),
+    });
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":diagnostics");
+    try app.executeCommand();
+    try std.testing.expect(app.diagnostics_pane_id != null);
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":dnext");
+    try app.executeCommand();
+    try std.testing.expectEqual(@as(usize, 1), app.diagnostics_list.selected);
+    try std.testing.expect(std.mem.indexOf(u8, app.status.items, "2/2") != null);
+
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":dopen");
+    try app.executeCommand();
+    try std.testing.expectEqualStrings("diag.txt", app.activeBuffer().path.?);
+    try std.testing.expectEqual(@as(usize, 1), app.activeBuffer().cursor.row);
+    try std.testing.expectEqual(@as(usize, 2), app.activeBuffer().cursor.col);
 }
 
 test "fold commands create and manipulate paragraph folds" {
@@ -6312,6 +8219,49 @@ test "visual mode yank and delete use the selected region" {
     try std.testing.expectEqualStrings("pha beta", app.activeBuffer().currentLine());
 }
 
+test "visual delete can be undone and redone" {
+    var app = try makeTestApp(std.testing.allocator, "one\ntwo\nthree");
+    defer app.deinit();
+
+    try app.handleNormalByte('V');
+    try app.handleVisualByte('j');
+    try app.handleVisualByte('x');
+    try std.testing.expectEqualStrings("three", app.activeBuffer().currentLine());
+
+    try pressNormalKeys(&app, "u");
+    const restored = try app.activeBuffer().serialize();
+    defer std.testing.allocator.free(restored);
+    try std.testing.expectEqualStrings("one\ntwo\nthree", restored);
+
+    try pressNormalKeys(&app, "\x12");
+    const redone = try app.activeBuffer().serialize();
+    defer std.testing.allocator.free(redone);
+    try std.testing.expectEqualStrings("three", redone);
+}
+
+test "visual block delete can be undone and redone as one edit" {
+    var app = try makeTestApp(std.testing.allocator, "ab\ncd");
+    defer app.deinit();
+
+    try app.handleNormalByte(0x16);
+    try app.handleVisualByte('j');
+    try app.handleVisualByte('l');
+    try app.handleVisualByte('x');
+    const deleted = try app.activeBuffer().serialize();
+    defer std.testing.allocator.free(deleted);
+    try std.testing.expectEqualStrings("b\nd", deleted);
+
+    try pressNormalKeys(&app, "u");
+    const restored = try app.activeBuffer().serialize();
+    defer std.testing.allocator.free(restored);
+    try std.testing.expectEqualStrings("ab\ncd", restored);
+
+    try pressNormalKeys(&app, "\x12");
+    const redone = try app.activeBuffer().serialize();
+    defer std.testing.allocator.free(redone);
+    try std.testing.expectEqualStrings("b\nd", redone);
+}
+
 test "visual mode can switch shape and restore the previous area" {
     var app = try makeTestApp(std.testing.allocator, "alpha beta");
     defer app.deinit();
@@ -6374,6 +8324,28 @@ test "select mode typing replaces the selection and enters insert mode" {
     const text = try app.activeBuffer().serialize();
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("Xpha", text);
+}
+
+test "select mode typing can be undone and redone" {
+    var app = try makeTestApp(std.testing.allocator, "alpha");
+    defer app.deinit();
+
+    try app.handleNormalByte('v');
+    try app.handleVisualByte('l');
+    try app.handleVisualByte('l');
+    try app.handleVisualByte(0x07);
+    try app.handleByte('X', std.fs.File.stdin());
+    try std.testing.expectEqual(Mode.insert, app.mode);
+
+    try pressNormalKeys(&app, "u");
+    const restored = try app.activeBuffer().serialize();
+    defer std.testing.allocator.free(restored);
+    try std.testing.expectEqualStrings("alpha", restored);
+
+    try pressNormalKeys(&app, "\x12");
+    const redone = try app.activeBuffer().serialize();
+    defer std.testing.allocator.free(redone);
+    try std.testing.expectEqualStrings("Xpha", redone);
 }
 
 test "replace mode overwrites characters in place" {
@@ -7097,4 +9069,92 @@ test "editor command aliases" {
     try std.testing.expect(matchesCommand("help", &.{ "h", "help" }, ":help"));
     try std.testing.expect(matchesCommand("wq", &.{ "wq", "x" }, ":wq"));
     try std.testing.expect(matchesCommand("q!", &.{"q!"}, ":q!"));
+}
+
+test "lsp-enabled startup path launches the configured server" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_cwd = try std.process.getCwdAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(old_cwd);
+    try tmp.dir.setAsCwd();
+    defer std.process.changeCurDir(old_cwd) catch {};
+
+    var app = try makeTestApp(std.testing.allocator, "alpha");
+    defer app.deinit();
+
+    app.config.lsp.enabled = true;
+    app.config.allocator.free(app.config.lsp.command);
+    app.config.lsp.command = try app.allocator.dupe(u8, "sh");
+    try app.config.lsp.args.append(try app.allocator.dupe(u8, "-c"));
+    try app.config.lsp.args.append(try app.allocator.dupe(u8, "cat > lsp-init.log"));
+
+    app.startConfiguredLsp();
+    try std.testing.expect(app.lsp_server != null);
+    app.shutdownConfiguredLsp();
+
+    const capture = try tmp.dir.readFileAlloc(std.testing.allocator, "lsp-init.log", 1 << 20);
+    defer std.testing.allocator.free(capture);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"method\":\"initialize\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"rootUri\":\"file://") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"workspaceFolders\"") != null);
+}
+
+test "buffer close clears buffered lsp state for the closed path" {
+    var app = try makeTestApp(std.testing.allocator, "alpha");
+    defer app.deinit();
+
+    try app.activeBuffer().replacePath("sample.txt");
+    try app.lsp.publishDiagnostic(.{
+        .buffer_id = 0,
+        .path = try app.allocator.dupe(u8, "sample.txt"),
+        .row = 0,
+        .col = 0,
+        .severity = .warning,
+        .message = try app.allocator.dupe(u8, "first"),
+    });
+    try app.lsp.publishSymbol(.{
+        .id = 1,
+        .path = try app.allocator.dupe(u8, "sample.txt"),
+        .row = 0,
+        .col = 0,
+        .label = try app.allocator.dupe(u8, "alpha"),
+        .detail = try app.allocator.dupe(u8, "fn alpha"),
+        .score = 1,
+    });
+
+    try app.closeCurrentPane();
+    try std.testing.expectEqual(@as(usize, 0), app.lsp.diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.lsp.symbols.items.len);
+    try std.testing.expectEqualStrings("buffer closed", app.status.items);
+}
+
+test "lsp startup failure falls back without quitting the editor" {
+    var app = try makeTestApp(std.testing.allocator, "alpha");
+    defer app.deinit();
+
+    app.config.lsp.enabled = true;
+    app.config.allocator.free(app.config.lsp.command);
+    app.config.lsp.command = try app.allocator.dupe(u8, "definitely-not-a-real-lsp-binary");
+
+    app.startConfiguredLsp();
+    try std.testing.expect(app.lsp_server == null);
+    try std.testing.expect(std.mem.indexOf(u8, app.status.items, "lsp executable not found") != null);
+}
+
+test "lsp shutdown helper clears the started server" {
+    var app = try makeTestApp(std.testing.allocator, "alpha");
+    defer app.deinit();
+
+    app.config.lsp.enabled = true;
+    app.config.allocator.free(app.config.lsp.command);
+    app.config.lsp.command = try app.allocator.dupe(u8, "sh");
+    try app.config.lsp.args.append(try app.allocator.dupe(u8, "-c"));
+    try app.config.lsp.args.append(try app.allocator.dupe(u8, "cat"));
+
+    app.startConfiguredLsp();
+    try std.testing.expect(app.lsp_server != null);
+
+    app.shutdownConfiguredLsp();
+    try std.testing.expect(app.lsp_server == null);
 }

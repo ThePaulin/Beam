@@ -23,6 +23,8 @@ pub const Config = struct {
     theme: []u8,
     keymap: Keymap,
     builtins: Builtins,
+    plugins: Plugins,
+    lsp: Lsp,
 
     pub const Keymap = struct {
         pub const LeaderBinding = struct {
@@ -46,7 +48,20 @@ pub const Config = struct {
     };
 
     pub const Builtins = struct {
+        api_version: u32 = 1,
         enabled: std.array_list.Managed([]u8),
+    };
+
+    pub const Plugins = struct {
+        api_version: u32 = 1,
+        root: []u8,
+        enabled: std.array_list.Managed([]u8),
+    };
+
+    pub const Lsp = struct {
+        enabled: bool = false,
+        command: []u8,
+        args: std.array_list.Managed([]u8),
     };
 
     pub fn init(allocator: std.mem.Allocator) !Config {
@@ -59,6 +74,11 @@ pub const Config = struct {
             .keywordprg = try allocator.dupe(u8, "man"),
             .equalprg = try allocator.dupe(u8, "cat"),
             .theme = try allocator.dupe(u8, "beam"),
+            .lsp = .{
+                .enabled = false,
+                .command = try allocator.dupe(u8, ""),
+                .args = std.array_list.Managed([]u8).init(allocator),
+            },
             .keymap = .{
                 .leader = try allocator.dupe(u8, ":"),
                 .help = try allocator.dupe(u8, ":help"),
@@ -75,6 +95,12 @@ pub const Config = struct {
                 .leader_bindings = std.array_list.Managed(Keymap.LeaderBinding).init(allocator),
             },
             .builtins = .{
+                .api_version = 1,
+                .enabled = std.array_list.Managed([]u8).init(allocator),
+            },
+            .plugins = .{
+                .api_version = 1,
+                .root = try allocator.dupe(u8, "plugins"),
                 .enabled = std.array_list.Managed([]u8).init(allocator),
             },
         };
@@ -109,6 +135,16 @@ pub const Config = struct {
             self.allocator.free(item);
         }
         self.builtins.enabled.deinit();
+        self.allocator.free(self.plugins.root);
+        for (self.plugins.enabled.items) |item| {
+            self.allocator.free(item);
+        }
+        self.plugins.enabled.deinit();
+        self.allocator.free(self.lsp.command);
+        for (self.lsp.args.items) |item| {
+            self.allocator.free(item);
+        }
+        self.lsp.args.deinit();
     }
 };
 
@@ -208,8 +244,42 @@ fn apply(config: *Config, section: []const u8, key: []const u8, value: []const u
     }
 
     if (std.mem.eql(u8, section, "builtins")) {
+        if (std.mem.eql(u8, scope, "api_version")) {
+            config.builtins.api_version = @as(u32, @intCast(try parseInt(value, line_no, diag)));
+            return;
+        }
         if (std.mem.eql(u8, scope, "enabled")) {
             try parseStringArray(config, value, diag, line_no);
+            return;
+        }
+    }
+
+    if (std.mem.eql(u8, section, "plugins")) {
+        if (std.mem.eql(u8, scope, "api_version")) {
+            config.plugins.api_version = @as(u32, @intCast(try parseInt(value, line_no, diag)));
+            return;
+        }
+        if (std.mem.eql(u8, scope, "root")) {
+            try replaceString(config.allocator, &config.plugins.root, value, line_no, diag);
+            return;
+        }
+        if (std.mem.eql(u8, scope, "enabled")) {
+            try parseStringArrayInto(config.allocator, &config.plugins.enabled, value, diag, line_no);
+            return;
+        }
+    }
+
+    if (std.mem.eql(u8, section, "lsp")) {
+        if (std.mem.eql(u8, scope, "enabled")) {
+            config.lsp.enabled = try parseBool(value, line_no, diag);
+            return;
+        }
+        if (std.mem.eql(u8, scope, "command")) {
+            try replaceString(config.allocator, &config.lsp.command, value, line_no, diag);
+            return;
+        }
+        if (std.mem.eql(u8, scope, "args")) {
+            try parseStringArrayInto(config.allocator, &config.lsp.args, value, diag, line_no);
             return;
         }
     }
@@ -280,6 +350,10 @@ fn apply(config: *Config, section: []const u8, key: []const u8, value: []const u
 }
 
 fn parseStringArray(config: *Config, value: []const u8, diag: *Diagnostics, line_no: usize) !void {
+    try parseStringArrayInto(config.allocator, &config.builtins.enabled, value, diag, line_no);
+}
+
+fn parseStringArrayInto(allocator: std.mem.Allocator, dest: *std.array_list.Managed([]u8), value: []const u8, diag: *Diagnostics, line_no: usize) !void {
     if (value.len < 2 or value[0] != '[' or value[value.len - 1] != ']') {
         diag.* = .{ .line = line_no, .column = 1, .message = "expected [\"a\", \"b\"]" };
         return error.InvalidToml;
@@ -289,7 +363,7 @@ fn parseStringArray(config: *Config, value: []const u8, diag: *Diagnostics, line
     var it = splitComma(inner);
     while (it.next()) |entry| {
         const parsed = try parseString(entry, line_no, diag);
-        try config.builtins.enabled.append(try config.allocator.dupe(u8, parsed));
+        try dest.append(try allocator.dupe(u8, parsed));
     }
 }
 
@@ -368,7 +442,17 @@ test "config parse" {
         \\opacity = 75
         \\
         \\[builtins]
+        \\api_version = 1
         \\enabled = ["hello"]
+        \\
+        \\[plugins]
+        \\root = "zig-out/plugins"
+        \\enabled = ["hello"]
+        \\
+        \\[lsp]
+        \\enabled = true
+        \\command = "clangd"
+        \\args = ["--background-index"]
     , &diag);
     try std.testing.expectEqual(@as(usize, 2), cfg.tab_width);
     try std.testing.expect(!cfg.show_line_numbers);
@@ -378,7 +462,14 @@ test "config parse" {
     try std.testing.expect(cfg.blur);
     try std.testing.expectEqual(@as(usize, 75), cfg.opacity);
     try std.testing.expectEqualStrings("terminal", cfg.background_color);
+    try std.testing.expectEqual(@as(u32, 1), cfg.builtins.api_version);
     try std.testing.expectEqualStrings("hello", cfg.builtins.enabled.items[0]);
+    try std.testing.expectEqualStrings("zig-out/plugins", cfg.plugins.root);
+    try std.testing.expectEqualStrings("hello", cfg.plugins.enabled.items[0]);
+    try std.testing.expectEqual(@as(u32, 1), cfg.plugins.api_version);
+    try std.testing.expect(cfg.lsp.enabled);
+    try std.testing.expectEqualStrings("clangd", cfg.lsp.command);
+    try std.testing.expectEqualStrings("--background-index", cfg.lsp.args.items[0]);
 }
 
 test "config parse status bar icon default sentinel" {

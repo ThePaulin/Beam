@@ -1,8 +1,15 @@
 const std = @import("std");
 
+var next_buffer_id: u64 = 1;
+
 pub const Position = struct {
     row: usize = 0,
     col: usize = 0,
+};
+
+pub const Selection = struct {
+    start: Position,
+    end: Position,
 };
 
 pub const Fold = struct {
@@ -11,35 +18,100 @@ pub const Fold = struct {
     closed: bool = true,
 };
 
-const Snapshot = struct {
+pub const ReadSnapshot = struct {
+    buffer_id: u64,
+    generation: u64,
+    cursor: Position,
+    scroll_row: usize,
+    text: []u8,
+    selection: ?Selection = null,
+};
+
+const UndoSnapshot = struct {
     text: []u8,
     row: usize,
     col: usize,
 };
 
+pub const EditTransaction = struct {
+    buffer: *Buffer,
+    original_text: []u8,
+    working_text: std.array_list.Managed(u8),
+    cursor: Position,
+    committed: bool = false,
+
+    fn init(buffer: *Buffer) !EditTransaction {
+        const text = try buffer.serialize();
+        var working_text = std.array_list.Managed(u8).init(buffer.allocator);
+        try working_text.appendSlice(text);
+        return .{
+            .buffer = buffer,
+            .original_text = text,
+            .working_text = working_text,
+            .cursor = buffer.cursor,
+        };
+    }
+
+    pub fn deinit(self: *EditTransaction) void {
+        if (!self.committed) {
+            self.working_text.deinit();
+            self.buffer.allocator.free(self.original_text);
+        }
+    }
+
+    pub fn replaceRange(self: *EditTransaction, start: Position, end: Position, replacement: []const u8) !void {
+        const updated = try self.buffer.buildReplacementText(self.working_text.items, start, end, replacement);
+        defer self.buffer.allocator.free(updated);
+        self.working_text.clearRetainingCapacity();
+        try self.working_text.appendSlice(updated);
+        self.cursor = self.buffer.positionAfterReplacement(start, replacement);
+    }
+
+    pub fn insertText(self: *EditTransaction, at: Position, bytes: []const u8) !void {
+        try self.replaceRange(at, at, bytes);
+    }
+
+    pub fn commit(self: *EditTransaction) !void {
+        if (self.committed) return;
+        try self.buffer.pushUndoSnapshotText(self.original_text, self.buffer.cursor);
+        try self.buffer.setText(self.working_text.items);
+        self.buffer.cursor = self.cursor;
+        self.buffer.bumpGeneration();
+        self.buffer.dirty = true;
+        self.committed = true;
+        self.working_text.deinit();
+        self.buffer.allocator.free(self.original_text);
+    }
+};
+
 pub const Buffer = struct {
     allocator: std.mem.Allocator,
+    id: u64,
+    generation: u64 = 1,
     path: ?[]u8 = null,
     lines: std.array_list.Managed([]u8),
     cursor: Position = .{},
     scroll_row: usize = 0,
     fold_enabled: bool = true,
     folds: std.array_list.Managed(Fold),
-    undo_stack: std.array_list.Managed(Snapshot),
-    redo_stack: std.array_list.Managed(Snapshot),
+    undo_stack: std.array_list.Managed(UndoSnapshot),
+    redo_stack: std.array_list.Managed(UndoSnapshot),
     dirty: bool = false,
 
     pub fn initEmpty(allocator: std.mem.Allocator) !Buffer {
         var lines = std.array_list.Managed([]u8).init(allocator);
         try lines.append(try allocator.dupe(u8, ""));
+        const id = next_buffer_id;
+        next_buffer_id += 1;
         return .{
             .allocator = allocator,
+            .id = id,
             .lines = lines,
             .scroll_row = 0,
             .fold_enabled = true,
             .folds = std.array_list.Managed(Fold).init(allocator),
-            .undo_stack = std.array_list.Managed(Snapshot).init(allocator),
-            .redo_stack = std.array_list.Managed(Snapshot).init(allocator),
+            .undo_stack = std.array_list.Managed(UndoSnapshot).init(allocator),
+            .redo_stack = std.array_list.Managed(UndoSnapshot).init(allocator),
         };
     }
 
@@ -57,6 +129,28 @@ pub const Buffer = struct {
         return buffer;
     }
 
+    pub fn beginTransaction(self: *Buffer) !EditTransaction {
+        return try EditTransaction.init(self);
+    }
+
+    pub fn readSnapshot(self: *const Buffer) !ReadSnapshot {
+        return .{
+            .buffer_id = self.id,
+            .generation = self.generation,
+            .cursor = self.cursor,
+            .scroll_row = self.scroll_row,
+            .text = try self.serialize(),
+        };
+    }
+
+    pub fn isFresh(self: *const Buffer, read_snapshot: ReadSnapshot) bool {
+        return read_snapshot.buffer_id == self.id and read_snapshot.generation == self.generation;
+    }
+
+    pub fn freeReadSnapshot(self: *const Buffer, read_snapshot: ReadSnapshot) void {
+        self.allocator.free(read_snapshot.text);
+    }
+
     pub fn deinit(self: *Buffer) void {
         self.clearLines();
         self.clearFolds();
@@ -72,6 +166,7 @@ pub const Buffer = struct {
     pub fn replacePath(self: *Buffer, path: []const u8) !void {
         if (self.path) |old| self.allocator.free(old);
         self.path = try self.allocator.dupe(u8, path);
+        self.bumpGeneration();
     }
 
     pub fn setText(self: *Buffer, text: []const u8) !void {
@@ -80,6 +175,7 @@ pub const Buffer = struct {
         self.cursor = .{};
         self.scroll_row = 0;
         self.clearFolds();
+        self.bumpGeneration();
         self.dirty = false;
     }
 
@@ -127,14 +223,26 @@ pub const Buffer = struct {
 
     pub fn createParagraphFold(self: *Buffer) !void {
         const range = self.paragraphFoldRange() orelse return;
-        if (range.end_row <= range.start_row) return;
-        try self.folds.append(.{ .start_row = range.start_row, .end_row = range.end_row, .closed = true });
+        try self.createFoldRange(range.start_row, range.end_row);
+    }
+
+    pub fn createFoldRange(self: *Buffer, start_row: usize, end_row: usize) !void {
+        if (end_row <= start_row) return;
+        if (start_row >= self.lines.items.len) return;
+        try self.folds.append(.{ .start_row = start_row, .end_row = @min(end_row, self.lines.items.len - 1), .closed = true });
+        self.bumpGeneration();
+    }
+
+    pub fn createFoldRangeClamped(self: *Buffer, start_row: usize, end_row: usize) !void {
+        if (end_row <= start_row) return;
+        try self.createFoldRange(start_row, end_row);
     }
 
     pub fn deleteFoldAtRow(self: *Buffer, row: usize) bool {
         for (self.folds.items, 0..) |fold, idx| {
             if (row >= fold.start_row and row <= fold.end_row) {
                 _ = self.folds.orderedRemove(idx);
+                self.bumpGeneration();
                 return true;
             }
         }
@@ -145,6 +253,7 @@ pub const Buffer = struct {
         for (self.folds.items) |*fold| {
             if (row >= fold.start_row and row <= fold.end_row) {
                 fold.closed = !fold.closed;
+                self.bumpGeneration();
                 return true;
             }
         }
@@ -155,6 +264,7 @@ pub const Buffer = struct {
         for (self.folds.items) |*fold| {
             if (row >= fold.start_row and row <= fold.end_row) {
                 fold.closed = false;
+                self.bumpGeneration();
                 return true;
             }
         }
@@ -165,6 +275,7 @@ pub const Buffer = struct {
         for (self.folds.items) |*fold| {
             if (row >= fold.start_row and row <= fold.end_row) {
                 fold.closed = true;
+                self.bumpGeneration();
                 return true;
             }
         }
@@ -173,14 +284,17 @@ pub const Buffer = struct {
 
     pub fn openAllFolds(self: *Buffer) void {
         for (self.folds.items) |*fold| fold.closed = false;
+        self.bumpGeneration();
     }
 
     pub fn closeAllFolds(self: *Buffer) void {
         for (self.folds.items) |*fold| fold.closed = true;
+        self.bumpGeneration();
     }
 
     pub fn toggleFolding(self: *Buffer) void {
         self.fold_enabled = !self.fold_enabled;
+        self.bumpGeneration();
     }
 
     pub fn replaceLine(self: *Buffer, row: usize, text: []const u8) !void {
@@ -189,6 +303,7 @@ pub const Buffer = struct {
         self.allocator.free(self.lines.items[row]);
         self.lines.items[row] = try self.allocator.dupe(u8, text);
         self.clearHistory(&self.redo_stack);
+        self.bumpGeneration();
         self.dirty = true;
     }
 
@@ -343,6 +458,7 @@ pub const Buffer = struct {
         self.allocator.free(line);
         self.lines.items[self.cursor.row] = new_line;
         self.clearHistory(&self.redo_stack);
+        self.bumpGeneration();
         self.dirty = true;
     }
 
@@ -506,6 +622,7 @@ pub const Buffer = struct {
         try self.setText(new_text);
         self.cursor = self.positionAfterReplacement(start, replacement);
         self.clearHistory(&self.redo_stack);
+        self.bumpGeneration();
         self.dirty = true;
     }
 
@@ -518,6 +635,7 @@ pub const Buffer = struct {
         try self.setText(new_text);
         self.cursor = self.positionAfterReplacement(start, replacement);
         self.clearHistory(&self.redo_stack);
+        self.bumpGeneration();
         self.dirty = true;
         return removed;
     }
@@ -584,6 +702,7 @@ pub const Buffer = struct {
             try self.insertIntoLine(byte);
         }
         self.clearHistory(&self.redo_stack);
+        self.bumpGeneration();
         self.dirty = true;
     }
 
@@ -626,6 +745,7 @@ pub const Buffer = struct {
             self.cursor.col = prev_len;
         }
         self.clearHistory(&self.redo_stack);
+        self.bumpGeneration();
         self.dirty = true;
     }
 
@@ -653,6 +773,7 @@ pub const Buffer = struct {
             _ = self.lines.orderedRemove(self.cursor.row + 1);
         }
         self.clearHistory(&self.redo_stack);
+        self.bumpGeneration();
         self.dirty = true;
     }
 
@@ -665,6 +786,7 @@ pub const Buffer = struct {
         try self.lines.insert(self.cursor.row + 1, right);
         self.cursor.row += 1;
         self.cursor.col = 0;
+        self.bumpGeneration();
     }
 
     pub fn insertBlankLineBelow(self: *Buffer) !void {
@@ -674,6 +796,7 @@ pub const Buffer = struct {
         self.cursor.row += 1;
         self.cursor.col = 0;
         self.clearHistory(&self.redo_stack);
+        self.bumpGeneration();
         self.dirty = true;
     }
 
@@ -683,26 +806,29 @@ pub const Buffer = struct {
         try self.lines.insert(self.cursor.row, empty);
         self.cursor.col = 0;
         self.clearHistory(&self.redo_stack);
+        self.bumpGeneration();
         self.dirty = true;
     }
 
     pub fn undo(self: *Buffer) !void {
         if (self.undo_stack.items.len == 0) return;
-        const current = try self.snapshot();
+        const current = try self.captureUndoSnapshot();
         try self.redo_stack.append(current);
         const snap = self.undo_stack.pop() orelse return;
         try self.restoreSnapshot(snap);
         self.freeSnapshot(snap);
+        self.bumpGeneration();
         self.dirty = true;
     }
 
     pub fn redo(self: *Buffer) !void {
         if (self.redo_stack.items.len == 0) return;
-        const current = try self.snapshot();
+        const current = try self.captureUndoSnapshot();
         try self.undo_stack.append(current);
         const snap = self.redo_stack.pop() orelse return;
         try self.restoreSnapshot(snap);
         self.freeSnapshot(snap);
+        self.bumpGeneration();
         self.dirty = true;
     }
 
@@ -718,7 +844,15 @@ pub const Buffer = struct {
     }
 
     fn pushUndoSnapshot(self: *Buffer) !void {
-        try self.undo_stack.append(try self.snapshot());
+        try self.undo_stack.append(try self.captureUndoSnapshot());
+    }
+
+    fn pushUndoSnapshotText(self: *Buffer, text: []const u8, cursor: Position) !void {
+        try self.undo_stack.append(.{
+            .text = try self.allocator.dupe(u8, text),
+            .row = cursor.row,
+            .col = cursor.col,
+        });
     }
 
     fn paragraphFoldRange(self: *const Buffer) ?struct { start_row: usize, end_row: usize } {
@@ -732,26 +866,31 @@ pub const Buffer = struct {
         return .{ .start_row = start, .end_row = end };
     }
 
-    fn snapshot(self: *const Buffer) !Snapshot {
+    fn captureUndoSnapshot(self: *const Buffer) !UndoSnapshot {
         const text = try self.serialize();
         return .{ .text = text, .row = self.cursor.row, .col = self.cursor.col };
     }
 
-    fn restoreSnapshot(self: *Buffer, snap: Snapshot) !void {
+    fn restoreSnapshot(self: *Buffer, snap: UndoSnapshot) !void {
         try self.setText(snap.text);
         self.cursor = .{ .row = snap.row, .col = snap.col };
         self.dirty = true;
+        self.bumpGeneration();
     }
 
-    fn freeSnapshot(self: *Buffer, snap: Snapshot) void {
+    fn freeSnapshot(self: *Buffer, snap: UndoSnapshot) void {
         self.allocator.free(snap.text);
     }
 
-    fn clearHistory(self: *Buffer, history: *std.array_list.Managed(Snapshot)) void {
+    fn clearHistory(self: *Buffer, history: *std.array_list.Managed(UndoSnapshot)) void {
         for (history.items) |snap| {
             self.allocator.free(snap.text);
         }
         history.clearRetainingCapacity();
+    }
+
+    fn bumpGeneration(self: *Buffer) void {
+        self.generation += 1;
     }
 
     fn clearLines(self: *Buffer) void {

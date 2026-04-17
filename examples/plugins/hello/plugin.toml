@@ -1,0 +1,9 @@
+[plugin]
+name = "hello"
+version = "0.1.0"
+api_version = 1
+
+[capabilities]
+command = true
+event = true
+status = true

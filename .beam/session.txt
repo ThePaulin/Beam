@@ -1,0 +1,6 @@
+api_version=1
+split_ratio=50
+active_index=0
+split_focus_right=false
+selected_picker_index=0
+selected_diagnostics_index=0

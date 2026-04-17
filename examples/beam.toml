@@ -15,6 +15,15 @@ theme = "beam"
 [builtins]
 enabled = ["hello"]
 
+[plugins]
+root = "zig-out/plugins"
+enabled = ["hello"]
+
+[lsp]
+# Set enabled = true and point command/args at your language server.
+# command = "clangd"
+# args = ["--background-index"]
+
 [keymap]
 leader = " "
 help = ":help"
