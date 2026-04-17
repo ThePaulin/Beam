@@ -430,6 +430,9 @@ fn parseManifestDraft(text: []const u8, fallback_name: []const u8) !ManifestDraf
             if (std.mem.eql(u8, key, "picker")) draft.capabilities.picker = enabled else
             if (std.mem.eql(u8, key, "pane")) draft.capabilities.pane = enabled else
             if (std.mem.eql(u8, key, "fs_read")) draft.capabilities.fs_read = enabled else
+            if (std.mem.eql(u8, key, "tree_query")) draft.capabilities.tree_query = enabled else
+            if (std.mem.eql(u8, key, "decoration")) draft.capabilities.decoration = enabled else
+            if (std.mem.eql(u8, key, "lsp")) draft.capabilities.lsp = enabled else
                 return error.InvalidManifest;
             continue;
         }

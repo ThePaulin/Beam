@@ -11,6 +11,7 @@ Beam aims to be a fast editor for the terminal:
 - built-in modules can register commands, react to events, and update editor state
 - QuickJS plugins can extend the editor through a small native bridge
 - search, picker, diagnostics, and workspace state all live in the editor runtime
+- the editor also exposes `:lsp` request commands for definition, hover, completion, references, rename, code actions, and semantic tokens
 
 ## Repository Layout
 
@@ -96,6 +97,19 @@ Beam's normal mode is built around composable motions and edits:
 - visual and select-mode deletes are undoable with the same `u` / `Ctrl-R` workflow
 
 Beam keeps the motion and editing grammar intentionally small, but the goal is for the pieces above to compose cleanly.
+
+For Zig buffers, Beam also uses Tree-sitter syntax data where it helps the editor stay structural:
+
+- block text objects prefer parser-backed ranges when available
+- fold creation prefers Tree-sitter fold queries before falling back to paragraph folds
+- open-line actions use syntax-aware indentation when the parser can provide it
+- the status bar shows whether Zig parsing is running in fallback, parser, or parser-plus-queries mode
+
+Beam keeps the Tree-sitter integration self-contained:
+
+- the Tree-sitter runtime and Zig grammar are vendored under `vendor/` and built directly
+- Tree-sitter query files are copied into the Zig build and embedded into the executable
+- the editor still falls back to its non-parser behavior when parser state or query data is unavailable
 
 ## Configuration
 

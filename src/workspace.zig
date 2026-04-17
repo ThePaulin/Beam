@@ -58,6 +58,20 @@ pub const Workspace = struct {
         self.session_generation += 1;
     }
 
+    pub fn gitBranchName(self: *Workspace, allocator: std.mem.Allocator) ![]u8 {
+        const head_path = try std.fs.path.join(allocator, &[_][]const u8{ self.root_path, ".git", "HEAD" });
+        defer allocator.free(head_path);
+        const raw = std.fs.cwd().readFileAlloc(allocator, head_path, 1024) catch return try allocator.dupe(u8, "");
+        defer allocator.free(raw);
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.startsWith(u8, trimmed, "ref: ")) {
+            const ref = std.mem.trim(u8, trimmed["ref: ".len ..], " \t\r\n");
+            const branch = std.fs.path.basename(ref);
+            return try allocator.dupe(u8, branch);
+        }
+        return try allocator.dupe(u8, "detached");
+    }
+
     pub fn loadSession(self: *Workspace) !void {
         const file = std.fs.cwd().openFile(self.session_path, .{ .mode = .read_only }) catch return;
         defer file.close();

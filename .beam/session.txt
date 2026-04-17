@@ -4,3 +4,4 @@ active_index=0
 split_focus_right=false
 selected_picker_index=0
 selected_diagnostics_index=0
+open=/Users/paulinkubwira/Desktop/test.md

@@ -91,6 +91,15 @@ pub const Scheduler = struct {
         return false;
     }
 
+    pub fn completeFresh(self: *Scheduler, job_id: u64, request_generation: u64, workspace_generation: u64, payload: []const u8, success: bool) !bool {
+        for (self.jobs.items) |*job| {
+            if (job.id != job_id) continue;
+            if (!Scheduler.isFresh(job.*, request_generation, workspace_generation)) return false;
+            return try self.complete(job_id, payload, success);
+        }
+        return false;
+    }
+
     pub fn popCompleted(self: *Scheduler) ?Result {
         return self.completed.pop();
     }
@@ -129,4 +138,13 @@ test "scheduler completion records payloads" {
     try std.testing.expectEqualStrings("done", result.payload);
     try std.testing.expect(result.success);
     std.testing.allocator.free(result.payload);
+}
+
+test "scheduler completeFresh rejects stale generations" {
+    var scheduler = Scheduler.init(std.testing.allocator);
+    defer scheduler.deinit();
+
+    const job_id = try scheduler.spawn(.symbols, 3, 9);
+    try std.testing.expect(!(try scheduler.completeFresh(job_id, 4, 9, "stale", true)));
+    try std.testing.expect(try scheduler.completeFresh(job_id, 3, 9, "fresh", true));
 }
