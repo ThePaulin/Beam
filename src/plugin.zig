@@ -1,6 +1,7 @@
 const std = @import("std");
 const buffer_mod = @import("buffer.zig");
 const diagnostics_mod = @import("diagnostics.zig");
+const listpane_mod = @import("listpane.zig");
 const pane_mod = @import("pane.zig");
 const scheduler_mod = @import("scheduler.zig");
 const syntax_mod = @import("treesitter.zig");
@@ -72,6 +73,12 @@ pub const EventHandler = *const fn (ctx: *anyopaque, payload: []const u8) anyerr
 pub const JobHandler = *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64;
 pub const DecorationHandler = *const fn (ctx: *anyopaque, decoration: diagnostics_mod.Decoration) anyerror!void;
 pub const PaneTextHandler = *const fn (ctx: *anyopaque, pane_id: u64, title: []const u8, text: []const u8) anyerror!void;
+pub const PaneKind = pane_mod.PaneKind;
+pub const PickerItem = listpane_mod.Item;
+pub const PickerPreviewMode = enum {
+    none,
+    detail,
+};
 pub const WorkspaceInfo = struct {
     root_path: []u8,
     session_generation: u64,
@@ -107,6 +114,32 @@ fn defaultAddDecoration(_: *anyopaque, _: diagnostics_mod.Decoration) anyerror!v
 fn defaultSetPaneText(_: *anyopaque, _: u64, _: []const u8, _: []const u8) anyerror!void {
     return error.PermissionDenied;
 }
+
+fn defaultCreatePane(_: *anyopaque, _: PaneKind, _: []const u8) anyerror!u64 {
+    return error.PermissionDenied;
+}
+
+fn defaultFocusPane(_: *anyopaque, _: u64) bool {
+    return false;
+}
+
+fn defaultOpenPicker(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+    return error.PermissionDenied;
+}
+
+fn defaultSetPickerItems(_: *anyopaque, _: []const PickerItem) anyerror!void {
+    return error.PermissionDenied;
+}
+
+fn defaultAppendPickerItem(_: *anyopaque, _: PickerItem) anyerror!void {
+    return error.PermissionDenied;
+}
+
+fn defaultSetPickerPreview(_: *anyopaque, _: ?[]const u8) anyerror!void {
+    return error.PermissionDenied;
+}
+
+fn defaultCancelPicker(_: *anyopaque) void {}
 
 fn defaultReadBufferSnapshot(_: *anyopaque, _: u64) anyerror!buffer_mod.ReadSnapshot {
     return error.PermissionDenied;
@@ -167,6 +200,13 @@ pub const Host = struct {
     spawn_job: *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64 = defaultSpawnJob,
     add_decoration: *const fn (ctx: *anyopaque, decoration: diagnostics_mod.Decoration) anyerror!void = defaultAddDecoration,
     set_pane_text: *const fn (ctx: *anyopaque, pane_id: u64, title: []const u8, text: []const u8) anyerror!void = defaultSetPaneText,
+    create_pane: *const fn (ctx: *anyopaque, kind: PaneKind, title: []const u8) anyerror!u64 = defaultCreatePane,
+    focus_pane: *const fn (ctx: *anyopaque, pane_id: u64) bool = defaultFocusPane,
+    open_picker: *const fn (ctx: *anyopaque, title: []const u8, query: []const u8) anyerror!void = defaultOpenPicker,
+    set_picker_items: *const fn (ctx: *anyopaque, items: []const PickerItem) anyerror!void = defaultSetPickerItems,
+    append_picker_item: *const fn (ctx: *anyopaque, item: PickerItem) anyerror!void = defaultAppendPickerItem,
+    set_picker_preview: *const fn (ctx: *anyopaque, preview: ?[]const u8) anyerror!void = defaultSetPickerPreview,
+    cancel_picker: *const fn (ctx: *anyopaque) void = defaultCancelPicker,
     read_buffer_snapshot: *const fn (ctx: *anyopaque, buffer_id: u64) anyerror!buffer_mod.ReadSnapshot = defaultReadBufferSnapshot,
     free_buffer_snapshot: *const fn (ctx: *anyopaque, snapshot: buffer_mod.ReadSnapshot) void = defaultFreeBufferSnapshot,
     begin_buffer_edit: *const fn (ctx: *anyopaque, buffer_id: u64) anyerror!buffer_mod.EditTransaction = defaultBeginBufferEdit,
@@ -229,6 +269,40 @@ pub const Host = struct {
     pub fn setPaneText(self: *const Host, pane_id: u64, title: []const u8, text: []const u8) !void {
         try self.require(.pane);
         try self.set_pane_text(self.ctx, pane_id, title, text);
+    }
+
+    pub fn createPane(self: *const Host, kind: PaneKind, title: []const u8) !u64 {
+        try self.require(.pane);
+        return try self.create_pane(self.ctx, kind, title);
+    }
+
+    pub fn focusPane(self: *const Host, pane_id: u64) !bool {
+        try self.require(.pane);
+        return self.focus_pane(self.ctx, pane_id);
+    }
+
+    pub fn openPicker(self: *const Host, title: []const u8, query: []const u8) !void {
+        try self.require(.picker);
+        try self.open_picker(self.ctx, title, query);
+    }
+
+    pub fn setPickerItems(self: *const Host, items: []const PickerItem) !void {
+        try self.require(.picker);
+        try self.set_picker_items(self.ctx, items);
+    }
+
+    pub fn appendPickerItem(self: *const Host, item: PickerItem) !void {
+        try self.require(.picker);
+        try self.append_picker_item(self.ctx, item);
+    }
+
+    pub fn setPickerPreview(self: *const Host, preview: ?[]const u8) !void {
+        try self.require(.picker);
+        try self.set_picker_preview(self.ctx, preview);
+    }
+
+    pub fn cancelPicker(self: *const Host) void {
+        self.cancel_picker(self.ctx);
     }
 
     pub fn readBufferSnapshot(self: *const Host, buffer_id: u64) !buffer_mod.ReadSnapshot {

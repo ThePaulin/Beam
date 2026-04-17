@@ -4818,6 +4818,51 @@ pub const App = struct {
         self.picker.setState(.idle);
     }
 
+    fn openPluginPicker(self: *App, title: []const u8, query: []const u8) !void {
+        self.cancelActivePickerSource();
+        self.picker.clear();
+        try self.picker.setQuery(query);
+        self.picker.setState(.loading);
+        try self.ensurePickerPane();
+        try self.syncPickerPaneTitle(title);
+    }
+
+    fn setPluginPickerItems(self: *App, items: []const listpane_mod.Item) !void {
+        try self.ensurePickerPane();
+        try self.picker.setItems(items);
+        self.picker.setState(.ready);
+        if (self.picker.selectedItem()) |item| {
+            try self.syncPluginPickerPreviewForSelection(item);
+        } else {
+            self.picker.clearPreview();
+        }
+        if (self.picker.items.items.len == 0) {
+            try self.setStatus("picker empty");
+        }
+    }
+
+    fn appendPluginPickerItem(self: *App, item: listpane_mod.Item) !void {
+        try self.ensurePickerPane();
+        try self.picker.appendItem(item);
+        self.picker.setState(.ready);
+    }
+
+    fn setPluginPickerPreview(self: *App, preview: ?[]const u8) !void {
+        try self.picker.setPreview(preview);
+    }
+
+    fn cancelPluginPicker(self: *App) void {
+        self.picker.clear();
+    }
+
+    fn syncPluginPickerPreviewForSelection(self: *App, item: listpane_mod.Item) !void {
+        if (item.detail) |detail| {
+            try self.picker.setPreview(detail);
+        } else {
+            self.picker.clearPreview();
+        }
+    }
+
     fn refreshDerivedSources(self: *App) !void {
         _ = self.lsp.refreshDiagnostics() catch {};
         _ = self.lsp.refreshSymbols() catch {};
@@ -5072,13 +5117,17 @@ pub const App = struct {
     }
 
     fn syncPickerPreviewForSelection(self: *App, item: listpane_mod.Item) !void {
-        const spec = self.picker_source_spec orelse {
-            self.picker.clearPreview();
+        if (self.picker_source_spec) |spec| {
+            switch (spec.preview) {
+                .none => self.picker.clearPreview(),
+                .detail => if (item.detail) |detail| try self.picker.setPreview(detail) else self.picker.clearPreview(),
+            }
             return;
-        };
-        switch (spec.preview) {
-            .none => self.picker.clearPreview(),
-            .detail => if (item.detail) |detail| try self.picker.setPreview(detail) else self.picker.clearPreview(),
+        }
+        if (item.detail) |detail| {
+            try self.picker.setPreview(detail);
+        } else {
+            self.picker.clearPreview();
         }
     }
 
@@ -6847,6 +6896,13 @@ pub const App = struct {
             .spawn_job = builtinSpawnJob,
             .add_decoration = builtinAddDecoration,
             .set_pane_text = builtinSetPaneText,
+            .create_pane = builtinCreatePane,
+            .focus_pane = builtinFocusPane,
+            .open_picker = builtinOpenPicker,
+            .set_picker_items = builtinSetPickerItems,
+            .append_picker_item = builtinAppendPickerItem,
+            .set_picker_preview = builtinSetPickerPreview,
+            .cancel_picker = builtinCancelPicker,
             .read_buffer_snapshot = builtinReadBufferSnapshot,
             .free_buffer_snapshot = builtinFreeBufferSnapshot,
             .begin_buffer_edit = builtinBeginBufferEdit,
@@ -6987,10 +7043,47 @@ fn builtinSetPaneText(ctx: *anyopaque, pane_id: u64, title: []const u8, text: []
     _ = try app.panes.appendStreaming(pane_id, text);
 }
 
-fn builtinReadBufferSnapshot(ctx: *anyopaque, buffer_id: u64) anyerror!buffer_mod.ReadSnapshot {
+fn builtinCreatePane(ctx: *anyopaque, kind: plugin_mod.PaneKind, title: []const u8) anyerror!u64 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    return try app.readBufferSnapshot(buffer_id);
+    const id = try app.panes.open(kind, title);
+    _ = app.panes.focus(id);
+    return id;
 }
+
+fn builtinFocusPane(ctx: *anyopaque, pane_id: u64) bool {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.panes.focus(pane_id);
+}
+
+    fn builtinOpenPicker(ctx: *anyopaque, title: []const u8, query: []const u8) anyerror!void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        try app.openPluginPicker(title, query);
+    }
+
+    fn builtinSetPickerItems(ctx: *anyopaque, items: []const listpane_mod.Item) anyerror!void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        try app.setPluginPickerItems(items);
+    }
+
+    fn builtinAppendPickerItem(ctx: *anyopaque, item: listpane_mod.Item) anyerror!void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        try app.appendPluginPickerItem(item);
+    }
+
+    fn builtinSetPickerPreview(ctx: *anyopaque, preview: ?[]const u8) anyerror!void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        try app.setPluginPickerPreview(preview);
+    }
+
+    fn builtinCancelPicker(ctx: *anyopaque) void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        app.cancelPluginPicker();
+    }
+
+    fn builtinReadBufferSnapshot(ctx: *anyopaque, buffer_id: u64) anyerror!buffer_mod.ReadSnapshot {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        return try app.readBufferSnapshot(buffer_id);
+    }
 
 fn builtinFreeBufferSnapshot(ctx: *anyopaque, snapshot: buffer_mod.ReadSnapshot) void {
     const app: *App = @ptrCast(@alignCast(ctx));
@@ -8450,6 +8543,58 @@ test "refresh sources reruns the active picker search" {
     try app.command_buffer.appendSlice(":refresh-sources");
     try app.executeCommand();
     try std.testing.expectEqual(@as(usize, 2), app.picker.items.items.len);
+}
+
+test "plugin picker host can open update preview and cancel" {
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    const host = app.builtinHost();
+    try host.openPicker("plugin picker", "query");
+    try host.setPickerItems(&.{
+        .{ .id = 1, .label = "alpha", .detail = "first item" },
+        .{ .id = 2, .label = "beta", .detail = "second item" },
+    });
+    try host.setPickerPreview("preview text");
+
+    try std.testing.expect(app.picker_pane_id != null);
+    try std.testing.expectEqualStrings("query", app.picker.query.items);
+    try std.testing.expectEqual(@as(usize, 2), app.picker.items.items.len);
+    try std.testing.expect(app.picker.preview != null);
+    try std.testing.expectEqualStrings("preview text", app.picker.preview.?);
+    if (app.picker_pane_id) |pane_id| {
+        var found_title = false;
+        for (app.panes.panes.items) |pane| {
+            if (pane.id == pane_id) {
+                found_title = std.mem.indexOf(u8, pane.title, "plugin picker") != null;
+            }
+        }
+        try std.testing.expect(found_title);
+    }
+
+    host.cancelPicker();
+    try std.testing.expectEqual(@as(usize, 0), app.picker.items.items.len);
+    try std.testing.expectEqual(listpane_mod.SourceState.idle, app.picker.state);
+}
+
+test "plugin host can create and update a custom pane" {
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    const host = app.builtinHost();
+    const pane_id = try host.createPane(.custom, "plugin pane");
+    try std.testing.expect(host.focusPane(pane_id));
+    try host.setPaneText(pane_id, "plugin pane", "hello pane");
+
+    var found = false;
+    for (app.panes.panes.items) |pane| {
+        if (pane.id != pane_id) continue;
+        found = true;
+        try std.testing.expectEqualStrings("plugin pane", pane.title);
+        try std.testing.expectEqualStrings("hello pane", pane.streaming.items);
+    }
+    try std.testing.expect(found);
+    try std.testing.expectEqual(@as(?u64, pane_id), app.panes.focusedPaneId());
 }
 
 test "diagnostics pane opens and reflects diagnostics counts" {
