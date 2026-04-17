@@ -7,3 +7,5 @@ api_version = 1
 command = true
 event = true
 status = true
+pane = true
+decoration = true

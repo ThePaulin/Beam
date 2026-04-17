@@ -5133,7 +5133,8 @@ pub const App = struct {
 
     fn syncDiagnosticsPane(self: *App) !void {
         const id = self.diagnostics_pane_id orelse return;
-        self.diagnostics.clearDecorations();
+        const diagnostics_owner = try self.diagnostics.registerDecorationOwner("diagnostics");
+        self.diagnostics.clearOwner(diagnostics_owner);
         const errors = self.diagnostics.count(.err);
         const warnings = self.diagnostics.count(.warning);
         const infos = self.diagnostics.count(.info);
@@ -5161,7 +5162,7 @@ pub const App = struct {
                 diag.col + 1,
             });
             const detail = try std.fmt.allocPrint(self.allocator, "[{s}] {s}", .{ severity, diag.message });
-            self.diagnostics.addDiagnosticDecoration(diag) catch {};
+            self.diagnostics.addDiagnosticDecorationOwned(diagnostics_owner, diag) catch {};
             try source.append(key, .{
                 .id = source.items.items.len + 1,
                 .path = if (diag.path) |p| try self.allocator.dupe(u8, p) else null,
@@ -6888,6 +6889,8 @@ pub const App = struct {
                 .decoration = true,
                 .lsp = true,
             },
+            .decoration_owner = "editor",
+            .pane_owner = "editor",
             .set_status = builtinSetStatus,
             .set_extension_status = builtinSetExtensionStatus,
             .set_plugin_activity = builtinSetPluginActivity,
@@ -6895,8 +6898,14 @@ pub const App = struct {
             .register_event = builtinRegisterEvent,
             .spawn_job = builtinSpawnJob,
             .add_decoration = builtinAddDecoration,
+            .clear_decorations = builtinClearDecorations,
+            .clear_buffer_decorations = builtinClearBufferDecorations,
             .set_pane_text = builtinSetPaneText,
             .create_pane = builtinCreatePane,
+            .register_pane_type = builtinRegisterPaneType,
+            .create_pane_of_type = builtinCreatePaneOfType,
+            .update_pane_state = builtinUpdatePaneState,
+            .trigger_pane_action = builtinTriggerPaneAction,
             .focus_pane = builtinFocusPane,
             .open_picker = builtinOpenPicker,
             .set_picker_items = builtinSetPickerItems,
@@ -7031,16 +7040,27 @@ fn builtinSpawnJob(ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generat
     return try app.scheduler.spawn(kind, request_generation, workspace_generation);
 }
 
-fn builtinAddDecoration(ctx: *anyopaque, decoration: diagnostics_mod.Decoration) anyerror!void {
+fn builtinAddDecoration(ctx: *anyopaque, owner: []const u8, decoration: diagnostics_mod.Decoration) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx));
-    try app.diagnostics.addDecoration(decoration);
+    const owner_id = try app.diagnostics.registerDecorationOwner(owner);
+    try app.diagnostics.addDecorationOwned(owner_id, decoration);
+}
+
+fn builtinClearDecorations(ctx: *anyopaque, owner: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const owner_id = try app.diagnostics.registerDecorationOwner(owner);
+    app.diagnostics.clearOwner(owner_id);
+}
+
+fn builtinClearBufferDecorations(ctx: *anyopaque, owner: []const u8, buffer_id: u64) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const owner_id = try app.diagnostics.registerDecorationOwner(owner);
+    app.diagnostics.clearBufferOwner(buffer_id, owner_id);
 }
 
 fn builtinSetPaneText(ctx: *anyopaque, pane_id: u64, title: []const u8, text: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx));
-    if (!try app.panes.updateTitle(pane_id, title)) return;
-    _ = app.panes.clearStreaming(pane_id);
-    _ = try app.panes.appendStreaming(pane_id, text);
+    _ = try app.panes.updatePaneState(pane_id, title, text);
 }
 
 fn builtinCreatePane(ctx: *anyopaque, kind: plugin_mod.PaneKind, title: []const u8) anyerror!u64 {
@@ -7048,6 +7068,28 @@ fn builtinCreatePane(ctx: *anyopaque, kind: plugin_mod.PaneKind, title: []const 
     const id = try app.panes.open(kind, title);
     _ = app.panes.focus(id);
     return id;
+}
+
+fn builtinRegisterPaneType(ctx: *anyopaque, owner: []const u8, name: []const u8, handler: ?plugin_mod.PaneActionHandler) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.panes.registerPaneType(owner, name, app, handler);
+}
+
+fn builtinCreatePaneOfType(ctx: *anyopaque, type_id: u64, title: []const u8) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const id = try app.panes.createPaneOfType(type_id, title);
+    _ = app.panes.focus(id);
+    return id;
+}
+
+fn builtinUpdatePaneState(ctx: *anyopaque, pane_id: u64, title: ?[]const u8, body: ?[]const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    _ = try app.panes.updatePaneState(pane_id, title, body);
+}
+
+fn builtinTriggerPaneAction(ctx: *anyopaque, pane_id: u64, action: pane_mod.PaneAction, payload: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    if (!app.panes.triggerPaneAction(pane_id, action, payload)) return error.NotFound;
 }
 
 fn builtinFocusPane(ctx: *anyopaque, pane_id: u64) bool {
@@ -8585,6 +8627,27 @@ test "plugin host can create and update a custom pane" {
     const pane_id = try host.createPane(.custom, "plugin pane");
     try std.testing.expect(host.focusPane(pane_id));
     try host.setPaneText(pane_id, "plugin pane", "hello pane");
+
+    var found = false;
+    for (app.panes.panes.items) |pane| {
+        if (pane.id != pane_id) continue;
+        found = true;
+        try std.testing.expectEqualStrings("plugin pane", pane.title);
+        try std.testing.expectEqualStrings("hello pane", pane.streaming.items);
+    }
+    try std.testing.expect(found);
+    try std.testing.expectEqual(@as(?u64, pane_id), app.panes.focusedPaneId());
+}
+
+test "plugin host can register a pane type and update its state" {
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    var host = app.builtinHost();
+    host.pane_owner = "plugin-hello";
+    const type_id = try host.registerPaneType("detail", null);
+    const pane_id = try host.createPaneOfType(type_id, "plugin pane");
+    try host.updatePaneState(pane_id, "plugin pane", "hello pane");
 
     var found = false;
     for (app.panes.panes.items) |pane| {

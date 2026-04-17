@@ -24,6 +24,7 @@ pub const Entry = struct {
 const LoadedPlugin = struct {
     name: []u8,
     lib: std.DynLib,
+    host: plugin_mod.Host,
     deinit_fn: ?plugin_mod.PluginDeinitFn = null,
 };
 
@@ -281,12 +282,16 @@ pub const Catalog = struct {
 
         const init_fn = lib.lookup(plugin_mod.PluginInitFn, plugin_mod.InitSymbol) orelse return error.PermissionDenied;
         const deinit_fn = lib.lookup(plugin_mod.PluginDeinitFn, plugin_mod.DeinitSymbol);
-        const rc = init_fn(host);
+        var plugin_host = host.*;
+        plugin_host.decoration_owner = manifest.name;
+        plugin_host.pane_owner = manifest.name;
+        const rc = init_fn(&plugin_host);
         if (rc != 0) return error.PermissionDenied;
 
         return .{
             .name = try self.allocator.dupe(u8, manifest.name),
             .lib = lib,
+            .host = plugin_host,
             .deinit_fn = deinit_fn,
         };
     }
@@ -294,9 +299,7 @@ pub const Catalog = struct {
     fn unloadAll(self: *Catalog) void {
         for (self.loaded_plugins.items) |*plugin| {
             if (plugin.deinit_fn) |deinit_fn| {
-                if (self.host) |plugin_host| {
-                    deinit_fn(&plugin_host);
-                }
+                deinit_fn(&plugin.host);
             }
             self.allocator.free(plugin.name);
             plugin.lib.close();
@@ -310,9 +313,7 @@ pub const Catalog = struct {
         const plugin = self.loaded_plugins.items[idx];
         self.loaded_plugins.items.len = idx;
         if (plugin.deinit_fn) |deinit_fn| {
-            if (self.host) |plugin_host| {
-                deinit_fn(&plugin_host);
-            }
+            deinit_fn(&plugin.host);
         }
         self.allocator.free(plugin.name);
         var lib = plugin.lib;

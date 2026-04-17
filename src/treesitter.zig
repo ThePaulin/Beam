@@ -205,7 +205,8 @@ pub const Service = struct {
     }
 
     pub fn applyDecorations(self: *Service, store: *diagnostics_mod.Store, snapshot: buffer_mod.ReadSnapshot) !void {
-        store.clearBufferSource(snapshot.buffer_id, .treesitter);
+        const owner_id = try store.registerDecorationOwner("treesitter");
+        store.clearBufferOwner(snapshot.buffer_id, owner_id);
         if (!isZigFiletype(snapshot.filetype)) return;
 
         const state = self.snapshotStateMutable(snapshot.buffer_id) orelse return;
@@ -218,10 +219,10 @@ pub const Service = struct {
         };
 
         if (self.zig_locals_query) |query| {
-            try self.applyQueryDecorations(store, snapshot.buffer_id, root, query, .hint);
+            try self.applyQueryDecorations(store, owner_id, snapshot.buffer_id, root, query, .hint);
         }
         if (self.zig_highlights_query) |query| {
-            try self.applyQueryDecorations(store, snapshot.buffer_id, root, query, .highlight);
+            try self.applyQueryDecorations(store, owner_id, snapshot.buffer_id, root, query, .highlight);
         }
     }
 
@@ -308,7 +309,7 @@ pub const Service = struct {
         try self.setError(state, "tree-sitter parse failed");
     }
 
-    fn applyQueryDecorations(self: *Service, store: *diagnostics_mod.Store, buffer_id: u64, root: ts.Node, query: *const ts.Query, kind: diagnostics_mod.DecorationKind) !void {
+    fn applyQueryDecorations(self: *Service, store: *diagnostics_mod.Store, owner_id: u64, buffer_id: u64, root: ts.Node, query: *const ts.Query, kind: diagnostics_mod.DecorationKind) !void {
         _ = self;
         var cursor = ts.QueryCursor.create();
         defer cursor.destroy();
@@ -323,7 +324,8 @@ pub const Service = struct {
                 const end = node.endPoint();
                 const start_col: usize = @intCast(start.column);
                 const len: usize = if (end.column > start.column) @max(@as(usize, @intCast(end.column - start.column)), 1) else 1;
-                try store.addTreeDecoration(
+                try store.addTreeDecorationOwned(
+                    owner_id,
                     buffer_id,
                     @intCast(start.row),
                     start_col,

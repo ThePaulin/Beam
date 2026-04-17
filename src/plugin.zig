@@ -71,7 +71,14 @@ pub const Manifest = struct {
 pub const CommandHandler = *const fn (ctx: *anyopaque, args: []const []const u8) anyerror!void;
 pub const EventHandler = *const fn (ctx: *anyopaque, payload: []const u8) anyerror!void;
 pub const JobHandler = *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64;
-pub const DecorationHandler = *const fn (ctx: *anyopaque, decoration: diagnostics_mod.Decoration) anyerror!void;
+pub const DecorationHandler = *const fn (ctx: *anyopaque, owner: []const u8, decoration: diagnostics_mod.Decoration) anyerror!void;
+pub const DecorationClearHandler = *const fn (ctx: *anyopaque, owner: []const u8) anyerror!void;
+pub const DecorationBufferClearHandler = *const fn (ctx: *anyopaque, owner: []const u8, buffer_id: u64) anyerror!void;
+pub const PaneActionHandler = pane_mod.PaneActionHandler;
+pub const RegisterPaneTypeHandler = *const fn (ctx: *anyopaque, owner: []const u8, name: []const u8, handler: ?PaneActionHandler) anyerror!u64;
+pub const CreatePaneTypeHandler = *const fn (ctx: *anyopaque, type_id: u64, title: []const u8) anyerror!u64;
+pub const UpdatePaneStateHandler = *const fn (ctx: *anyopaque, pane_id: u64, title: ?[]const u8, body: ?[]const u8) anyerror!void;
+pub const TriggerPaneActionHandler = *const fn (ctx: *anyopaque, pane_id: u64, action: pane_mod.PaneAction, payload: []const u8) anyerror!void;
 pub const PaneTextHandler = *const fn (ctx: *anyopaque, pane_id: u64, title: []const u8, text: []const u8) anyerror!void;
 pub const PaneKind = pane_mod.PaneKind;
 pub const PickerItem = listpane_mod.Item;
@@ -107,7 +114,15 @@ fn defaultSpawnJob(_: *anyopaque, _: scheduler_mod.JobKind, _: u64, _: u64) anye
     return error.PermissionDenied;
 }
 
-fn defaultAddDecoration(_: *anyopaque, _: diagnostics_mod.Decoration) anyerror!void {
+fn defaultAddDecoration(_: *anyopaque, _: []const u8, _: diagnostics_mod.Decoration) anyerror!void {
+    return error.PermissionDenied;
+}
+
+fn defaultClearDecorations(_: *anyopaque, _: []const u8) anyerror!void {
+    return error.PermissionDenied;
+}
+
+fn defaultClearBufferDecorations(_: *anyopaque, _: []const u8, _: u64) anyerror!void {
     return error.PermissionDenied;
 }
 
@@ -116,6 +131,22 @@ fn defaultSetPaneText(_: *anyopaque, _: u64, _: []const u8, _: []const u8) anyer
 }
 
 fn defaultCreatePane(_: *anyopaque, _: PaneKind, _: []const u8) anyerror!u64 {
+    return error.PermissionDenied;
+}
+
+fn defaultRegisterPaneType(_: *anyopaque, _: []const u8, _: []const u8, _: ?PaneActionHandler) anyerror!u64 {
+    return error.PermissionDenied;
+}
+
+fn defaultCreatePaneOfType(_: *anyopaque, _: u64, _: []const u8) anyerror!u64 {
+    return error.PermissionDenied;
+}
+
+fn defaultUpdatePaneState(_: *anyopaque, _: u64, _: ?[]const u8, _: ?[]const u8) anyerror!void {
+    return error.PermissionDenied;
+}
+
+fn defaultTriggerPaneAction(_: *anyopaque, _: u64, _: pane_mod.PaneAction, _: []const u8) anyerror!void {
     return error.PermissionDenied;
 }
 
@@ -192,15 +223,23 @@ fn defaultRequestLsp(_: *anyopaque, _: []const u8) anyerror!u64 {
 pub const Host = struct {
     ctx: *anyopaque,
     caps: Capabilities = .{},
+    decoration_owner: []const u8 = "builtin",
+    pane_owner: []const u8 = "builtin",
     set_status: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,
     set_extension_status: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,
     set_plugin_activity: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void = defaultSetPluginActivity,
     register_command: *const fn (ctx: *anyopaque, name: []const u8, description: []const u8, handler: CommandHandler) anyerror!void = defaultRegisterCommand,
     register_event: *const fn (ctx: *anyopaque, event: []const u8, handler: EventHandler) anyerror!void = defaultRegisterEvent,
     spawn_job: *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64 = defaultSpawnJob,
-    add_decoration: *const fn (ctx: *anyopaque, decoration: diagnostics_mod.Decoration) anyerror!void = defaultAddDecoration,
+    add_decoration: *const fn (ctx: *anyopaque, owner: []const u8, decoration: diagnostics_mod.Decoration) anyerror!void = defaultAddDecoration,
+    clear_decorations: *const fn (ctx: *anyopaque, owner: []const u8) anyerror!void = defaultClearDecorations,
+    clear_buffer_decorations: *const fn (ctx: *anyopaque, owner: []const u8, buffer_id: u64) anyerror!void = defaultClearBufferDecorations,
     set_pane_text: *const fn (ctx: *anyopaque, pane_id: u64, title: []const u8, text: []const u8) anyerror!void = defaultSetPaneText,
     create_pane: *const fn (ctx: *anyopaque, kind: PaneKind, title: []const u8) anyerror!u64 = defaultCreatePane,
+    register_pane_type: *const fn (ctx: *anyopaque, owner: []const u8, name: []const u8, handler: ?PaneActionHandler) anyerror!u64 = defaultRegisterPaneType,
+    create_pane_of_type: *const fn (ctx: *anyopaque, type_id: u64, title: []const u8) anyerror!u64 = defaultCreatePaneOfType,
+    update_pane_state: *const fn (ctx: *anyopaque, pane_id: u64, title: ?[]const u8, body: ?[]const u8) anyerror!void = defaultUpdatePaneState,
+    trigger_pane_action: *const fn (ctx: *anyopaque, pane_id: u64, action: pane_mod.PaneAction, payload: []const u8) anyerror!void = defaultTriggerPaneAction,
     focus_pane: *const fn (ctx: *anyopaque, pane_id: u64) bool = defaultFocusPane,
     open_picker: *const fn (ctx: *anyopaque, title: []const u8, query: []const u8) anyerror!void = defaultOpenPicker,
     set_picker_items: *const fn (ctx: *anyopaque, items: []const PickerItem) anyerror!void = defaultSetPickerItems,
@@ -263,7 +302,17 @@ pub const Host = struct {
 
     pub fn addDecoration(self: *const Host, decoration: diagnostics_mod.Decoration) !void {
         try self.require(.decoration);
-        try self.add_decoration(self.ctx, decoration);
+        try self.add_decoration(self.ctx, self.decoration_owner, decoration);
+    }
+
+    pub fn clearDecorations(self: *const Host) !void {
+        try self.require(.decoration);
+        try self.clear_decorations(self.ctx, self.decoration_owner);
+    }
+
+    pub fn clearDecorationsForBuffer(self: *const Host, buffer_id: u64) !void {
+        try self.require(.decoration);
+        try self.clear_buffer_decorations(self.ctx, self.decoration_owner, buffer_id);
     }
 
     pub fn setPaneText(self: *const Host, pane_id: u64, title: []const u8, text: []const u8) !void {
@@ -274,6 +323,26 @@ pub const Host = struct {
     pub fn createPane(self: *const Host, kind: PaneKind, title: []const u8) !u64 {
         try self.require(.pane);
         return try self.create_pane(self.ctx, kind, title);
+    }
+
+    pub fn registerPaneType(self: *const Host, name: []const u8, handler: ?PaneActionHandler) !u64 {
+        try self.require(.pane);
+        return try self.register_pane_type(self.ctx, self.pane_owner, name, handler);
+    }
+
+    pub fn createPaneOfType(self: *const Host, type_id: u64, title: []const u8) !u64 {
+        try self.require(.pane);
+        return try self.create_pane_of_type(self.ctx, type_id, title);
+    }
+
+    pub fn updatePaneState(self: *const Host, pane_id: u64, title: ?[]const u8, body: ?[]const u8) !void {
+        try self.require(.pane);
+        try self.update_pane_state(self.ctx, pane_id, title, body);
+    }
+
+    pub fn triggerPaneAction(self: *const Host, pane_id: u64, action: pane_mod.PaneAction, payload: []const u8) !void {
+        try self.require(.pane);
+        try self.trigger_pane_action(self.ctx, pane_id, action, payload);
     }
 
     pub fn focusPane(self: *const Host, pane_id: u64) !bool {
