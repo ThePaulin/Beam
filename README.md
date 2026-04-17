@@ -153,4 +153,4 @@ If you are changing config keys, commands, or built-in behavior, update the docs
 
 ## License
 
-Beam is licensed under the Apache License, Version 2.0. See [`LICENSE`](/Volumes/T7%20Shield/Files/OSS/Beam/LICENSE) for the full text.
+Beam is licensed under the Apache License, Version 2.0. See [`LICENSE`](https://github.com/ThePaulin/Beam/blob/main/LICENSE) for the full text.
