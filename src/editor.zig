@@ -3292,7 +3292,7 @@ pub const App = struct {
     }
 
     fn showReferenceHelp(self: *App) !void {
-        try self.setStatus("help: :help keyword | :w | :wq | :q | :q! | :saveas PATH | :close | :terminal | :edit PATH | :open PATH | :bd | :bn | :bp | :buffer N|PATH | :buffers | :split PATH | :sp PATH | :vs PATH | :tabnew | :tabclose | :tabonly | :tabmove N | :refresh-sources | :lsp ACTION | :plugins | :vimgrep /pat/ [path] | :grep PAT [path] | :sort [u] | :!cmd | :cn | :cp | :cope | :ccl | :marks | :delmarks! | :zf | :za | :zo | :zc | :zE | :zr | :zm | :zi | :diffthis | :diffoff | :diffupdate | :diffget | :diffput | ]c/[c | syntax-aware a{/i{/a(/i( in Zig | n/N | * / # | m/'/` | Ctrl+u/d/i/o/^ | Ctrl+w s/v/n/q/x/+/-/</>/\\/|/_/=/T | leader x | :registers");
+        try self.setStatus("help: :help keyword | :w | :wq | :q | :q! | :saveas PATH | :close | :terminal | :edit PATH | :open PATH | :bd | :bn | :bp | :buffer N|PATH | :buffers | :split PATH | :sp PATH | :vs PATH | :tabnew | :tabclose | :tabonly | :tabmove N | :refresh-sources | :lsp ACTION | :plugins | :help plugin-pane | :help plugin-decorations | :vimgrep /pat/ [path] | :grep PAT [path] | :sort [u] | :!cmd | :cn | :cp | :cope | :ccl | :marks | :delmarks! | :zf | :za | :zo | :zc | :zE | :zr | :zm | :zi | :diffthis | :diffoff | :diffupdate | :diffget | :diffput | ]c/[c | syntax-aware a{/i{/a(/i( in Zig | n/N | * / # | m/'/` | Ctrl+u/d/i/o/^ | Ctrl+w s/v/n/q/x/+/-/</>/\\/|/_/=/T | leader x | :registers");
     }
 
     fn showHelpForCurrentWord(self: *App) !void {
@@ -5660,6 +5660,14 @@ pub const App = struct {
             try self.setStatus("put the current line into the diff peer");
             return;
         }
+        if (std.mem.eql(u8, stripped, "plugin-pane") or std.mem.eql(u8, stripped, "plugin-panes")) {
+            try self.setStatus("plugin pane API: registerPaneType, createPaneOfType, updatePaneState, updatePaneTitle; see examples/plugins/hello/plugin.zig");
+            return;
+        }
+        if (std.mem.eql(u8, stripped, "plugin-decorations") or std.mem.eql(u8, stripped, "plugin-decoration")) {
+            try self.setStatus("plugin decoration API: addDecoration(buffer_id, row, col, len, kind, source), clearDecorations; see examples/plugins/hello/plugin.zig");
+            return;
+        }
         if (std.mem.eql(u8, stripped, "q") or std.mem.eql(u8, stripped, "quit")) {
             try self.setStatus("quit the editor");
             return;
@@ -6973,6 +6981,8 @@ pub const App = struct {
             \\  :refresh-sources refresh picker and diagnostics sources
             \\  :lsp ACTION      issue an LSP request (definition, hover, completion, references, rename, code-action, semantic-tokens)
             \\  :plugins        show loaded plugin manifests
+            \\  :help plugin-pane  show plugin pane API reference
+            \\  :help plugin-decorations  show plugin decoration API reference
             \\  :vimgrep /pat/ [path] search files for a pattern
             \\  :pickgrep /pat/ [path] search files into the picker
             \\  :files [path]   list files into the picker
