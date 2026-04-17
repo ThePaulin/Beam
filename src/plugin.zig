@@ -1,7 +1,9 @@
 const std = @import("std");
+const buffer_mod = @import("buffer.zig");
 const diagnostics_mod = @import("diagnostics.zig");
 const pane_mod = @import("pane.zig");
 const scheduler_mod = @import("scheduler.zig");
+const syntax_mod = @import("treesitter.zig");
 
 pub const api_version: u32 = 1;
 
@@ -70,6 +72,11 @@ pub const EventHandler = *const fn (ctx: *anyopaque, payload: []const u8) anyerr
 pub const JobHandler = *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64;
 pub const DecorationHandler = *const fn (ctx: *anyopaque, decoration: diagnostics_mod.Decoration) anyerror!void;
 pub const PaneTextHandler = *const fn (ctx: *anyopaque, pane_id: u64, title: []const u8, text: []const u8) anyerror!void;
+pub const WorkspaceInfo = struct {
+    root_path: []u8,
+    session_generation: u64,
+    open_buffer_count: usize,
+};
 
 pub const PluginInitFn = *const fn (host: *const Host) callconv(.c) c_int;
 pub const PluginDeinitFn = *const fn (host: *const Host) callconv(.c) void;
@@ -101,6 +108,54 @@ fn defaultSetPaneText(_: *anyopaque, _: u64, _: []const u8, _: []const u8) anyer
     return error.PermissionDenied;
 }
 
+fn defaultReadBufferSnapshot(_: *anyopaque, _: u64) anyerror!buffer_mod.ReadSnapshot {
+    return error.PermissionDenied;
+}
+
+fn defaultFreeBufferSnapshot(_: *anyopaque, _: buffer_mod.ReadSnapshot) void {}
+
+fn defaultBeginBufferEdit(_: *anyopaque, _: u64) anyerror!buffer_mod.EditTransaction {
+    return error.PermissionDenied;
+}
+
+fn defaultReadBufferSelection(_: *anyopaque, _: u64) anyerror!?buffer_mod.Selection {
+    return error.PermissionDenied;
+}
+
+fn defaultWorkspaceInfo(_: *anyopaque) anyerror!WorkspaceInfo {
+    return error.PermissionDenied;
+}
+
+fn defaultReadFile(_: *anyopaque, _: []const u8) anyerror![]u8 {
+    return error.PermissionDenied;
+}
+
+fn defaultFreeBytes(_: *anyopaque, _: []u8) void {}
+
+fn defaultSyntaxNodeAtCursor(_: *anyopaque, _: u64) anyerror!?syntax_mod.Node {
+    return error.PermissionDenied;
+}
+
+fn defaultSyntaxFoldRange(_: *anyopaque, _: u64) anyerror!?syntax_mod.FoldRange {
+    return error.PermissionDenied;
+}
+
+fn defaultSyntaxEnclosingScope(_: *anyopaque, _: u64) anyerror!?syntax_mod.FoldRange {
+    return error.PermissionDenied;
+}
+
+fn defaultSyntaxIndentForRow(_: *anyopaque, _: u64, _: usize) anyerror!usize {
+    return error.PermissionDenied;
+}
+
+fn defaultSyntaxTextObjectRange(_: *anyopaque, _: u64, _: bool) anyerror!?syntax_mod.TextRange {
+    return error.PermissionDenied;
+}
+
+fn defaultRequestLsp(_: *anyopaque, _: []const u8) anyerror!u64 {
+    return error.PermissionDenied;
+}
+
 pub const Host = struct {
     ctx: *anyopaque,
     caps: Capabilities = .{},
@@ -112,6 +167,25 @@ pub const Host = struct {
     spawn_job: *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64 = defaultSpawnJob,
     add_decoration: *const fn (ctx: *anyopaque, decoration: diagnostics_mod.Decoration) anyerror!void = defaultAddDecoration,
     set_pane_text: *const fn (ctx: *anyopaque, pane_id: u64, title: []const u8, text: []const u8) anyerror!void = defaultSetPaneText,
+    read_buffer_snapshot: *const fn (ctx: *anyopaque, buffer_id: u64) anyerror!buffer_mod.ReadSnapshot = defaultReadBufferSnapshot,
+    free_buffer_snapshot: *const fn (ctx: *anyopaque, snapshot: buffer_mod.ReadSnapshot) void = defaultFreeBufferSnapshot,
+    begin_buffer_edit: *const fn (ctx: *anyopaque, buffer_id: u64) anyerror!buffer_mod.EditTransaction = defaultBeginBufferEdit,
+    read_buffer_selection: *const fn (ctx: *anyopaque, buffer_id: u64) anyerror!?buffer_mod.Selection = defaultReadBufferSelection,
+    workspace_info: *const fn (ctx: *anyopaque) anyerror!WorkspaceInfo = defaultWorkspaceInfo,
+    read_file: *const fn (ctx: *anyopaque, path: []const u8) anyerror![]u8 = defaultReadFile,
+    free_bytes: *const fn (ctx: *anyopaque, bytes: []u8) void = defaultFreeBytes,
+    syntax_node_at_cursor: *const fn (ctx: *anyopaque, buffer_id: u64) anyerror!?syntax_mod.Node = defaultSyntaxNodeAtCursor,
+    syntax_fold_range: *const fn (ctx: *anyopaque, buffer_id: u64) anyerror!?syntax_mod.FoldRange = defaultSyntaxFoldRange,
+    syntax_enclosing_scope: *const fn (ctx: *anyopaque, buffer_id: u64) anyerror!?syntax_mod.FoldRange = defaultSyntaxEnclosingScope,
+    syntax_indent_for_row: *const fn (ctx: *anyopaque, buffer_id: u64, row: usize) anyerror!usize = defaultSyntaxIndentForRow,
+    syntax_text_object_range: *const fn (ctx: *anyopaque, buffer_id: u64, inner: bool) anyerror!?syntax_mod.TextRange = defaultSyntaxTextObjectRange,
+    request_definition: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
+    request_references: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
+    request_rename: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
+    request_completion: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
+    request_hover: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
+    request_code_action: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
+    request_semantic_tokens: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
 
     pub fn require(self: *const Host, capability: Capability) !void {
         if (!self.caps.allows(capability)) return error.PermissionDenied;
@@ -155,6 +229,103 @@ pub const Host = struct {
     pub fn setPaneText(self: *const Host, pane_id: u64, title: []const u8, text: []const u8) !void {
         try self.require(.pane);
         try self.set_pane_text(self.ctx, pane_id, title, text);
+    }
+
+    pub fn readBufferSnapshot(self: *const Host, buffer_id: u64) !buffer_mod.ReadSnapshot {
+        try self.require(.buffer_read);
+        return try self.read_buffer_snapshot(self.ctx, buffer_id);
+    }
+
+    pub fn freeBufferSnapshot(self: *const Host, snapshot: buffer_mod.ReadSnapshot) void {
+        self.free_buffer_snapshot(self.ctx, snapshot);
+    }
+
+    pub fn beginBufferEdit(self: *const Host, buffer_id: u64) !buffer_mod.EditTransaction {
+        try self.require(.buffer_edit);
+        return try self.begin_buffer_edit(self.ctx, buffer_id);
+    }
+
+    pub fn readBufferSelection(self: *const Host, buffer_id: u64) !?buffer_mod.Selection {
+        try self.require(.buffer_read);
+        return try self.read_buffer_selection(self.ctx, buffer_id);
+    }
+
+    pub fn workspaceInfo(self: *const Host) !WorkspaceInfo {
+        try self.require(.workspace);
+        return try self.workspace_info(self.ctx);
+    }
+
+    pub fn freeWorkspaceInfo(self: *const Host, info: WorkspaceInfo) void {
+        self.free_bytes(self.ctx, info.root_path);
+    }
+
+    pub fn readFile(self: *const Host, path: []const u8) ![]u8 {
+        try self.require(.fs_read);
+        return try self.read_file(self.ctx, path);
+    }
+
+    pub fn freeBytes(self: *const Host, bytes: []u8) void {
+        self.free_bytes(self.ctx, bytes);
+    }
+
+    pub fn nodeAtCursor(self: *const Host, buffer_id: u64) !?syntax_mod.Node {
+        try self.require(.tree_query);
+        return try self.syntax_node_at_cursor(self.ctx, buffer_id);
+    }
+
+    pub fn foldRange(self: *const Host, buffer_id: u64) !?syntax_mod.FoldRange {
+        try self.require(.tree_query);
+        return try self.syntax_fold_range(self.ctx, buffer_id);
+    }
+
+    pub fn enclosingScope(self: *const Host, buffer_id: u64) !?syntax_mod.FoldRange {
+        try self.require(.tree_query);
+        return try self.syntax_enclosing_scope(self.ctx, buffer_id);
+    }
+
+    pub fn indentForRow(self: *const Host, buffer_id: u64, row: usize) !usize {
+        try self.require(.tree_query);
+        return try self.syntax_indent_for_row(self.ctx, buffer_id, row);
+    }
+
+    pub fn textObjectRange(self: *const Host, buffer_id: u64, inner: bool) !?syntax_mod.TextRange {
+        try self.require(.tree_query);
+        return try self.syntax_text_object_range(self.ctx, buffer_id, inner);
+    }
+
+    pub fn requestDefinition(self: *const Host, payload: []const u8) !u64 {
+        try self.require(.lsp);
+        return try self.request_definition(self.ctx, payload);
+    }
+
+    pub fn requestReferences(self: *const Host, payload: []const u8) !u64 {
+        try self.require(.lsp);
+        return try self.request_references(self.ctx, payload);
+    }
+
+    pub fn requestRename(self: *const Host, payload: []const u8) !u64 {
+        try self.require(.lsp);
+        return try self.request_rename(self.ctx, payload);
+    }
+
+    pub fn requestCompletion(self: *const Host, payload: []const u8) !u64 {
+        try self.require(.lsp);
+        return try self.request_completion(self.ctx, payload);
+    }
+
+    pub fn requestHover(self: *const Host, payload: []const u8) !u64 {
+        try self.require(.lsp);
+        return try self.request_hover(self.ctx, payload);
+    }
+
+    pub fn requestCodeAction(self: *const Host, payload: []const u8) !u64 {
+        try self.require(.lsp);
+        return try self.request_code_action(self.ctx, payload);
+    }
+
+    pub fn requestSemanticTokens(self: *const Host, payload: []const u8) !u64 {
+        try self.require(.lsp);
+        return try self.request_semantic_tokens(self.ctx, payload);
     }
 };
 

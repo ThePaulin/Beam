@@ -12,6 +12,7 @@ const pane_mod = @import("pane.zig");
 const listsource_mod = @import("listsource.zig");
 const listpane_mod = @import("listpane.zig");
 const picker_mod = @import("picker.zig");
+const plugin_mod = @import("plugin.zig");
 const plugin_catalog_mod = @import("plugin_catalog.zig");
 const search_mod = @import("search.zig");
 const scheduler_mod = @import("scheduler.zig");
@@ -2957,7 +2958,7 @@ pub const App = struct {
         const buf = self.activeBuffer();
         if (!std.mem.eql(u8, buf.filetypeText(), "zig")) return null;
         if (!self.syntax.hasParsedTree(buf.id)) return null;
-        const snapshot = buf.readSnapshot() catch return null;
+        const snapshot = buf.readSnapshot(null) catch return null;
         defer buf.freeReadSnapshot(snapshot);
         const range = self.syntax.textObjectRange(snapshot, inner) orelse return null;
         return .{ .start = range.start, .end = range.end };
@@ -2966,7 +2967,7 @@ pub const App = struct {
     fn insertIndentedBlankLine(self: *App, above: bool) !void {
         const buf = self.activeBuffer();
         const indent_row = if (above or buf.cursor.row + 1 >= buf.lines.items.len) buf.cursor.row else buf.cursor.row + 1;
-        const indent = self.syntaxIndentForRow(indent_row);
+        const indent = self.syntaxIndentForRowFromActiveBuffer(indent_row);
         if (above) {
             try buf.insertBlankLineAboveIndented(indent);
         } else {
@@ -2974,9 +2975,9 @@ pub const App = struct {
         }
     }
 
-    fn syntaxIndentForRow(self: *App, row: usize) usize {
+    fn syntaxIndentForRowFromActiveBuffer(self: *App, row: usize) usize {
         const buf = self.activeBuffer();
-        const snapshot = buf.readSnapshot() catch return self.lineIndentForRow(row);
+        const snapshot = buf.readSnapshot(null) catch return self.lineIndentForRow(row);
         defer buf.freeReadSnapshot(snapshot);
         return self.syntax.indentForRow(snapshot, row);
     }
@@ -4339,7 +4340,7 @@ pub const App = struct {
 
     fn createFoldAtCursor(self: *App) !void {
         const buf = self.activeBuffer();
-        const snapshot = buf.readSnapshot() catch {
+        const snapshot = buf.readSnapshot(null) catch {
             try buf.createParagraphFold();
             try self.setStatus("fold created");
             return;
@@ -6374,6 +6375,109 @@ pub const App = struct {
         return &self.buffers.items[self.active_index];
     }
 
+    fn bufferById(self: *App, buffer_id: u64) ?*buffer_mod.Buffer {
+        for (self.buffers.items) |*buffer| {
+            if (buffer.id == buffer_id) return buffer;
+        }
+        return null;
+    }
+
+    fn selectionForBuffer(self: *App, buffer_id: u64) ?buffer_mod.Selection {
+        const buffer = self.bufferById(buffer_id) orelse return null;
+        if (self.buffers.items.len == 0) return null;
+        if (buffer.id != self.activeBuffer().id) return null;
+        const visual = self.visualSelection() orelse return null;
+        return .{ .start = visual.start, .end = visual.end };
+    }
+
+    fn readBufferSnapshot(self: *App, buffer_id: u64) !buffer_mod.ReadSnapshot {
+        const buffer = self.bufferById(buffer_id) orelse return error.BufferNotFound;
+        return try buffer.readSnapshot(self.selectionForBuffer(buffer_id));
+    }
+
+    fn freeBufferSnapshot(self: *App, snapshot: buffer_mod.ReadSnapshot) void {
+        self.allocator.free(snapshot.text);
+    }
+
+    fn beginBufferEdit(self: *App, buffer_id: u64) !buffer_mod.EditTransaction {
+        const buffer = self.bufferById(buffer_id) orelse return error.BufferNotFound;
+        return try buffer.beginTransaction();
+    }
+
+    fn workspaceInfo(self: *App) !plugin_mod.WorkspaceInfo {
+        return .{
+            .root_path = try self.allocator.dupe(u8, self.workspace.root_path),
+            .session_generation = self.workspace.session_generation,
+            .open_buffer_count = self.workspace.session.open_buffers.items.len,
+        };
+    }
+
+    fn freeWorkspaceInfo(self: *App, info: plugin_mod.WorkspaceInfo) void {
+        self.allocator.free(info.root_path);
+    }
+
+    fn freeBytes(self: *App, bytes: []u8) void {
+        self.allocator.free(bytes);
+    }
+
+    fn syntaxNodeAtCursor(self: *App, buffer_id: u64) !?syntax_mod.Node {
+        const snapshot = try self.readBufferSnapshot(buffer_id);
+        defer self.freeBufferSnapshot(snapshot);
+        return self.syntax.nodeAtCursor(snapshot);
+    }
+
+    fn syntaxFoldRange(self: *App, buffer_id: u64) !?syntax_mod.FoldRange {
+        const snapshot = try self.readBufferSnapshot(buffer_id);
+        defer self.freeBufferSnapshot(snapshot);
+        return self.syntax.foldRangeForSnapshot(snapshot);
+    }
+
+    fn syntaxEnclosingScope(self: *App, buffer_id: u64) !?syntax_mod.FoldRange {
+        const snapshot = try self.readBufferSnapshot(buffer_id);
+        defer self.freeBufferSnapshot(snapshot);
+        return self.syntax.enclosingScope(snapshot);
+    }
+
+    fn syntaxIndentForBufferRow(self: *App, buffer_id: u64, row: usize) !usize {
+        const snapshot = try self.readBufferSnapshot(buffer_id);
+        defer self.freeBufferSnapshot(snapshot);
+        return self.syntax.indentForRow(snapshot, row);
+    }
+
+    fn syntaxTextObjectRange(self: *App, buffer_id: u64, inner: bool) !?syntax_mod.TextRange {
+        const snapshot = try self.readBufferSnapshot(buffer_id);
+        defer self.freeBufferSnapshot(snapshot);
+        return self.syntax.textObjectRange(snapshot, inner);
+    }
+
+    fn lspRequestDefinition(self: *App, payload: []const u8) !u64 {
+        return try self.lsp.requestDefinition(payload);
+    }
+
+    fn lspRequestReferences(self: *App, payload: []const u8) !u64 {
+        return try self.lsp.requestReferences(payload);
+    }
+
+    fn lspRequestRename(self: *App, payload: []const u8) !u64 {
+        return try self.lsp.requestRename(payload);
+    }
+
+    fn lspRequestCompletion(self: *App, payload: []const u8) !u64 {
+        return try self.lsp.requestCompletion(payload);
+    }
+
+    fn lspRequestHover(self: *App, payload: []const u8) !u64 {
+        return try self.lsp.requestHover(payload);
+    }
+
+    fn lspRequestCodeAction(self: *App, payload: []const u8) !u64 {
+        return try self.lsp.requestCodeActions(payload);
+    }
+
+    fn lspRequestSemanticTokens(self: *App, payload: []const u8) !u64 {
+        return try self.lsp.requestSemanticTokens(payload);
+    }
+
     fn activeSearchHighlight(self: *App, active: bool) ?[]const u8 {
         if (!active) return null;
         if (self.mode == .search) return self.search_preview_highlight orelse self.search_highlight;
@@ -6710,7 +6814,7 @@ pub const App = struct {
         if (self.syntax.snapshotGeneration(buf.id)) |generation| {
             if (generation == buf.generation) return;
         }
-        const snapshot = buf.readSnapshot() catch return;
+        const snapshot = buf.readSnapshot(null) catch return;
         defer buf.freeReadSnapshot(snapshot);
         self.syntax.updateSnapshot(snapshot) catch {};
         self.syntax.applyDecorations(&self.diagnostics, snapshot) catch {};
@@ -6719,7 +6823,22 @@ pub const App = struct {
     fn builtinHost(self: *App) builtins_mod.Host {
         return .{
             .ctx = self,
-            .caps = .{ .command = true, .event = true, .status = true, .jobs = true, .pane = true, .decoration = true },
+            .caps = .{
+                .command = true,
+                .event = true,
+                .status = true,
+                .buffer_read = true,
+                .buffer_edit = true,
+                .jobs = true,
+                .workspace = true,
+                .diagnostics = true,
+                .picker = true,
+                .pane = true,
+                .fs_read = true,
+                .tree_query = true,
+                .decoration = true,
+                .lsp = true,
+            },
             .set_status = builtinSetStatus,
             .set_extension_status = builtinSetExtensionStatus,
             .set_plugin_activity = builtinSetPluginActivity,
@@ -6728,6 +6847,25 @@ pub const App = struct {
             .spawn_job = builtinSpawnJob,
             .add_decoration = builtinAddDecoration,
             .set_pane_text = builtinSetPaneText,
+            .read_buffer_snapshot = builtinReadBufferSnapshot,
+            .free_buffer_snapshot = builtinFreeBufferSnapshot,
+            .begin_buffer_edit = builtinBeginBufferEdit,
+            .read_buffer_selection = builtinReadBufferSelection,
+            .workspace_info = builtinWorkspaceInfo,
+            .read_file = builtinReadFile,
+            .free_bytes = builtinFreeBytes,
+            .syntax_node_at_cursor = builtinSyntaxNodeAtCursor,
+            .syntax_fold_range = builtinSyntaxFoldRange,
+            .syntax_enclosing_scope = builtinSyntaxEnclosingScope,
+            .syntax_indent_for_row = builtinSyntaxIndentForRow,
+            .syntax_text_object_range = builtinSyntaxTextObjectRange,
+            .request_definition = builtinRequestDefinition,
+            .request_references = builtinRequestReferences,
+            .request_rename = builtinRequestRename,
+            .request_completion = builtinRequestCompletion,
+            .request_hover = builtinRequestHover,
+            .request_code_action = builtinRequestCodeAction,
+            .request_semantic_tokens = builtinRequestSemanticTokens,
         };
     }
 
@@ -6847,6 +6985,108 @@ fn builtinSetPaneText(ctx: *anyopaque, pane_id: u64, title: []const u8, text: []
     if (!try app.panes.updateTitle(pane_id, title)) return;
     _ = app.panes.clearStreaming(pane_id);
     _ = try app.panes.appendStreaming(pane_id, text);
+}
+
+fn builtinReadBufferSnapshot(ctx: *anyopaque, buffer_id: u64) anyerror!buffer_mod.ReadSnapshot {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.readBufferSnapshot(buffer_id);
+}
+
+fn builtinFreeBufferSnapshot(ctx: *anyopaque, snapshot: buffer_mod.ReadSnapshot) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    app.freeBufferSnapshot(snapshot);
+}
+
+fn builtinBeginBufferEdit(ctx: *anyopaque, buffer_id: u64) anyerror!buffer_mod.EditTransaction {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.beginBufferEdit(buffer_id);
+}
+
+fn builtinReadBufferSelection(ctx: *anyopaque, buffer_id: u64) anyerror!?buffer_mod.Selection {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.selectionForBuffer(buffer_id);
+}
+
+fn builtinWorkspaceInfo(ctx: *anyopaque) anyerror!plugin_mod.WorkspaceInfo {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.workspaceInfo();
+}
+
+fn builtinReadFile(ctx: *anyopaque, path: []const u8) anyerror![]u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const resolved = try std.fs.path.resolve(app.allocator, &[_][]const u8{ app.workspace.root_path, path });
+    defer app.allocator.free(resolved);
+    if (!std.mem.eql(u8, resolved, app.workspace.root_path)) {
+        if (resolved.len <= app.workspace.root_path.len) return error.AccessDenied;
+        if (!std.mem.eql(u8, resolved[0..app.workspace.root_path.len], app.workspace.root_path)) return error.AccessDenied;
+        if (resolved[app.workspace.root_path.len] != std.fs.path.sep) return error.AccessDenied;
+    }
+    return try std.fs.cwd().readFileAlloc(app.allocator, resolved, 1 << 26);
+}
+
+fn builtinFreeBytes(ctx: *anyopaque, bytes: []u8) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    app.freeBytes(bytes);
+}
+
+fn builtinSyntaxNodeAtCursor(ctx: *anyopaque, buffer_id: u64) anyerror!?syntax_mod.Node {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.syntaxNodeAtCursor(buffer_id);
+}
+
+fn builtinSyntaxFoldRange(ctx: *anyopaque, buffer_id: u64) anyerror!?syntax_mod.FoldRange {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.syntaxFoldRange(buffer_id);
+}
+
+fn builtinSyntaxEnclosingScope(ctx: *anyopaque, buffer_id: u64) anyerror!?syntax_mod.FoldRange {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.syntaxEnclosingScope(buffer_id);
+}
+
+fn builtinSyntaxIndentForRow(ctx: *anyopaque, buffer_id: u64, row: usize) anyerror!usize {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.syntaxIndentForBufferRow(buffer_id, row);
+}
+
+fn builtinSyntaxTextObjectRange(ctx: *anyopaque, buffer_id: u64, inner: bool) anyerror!?syntax_mod.TextRange {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.syntaxTextObjectRange(buffer_id, inner);
+}
+
+fn builtinRequestDefinition(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestDefinition(payload);
+}
+
+fn builtinRequestReferences(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestReferences(payload);
+}
+
+fn builtinRequestRename(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestRename(payload);
+}
+
+fn builtinRequestCompletion(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestCompletion(payload);
+}
+
+fn builtinRequestHover(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestHover(payload);
+}
+
+fn builtinRequestCodeAction(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestCodeAction(payload);
+}
+
+fn builtinRequestSemanticTokens(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestSemanticTokens(payload);
 }
 
 fn testInteractiveCommandHook(app: *App, argv: []const []const u8) bool {
@@ -8709,7 +8949,7 @@ test "visual text objects prefer tree-sitter blocks in zig buffers" {
     defer app.deinit();
 
     setCursor(&app, 1, 10);
-    const snapshot = try app.activeBuffer().readSnapshot();
+        const snapshot = try app.activeBuffer().readSnapshot(app.selectionForBuffer(app.activeBuffer().id));
     defer app.activeBuffer().freeReadSnapshot(snapshot);
     const expected_range = app.syntax.textObjectRange(snapshot, true) orelse return error.TestExpected;
 
@@ -8727,7 +8967,7 @@ test "zig open line actions use syntax-aware indentation" {
     var app = try makeTestAppWithFiletype(std.testing.allocator, "pub fn demo() void {\n}\n", "zig");
     defer app.deinit();
 
-    const snapshot = try app.activeBuffer().readSnapshot();
+    const snapshot = try app.activeBuffer().readSnapshot(app.selectionForBuffer(app.activeBuffer().id));
     defer app.activeBuffer().freeReadSnapshot(snapshot);
     const expected_indent = app.syntax.indentForRow(snapshot, 1);
 

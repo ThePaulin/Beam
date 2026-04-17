@@ -46,6 +46,7 @@ pub const EditTransaction = struct {
     original_text: []u8,
     working_text: std.array_list.Managed(u8),
     cursor: Position,
+    base_generation: u64,
     committed: bool = false,
 
     fn init(buffer: *Buffer) !EditTransaction {
@@ -57,6 +58,7 @@ pub const EditTransaction = struct {
             .original_text = text,
             .working_text = working_text,
             .cursor = buffer.cursor,
+            .base_generation = buffer.generation,
         };
     }
 
@@ -81,6 +83,7 @@ pub const EditTransaction = struct {
 
     pub fn commit(self: *EditTransaction) !void {
         if (self.committed) return;
+        if (self.buffer.generation != self.base_generation) return error.StaleSnapshot;
         try self.buffer.pushUndoSnapshotText(self.original_text, self.buffer.cursor);
         try self.buffer.setText(self.working_text.items);
         self.buffer.cursor = self.cursor;
@@ -147,7 +150,7 @@ pub const Buffer = struct {
         return try EditTransaction.init(self);
     }
 
-    pub fn readSnapshot(self: *const Buffer) !ReadSnapshot {
+    pub fn readSnapshot(self: *const Buffer, selection: ?Selection) !ReadSnapshot {
         return .{
             .buffer_id = self.id,
             .generation = self.generation,
@@ -155,6 +158,7 @@ pub const Buffer = struct {
             .scroll_row = self.scroll_row,
             .text = try self.serialize(),
             .filetype = self.filetype,
+            .selection = selection,
         };
     }
 
@@ -1065,6 +1069,18 @@ test "buffer tracks file metadata from its path" {
 
     try buffer.replacePath("src/main.zig");
     try std.testing.expectEqualStrings("zig", buffer.filetypeText());
+}
+
+test "edit transaction rejects stale snapshots" {
+    var buffer = try Buffer.initEmpty(std.testing.allocator);
+    defer buffer.deinit();
+
+    var tx = try buffer.beginTransaction();
+    defer tx.deinit();
+    try tx.insertText(.{ .row = 0, .col = 0 }, "updated");
+
+    try buffer.insertByte('!');
+    try std.testing.expectError(error.StaleSnapshot, tx.commit());
 }
 
 fn isWordChar(byte: u8) bool {
