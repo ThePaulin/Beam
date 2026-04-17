@@ -12,6 +12,13 @@ pub const Selection = struct {
     end: Position,
 };
 
+pub const LineEnding = enum {
+    lf,
+    crlf,
+    cr,
+    unknown,
+};
+
 pub const Fold = struct {
     start_row: usize,
     end_row: usize,
@@ -24,6 +31,7 @@ pub const ReadSnapshot = struct {
     cursor: Position,
     scroll_row: usize,
     text: []u8,
+    filetype: []const u8,
     selection: ?Selection = null,
 };
 
@@ -89,6 +97,9 @@ pub const Buffer = struct {
     id: u64,
     generation: u64 = 1,
     path: ?[]u8 = null,
+    filetype: []u8,
+    encoding: []u8,
+    line_ending: LineEnding = .lf,
     lines: std.array_list.Managed([]u8),
     cursor: Position = .{},
     scroll_row: usize = 0,
@@ -106,6 +117,8 @@ pub const Buffer = struct {
         return .{
             .allocator = allocator,
             .id = id,
+            .filetype = try allocator.dupe(u8, "text"),
+            .encoding = try allocator.dupe(u8, "utf-8"),
             .lines = lines,
             .scroll_row = 0,
             .fold_enabled = true,
@@ -124,6 +137,7 @@ pub const Buffer = struct {
         var buffer = try initEmpty(allocator);
         errdefer buffer.deinit();
         try buffer.replacePath(path);
+        buffer.line_ending = detectLineEnding(data);
         try buffer.setText(data);
         buffer.dirty = false;
         return buffer;
@@ -140,6 +154,7 @@ pub const Buffer = struct {
             .cursor = self.cursor,
             .scroll_row = self.scroll_row,
             .text = try self.serialize(),
+            .filetype = self.filetype,
         };
     }
 
@@ -155,6 +170,8 @@ pub const Buffer = struct {
         self.clearLines();
         self.clearFolds();
         if (self.path) |p| self.allocator.free(p);
+        self.allocator.free(self.filetype);
+        self.allocator.free(self.encoding);
         self.clearHistory(&self.undo_stack);
         self.clearHistory(&self.redo_stack);
         self.folds.deinit();
@@ -166,6 +183,7 @@ pub const Buffer = struct {
     pub fn replacePath(self: *Buffer, path: []const u8) !void {
         if (self.path) |old| self.allocator.free(old);
         self.path = try self.allocator.dupe(u8, path);
+        try self.updateFiletype();
         self.bumpGeneration();
     }
 
@@ -190,6 +208,23 @@ pub const Buffer = struct {
     pub fn saveAs(self: *Buffer, path: []const u8) !void {
         try self.replacePath(path);
         try self.save();
+    }
+
+    pub fn filetypeText(self: *const Buffer) []const u8 {
+        return self.filetype;
+    }
+
+    pub fn encodingText(self: *const Buffer) []const u8 {
+        return self.encoding;
+    }
+
+    pub fn lineEndingText(self: *const Buffer) []const u8 {
+        return switch (self.line_ending) {
+            .lf => "lf",
+            .crlf => "crlf",
+            .cr => "cr",
+            .unknown => "unknown",
+        };
     }
 
     pub fn setCursor(self: *Buffer, row: usize, col: usize) void {
@@ -800,11 +835,34 @@ pub const Buffer = struct {
         self.dirty = true;
     }
 
+    pub fn insertBlankLineBelowIndented(self: *Buffer, indent: usize) !void {
+        try self.pushUndoSnapshot();
+        const blank = try self.allocator.alloc(u8, indent);
+        @memset(blank, ' ');
+        try self.lines.insert(self.cursor.row + 1, blank);
+        self.cursor.row += 1;
+        self.cursor.col = indent;
+        self.clearHistory(&self.redo_stack);
+        self.bumpGeneration();
+        self.dirty = true;
+    }
+
     pub fn insertBlankLineAbove(self: *Buffer) !void {
         try self.pushUndoSnapshot();
         const empty = try self.allocator.dupe(u8, "");
         try self.lines.insert(self.cursor.row, empty);
         self.cursor.col = 0;
+        self.clearHistory(&self.redo_stack);
+        self.bumpGeneration();
+        self.dirty = true;
+    }
+
+    pub fn insertBlankLineAboveIndented(self: *Buffer, indent: usize) !void {
+        try self.pushUndoSnapshot();
+        const blank = try self.allocator.alloc(u8, indent);
+        @memset(blank, ' ');
+        try self.lines.insert(self.cursor.row, blank);
+        self.cursor.col = indent;
         self.clearHistory(&self.redo_stack);
         self.bumpGeneration();
         self.dirty = true;
@@ -893,6 +951,12 @@ pub const Buffer = struct {
         self.generation += 1;
     }
 
+    fn updateFiletype(self: *Buffer) !void {
+        const next = if (self.path) |path| deriveFiletype(path) else "text";
+        self.allocator.free(self.filetype);
+        self.filetype = try self.allocator.dupe(u8, next);
+    }
+
     fn clearLines(self: *Buffer) void {
         for (self.lines.items) |line| {
             self.allocator.free(line);
@@ -935,6 +999,19 @@ pub const Buffer = struct {
     }
 };
 
+fn deriveFiletype(path: []const u8) []const u8 {
+    const ext = std.fs.path.extension(path);
+    if (ext.len == 0) return "text";
+    return ext[1..];
+}
+
+fn detectLineEnding(text: []const u8) LineEnding {
+    if (std.mem.indexOf(u8, text, "\r\n") != null) return .crlf;
+    if (std.mem.indexOfScalar(u8, text, '\r') != null) return .cr;
+    if (text.len > 0) return .lf;
+    return .unknown;
+}
+
 test "buffer edit and undo" {
     var buffer = try Buffer.initEmpty(std.testing.allocator);
     defer buffer.deinit();
@@ -976,6 +1053,18 @@ test "buffer cursor clamps to available lines and columns" {
     buffer.moveLineEnd();
     try std.testing.expectEqual(@as(usize, 1), buffer.cursor.row);
     try std.testing.expectEqual(@as(usize, 3), buffer.cursor.col);
+}
+
+test "buffer tracks file metadata from its path" {
+    var buffer = try Buffer.initEmpty(std.testing.allocator);
+    defer buffer.deinit();
+
+    try std.testing.expectEqualStrings("text", buffer.filetypeText());
+    try std.testing.expectEqualStrings("utf-8", buffer.encodingText());
+    try std.testing.expectEqualStrings("lf", buffer.lineEndingText());
+
+    try buffer.replacePath("src/main.zig");
+    try std.testing.expectEqualStrings("zig", buffer.filetypeText());
 }
 
 fn isWordChar(byte: u8) bool {

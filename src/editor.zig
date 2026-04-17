@@ -666,6 +666,7 @@ pub const App = struct {
             const n = stdin_file.read(&input_buf) catch break;
             if (n == 0) break;
             try self.handleByte(input_buf[0], stdin_file);
+            self.syncActiveSyntax();
             self.serviceLsp();
         }
     }
@@ -916,6 +917,10 @@ pub const App = struct {
         }
         if (matchesCommand(head, &.{"symbols"}, "symbols")) {
             try self.runSymbolPickerSearch(tail);
+            return;
+        }
+        if (matchesCommand(head, &.{"lsp"}, "lsp")) {
+            try self.runLspCommand(tail);
             return;
         }
         if (matchesCommand(head, &.{"diagnostics"}, "diagnostics")) {
@@ -1763,23 +1768,20 @@ pub const App = struct {
                 self.mode = .insert;
             },
             .open_below => {
-                try buf.insertNewline();
+                try self.insertIndentedBlankLine(false);
                 self.mode = .insert;
             },
             .open_above => {
-                buf.moveUp();
-                buf.moveLineStart();
-                try buf.insertNewline();
-                buf.moveUp();
+                try self.insertIndentedBlankLine(true);
                 self.mode = .insert;
             },
             .insert_line_below => {
                 var i: usize = 0;
-                while (i < count) : (i += 1) try buf.insertBlankLineBelow();
+                while (i < count) : (i += 1) try self.insertIndentedBlankLine(false);
             },
             .insert_line_above => {
                 var i: usize = 0;
-                while (i < count) : (i += 1) try buf.insertBlankLineAbove();
+                while (i < count) : (i += 1) try self.insertIndentedBlankLine(true);
             },
             .delete_line => {
                 const removed = try buf.deleteLine(count);
@@ -2858,10 +2860,13 @@ pub const App = struct {
         return switch (byte) {
             'w' => self.wordObjectRange(false, inner),
             'W' => self.wordObjectRange(true, inner),
-            '(', ')', 'b' => self.pairedObjectRange('(', ')', inner),
-            '[', ']' => self.pairedObjectRange('[', ']', inner),
-            '{', '}', 'B' => self.pairedObjectRange('{', '}', inner),
-            '<', '>' => self.angleObjectRange(inner),
+            '(', ')', 'b', '[', ']', '{', '}', 'B', '<', '>' => self.syntaxAwareBlockObjectRange(inner) orelse switch (byte) {
+                '(', ')', 'b' => self.pairedObjectRange('(', ')', inner),
+                '[', ']' => self.pairedObjectRange('[', ']', inner),
+                '{', '}', 'B' => self.pairedObjectRange('{', '}', inner),
+                '<', '>' => self.angleObjectRange(inner),
+                else => null,
+            },
             '"' => self.quoteObjectRange('"', inner),
             '\'' => self.quoteObjectRange('\'', inner),
             '`' => self.quoteObjectRange('`', inner),
@@ -2946,6 +2951,43 @@ pub const App = struct {
 
     fn angleObjectRange(self: *App, inner: bool) ?VisualTextRange {
         return self.pairedObjectRange('<', '>', inner);
+    }
+
+    fn syntaxAwareBlockObjectRange(self: *App, inner: bool) ?VisualTextRange {
+        const buf = self.activeBuffer();
+        if (!std.mem.eql(u8, buf.filetypeText(), "zig")) return null;
+        if (!self.syntax.hasParsedTree(buf.id)) return null;
+        const snapshot = buf.readSnapshot() catch return null;
+        defer buf.freeReadSnapshot(snapshot);
+        const range = self.syntax.textObjectRange(snapshot, inner) orelse return null;
+        return .{ .start = range.start, .end = range.end };
+    }
+
+    fn insertIndentedBlankLine(self: *App, above: bool) !void {
+        const buf = self.activeBuffer();
+        const indent_row = if (above or buf.cursor.row + 1 >= buf.lines.items.len) buf.cursor.row else buf.cursor.row + 1;
+        const indent = self.syntaxIndentForRow(indent_row);
+        if (above) {
+            try buf.insertBlankLineAboveIndented(indent);
+        } else {
+            try buf.insertBlankLineBelowIndented(indent);
+        }
+    }
+
+    fn syntaxIndentForRow(self: *App, row: usize) usize {
+        const buf = self.activeBuffer();
+        const snapshot = buf.readSnapshot() catch return self.lineIndentForRow(row);
+        defer buf.freeReadSnapshot(snapshot);
+        return self.syntax.indentForRow(snapshot, row);
+    }
+
+    fn lineIndentForRow(self: *App, row: usize) usize {
+        const buf = self.activeBuffer();
+        if (row >= buf.lines.items.len) return 0;
+        const line = buf.lines.items[row];
+        var indent: usize = 0;
+        while (indent < line.len and line[indent] == ' ') : (indent += 1) {}
+        return indent;
     }
 
     fn paragraphObjectRange(self: *App, inner: bool) ?VisualTextRange {
@@ -3249,7 +3291,7 @@ pub const App = struct {
     }
 
     fn showReferenceHelp(self: *App) !void {
-        try self.setStatus("help: :help keyword | :w | :wq | :q | :q! | :saveas PATH | :close | :terminal | :edit PATH | :open PATH | :bd | :bn | :bp | :buffer N|PATH | :buffers | :split PATH | :sp PATH | :vs PATH | :tabnew | :tabclose | :tabonly | :tabmove N | :refresh-sources | :plugins | :vimgrep /pat/ [path] | :grep PAT [path] | :sort [u] | :!cmd | :cn | :cp | :cope | :ccl | :marks | :delmarks! | :zf | :za | :zo | :zc | :zE | :zr | :zm | :zi | :diffthis | :diffoff | :diffupdate | :diffget | :diffput | ]c/[c | () | n/N | * / # | m/'/` | Ctrl+u/d/i/o/^ | Ctrl+w s/v/n/q/x/+/-/</>/\\/|/_/=/T | leader x | :registers");
+        try self.setStatus("help: :help keyword | :w | :wq | :q | :q! | :saveas PATH | :close | :terminal | :edit PATH | :open PATH | :bd | :bn | :bp | :buffer N|PATH | :buffers | :split PATH | :sp PATH | :vs PATH | :tabnew | :tabclose | :tabonly | :tabmove N | :refresh-sources | :lsp ACTION | :plugins | :vimgrep /pat/ [path] | :grep PAT [path] | :sort [u] | :!cmd | :cn | :cp | :cope | :ccl | :marks | :delmarks! | :zf | :za | :zo | :zc | :zE | :zr | :zm | :zi | :diffthis | :diffoff | :diffupdate | :diffget | :diffput | ]c/[c | syntax-aware a{/i{/a(/i( in Zig | n/N | * / # | m/'/` | Ctrl+u/d/i/o/^ | Ctrl+w s/v/n/q/x/+/-/</>/\\/|/_/=/T | leader x | :registers");
     }
 
     fn showHelpForCurrentWord(self: *App) !void {
@@ -4606,6 +4648,93 @@ pub const App = struct {
         try self.runPickerSource(.{ .command = "symbols", .kind = .symbols, .title = "symbols" }, pattern, "");
     }
 
+    fn runLspCommand(self: *App, tail: []const u8) !void {
+        const arg_split = std.mem.indexOfScalar(u8, tail, ' ');
+        const head = if (arg_split) |idx| tail[0..idx] else tail;
+        const rest = if (arg_split) |idx| std.mem.trim(u8, tail[idx + 1 ..], " \t") else "";
+        if (head.len == 0) {
+            try self.setStatus("lsp commands: definition|references|hover|completion|rename NAME|code-action|semantic-tokens");
+            return;
+        }
+        if (std.mem.eql(u8, head, "definition")) {
+            try self.requestLspAction("definition", null);
+            return;
+        }
+        if (std.mem.eql(u8, head, "references")) {
+            try self.requestLspAction("references", null);
+            return;
+        }
+        if (std.mem.eql(u8, head, "hover")) {
+            try self.requestLspAction("hover", null);
+            return;
+        }
+        if (std.mem.eql(u8, head, "completion")) {
+            try self.requestLspAction("completion", null);
+            return;
+        }
+        if (std.mem.eql(u8, head, "code-action")) {
+            try self.requestLspAction("code-action", null);
+            return;
+        }
+        if (std.mem.eql(u8, head, "semantic-tokens")) {
+            try self.requestLspAction("semantic-tokens", null);
+            return;
+        }
+        if (std.mem.eql(u8, head, "rename")) {
+            if (rest.len == 0) {
+                try self.setStatus("lsp rename requires a new name");
+                return;
+            }
+            try self.requestLspAction("rename", rest);
+            return;
+        }
+        try self.setStatus("unknown lsp command");
+    }
+
+    fn requestLspAction(self: *App, action: []const u8, tail: ?[]const u8) !void {
+        const buf = self.activeBuffer();
+        const path = buf.path orelse {
+            try self.setStatus("current buffer has no path");
+            return;
+        };
+        const payload = try self.lspPositionPayload(path, tail);
+        defer self.allocator.free(payload);
+        if (std.mem.eql(u8, action, "definition")) {
+            _ = try self.lsp.requestDefinition(payload);
+        } else if (std.mem.eql(u8, action, "references")) {
+            _ = try self.lsp.requestReferences(payload);
+        } else if (std.mem.eql(u8, action, "rename")) {
+            _ = try self.lsp.requestRename(payload);
+        } else if (std.mem.eql(u8, action, "completion")) {
+            _ = try self.lsp.requestCompletion(payload);
+        } else if (std.mem.eql(u8, action, "hover")) {
+            _ = try self.lsp.requestHover(payload);
+        } else if (std.mem.eql(u8, action, "code-action")) {
+            _ = try self.lsp.requestCodeActions(payload);
+        } else if (std.mem.eql(u8, action, "semantic-tokens")) {
+            _ = try self.lsp.requestSemanticTokens(payload);
+        } else {
+            _ = try self.lsp.request(action, payload);
+        }
+        try self.setStatus("lsp request sent");
+    }
+
+    fn lspPositionPayload(self: *App, path: []const u8, tail: ?[]const u8) ![]u8 {
+        const buf = self.activeBuffer();
+        const row = buf.cursor.row;
+        const col = buf.cursor.col;
+        if (tail) |text| {
+            return try std.fmt.allocPrint(self.allocator,
+                "{{\"textDocument\":{{\"uri\":\"file://{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}},\"newName\":{s}}}",
+                .{ path, row, col, try jsonStringLiteral(self.allocator, text) },
+            );
+        }
+        return try std.fmt.allocPrint(self.allocator,
+            "{{\"textDocument\":{{\"uri\":\"file://{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}",
+            .{ path, row, col },
+        );
+    }
+
     fn runPickerSource(self: *App, spec: listsource_mod.SourceSpec, pattern: []const u8, pathspec: []const u8) !void {
         self.cancelActivePickerSource();
         var collector = SearchCollector.init(self, spec.kind, spec.emit_quickfix);
@@ -5222,6 +5351,9 @@ pub const App = struct {
             .{ .name = "picker", .enabled = caps.picker },
             .{ .name = "pane", .enabled = caps.pane },
             .{ .name = "fs_read", .enabled = caps.fs_read },
+            .{ .name = "tree_query", .enabled = caps.tree_query },
+            .{ .name = "decoration", .enabled = caps.decoration },
+            .{ .name = "lsp", .enabled = caps.lsp },
         };
         var any = false;
         for (capabilities) |cap| {
@@ -6190,11 +6322,6 @@ pub const App = struct {
     }
 
     fn rowDecorationForBuffer(self: *App, buffer: *buffer_mod.Buffer, row: usize) ?[]const u8 {
-        for (self.diagnostics.decorations.items) |decoration| {
-            if (decoration.buffer_id == buffer.id and decoration.row == row) {
-                if (decoration.text) |text| return text;
-            }
-        }
         for (self.diagnostics.diagnostics.items) |diagnostic| {
             if (diagnostic.buffer_id == buffer.id and diagnostic.row == row) {
                 return diagnostic.message;
@@ -6207,6 +6334,9 @@ pub const App = struct {
                     if (std.mem.eql(u8, diag_path, path)) return diagnostic.message;
                 }
             }
+        }
+        if (self.diagnostics.bestDecorationForRow(buffer.id, row)) |decoration| {
+            if (decoration.text) |text| return text;
         }
         return null;
     }
@@ -6318,6 +6448,12 @@ pub const App = struct {
         const builtin_status = self.builtins.statusText();
         const plugin_status_local = try self.plugin_catalog.statusText(self.allocator);
         defer self.allocator.free(plugin_status_local);
+        const git_branch = try self.workspace.gitBranchName(self.allocator);
+        defer self.allocator.free(git_branch);
+        const git_status = if (git_branch.len == 0) try self.allocator.dupe(u8, "") else blk: {
+            break :blk try std.fmt.allocPrint(self.allocator, "git {s}", .{git_branch});
+        };
+        defer self.allocator.free(git_status);
         const builtin_status_combined = if (builtin_status.len == 0) plugin_status_local else if (plugin_status_local.len == 0) builtin_status else blk: {
             break :blk try std.fmt.allocPrint(self.allocator, "{s} | {s}", .{ builtin_status, plugin_status_local });
         };
@@ -6336,28 +6472,48 @@ pub const App = struct {
         defer self.allocator.free(picker_status);
         const quickfix_status = if (self.quickfix_list.query.items.len > 0 or self.quickfix_list.items.items.len > 0) try self.quickfix_list.statusText(self.allocator, "quickfix") else try self.allocator.dupe(u8, "");
         defer self.allocator.free(quickfix_status);
+        const syntax_status = try self.syntax.statusText(self.allocator, buf.id, buf.filetypeText());
+        defer self.allocator.free(syntax_status);
+        const file_status = try std.fmt.allocPrint(self.allocator, "{s} {s} {s}", .{ buf.filetypeText(), buf.encodingText(), buf.lineEndingText() });
+        defer self.allocator.free(file_status);
+        const macro_status = if (self.macro_recording) |reg| blk: {
+            break :blk try std.fmt.allocPrint(self.allocator, "recording @{c}", .{reg});
+        } else try self.allocator.dupe(u8, "");
+        defer self.allocator.free(macro_status);
         const app_prefix = "󰞋 ";
         const builtin_prefix = "󰒓 ";
         const diagnostics_prefix = "󰧑 ";
         const pane_prefix = "󰓩 ";
         const picker_prefix = "󰌑 ";
         const quickfix_prefix = "󰜴 ";
+        const git_prefix = "󰓒 ";
+        const syntax_prefix = "󰚛 ";
+        const file_prefix = "󰏫 ";
+        const macro_prefix = "󰘥 ";
         const app_width = if (app_status.len > 0) displayWidth(app_prefix) + displayWidth(app_status) else 0;
         const builtin_width = if (builtin_status_combined.len > 0) displayWidth(builtin_prefix) + displayWidth(builtin_status_combined) else 0;
         const diagnostics_width = if (diagnostics_status.len > 0) displayWidth(diagnostics_prefix) + displayWidth(diagnostics_status) else 0;
         const pane_width = if (pane_status.len > 0) displayWidth(pane_prefix) + displayWidth(pane_status) else 0;
         const picker_width = if (picker_status.len > 0) displayWidth(picker_prefix) + displayWidth(picker_status) else 0;
         const quickfix_width = if (quickfix_status.len > 0) displayWidth(quickfix_prefix) + displayWidth(quickfix_status) else 0;
+        const git_width = if (git_status.len > 0) displayWidth(git_prefix) + displayWidth(git_status) else 0;
+        const syntax_width = if (syntax_status.len > 0) displayWidth(syntax_prefix) + displayWidth(syntax_status) else 0;
+        const file_width = if (file_status.len > 0) displayWidth(file_prefix) + displayWidth(file_status) else 0;
+        const macro_width = if (macro_status.len > 0) displayWidth(macro_prefix) + displayWidth(macro_status) else 0;
         const location_width = displayWidth(location);
         const progress_width = displayWidth(progress);
         const sep_width: usize = displayWidth(" │ ");
 
-        var include_app = app_width > 0 and max_width >= app_width + builtin_width + diagnostics_width + pane_width + picker_width + quickfix_width + location_width + progress_width;
-        var include_builtin = builtin_width > 0 and max_width >= builtin_width + diagnostics_width + pane_width + picker_width + quickfix_width + location_width + progress_width;
-        var include_diagnostics = diagnostics_width > 0 and max_width >= diagnostics_width + pane_width + picker_width + quickfix_width + location_width + progress_width;
-        var include_pane = pane_width > 0 and max_width >= pane_width + picker_width + quickfix_width + location_width + progress_width;
-        var include_picker = picker_width > 0 and max_width >= picker_width + quickfix_width + location_width + progress_width;
-        const include_quickfix = quickfix_width > 0 and max_width >= quickfix_width + location_width + progress_width;
+        var include_app = app_width > 0 and max_width >= app_width + builtin_width + diagnostics_width + pane_width + picker_width + quickfix_width + git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_builtin = builtin_width > 0 and max_width >= builtin_width + diagnostics_width + pane_width + picker_width + quickfix_width + git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_diagnostics = diagnostics_width > 0 and max_width >= diagnostics_width + pane_width + picker_width + quickfix_width + git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_pane = pane_width > 0 and max_width >= pane_width + picker_width + quickfix_width + git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_picker = picker_width > 0 and max_width >= picker_width + quickfix_width + git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_quickfix = quickfix_width > 0 and max_width >= quickfix_width + git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_git = git_width > 0 and max_width >= git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        const include_syntax = syntax_width > 0 and max_width >= syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_file = file_width > 0 and max_width >= file_width + macro_width + location_width + progress_width;
+        var include_macro = macro_width > 0 and max_width >= macro_width + location_width + progress_width;
 
         const mandatory_width = location_width + progress_width + (if (location_width > 0 and progress_width > 0) sep_width else 0);
         if (mandatory_width > max_width) {
@@ -6406,6 +6562,26 @@ pub const App = struct {
             try out.appendSlice(quickfix_prefix);
             try out.appendSlice(quickfix_status);
         }
+        if (include_git) {
+            if (out.items.len > 0) try out.appendSlice(" │ ");
+            try out.appendSlice(git_prefix);
+            try out.appendSlice(git_status);
+        }
+        if (include_syntax) {
+            if (out.items.len > 0) try out.appendSlice(" │ ");
+            try out.appendSlice(syntax_prefix);
+            try out.appendSlice(syntax_status);
+        }
+        if (include_file) {
+            if (out.items.len > 0) try out.appendSlice(" │ ");
+            try out.appendSlice(file_prefix);
+            try out.appendSlice(file_status);
+        }
+        if (include_macro) {
+            if (out.items.len > 0) try out.appendSlice(" │ ");
+            try out.appendSlice(macro_prefix);
+            try out.appendSlice(macro_status);
+        }
         if (out.items.len > 0) try out.appendSlice(" │ ");
         try out.appendSlice(location);
         if (progress.len > 0) {
@@ -6423,6 +6599,10 @@ pub const App = struct {
         include_diagnostics = false;
         include_pane = false;
         include_picker = false;
+        include_quickfix = false;
+        include_git = false;
+        include_file = false;
+        include_macro = false;
         if (include_builtin) {
             try out.appendSlice(builtin_prefix);
             try out.appendSlice(builtin_status_combined);
@@ -6443,6 +6623,24 @@ pub const App = struct {
         const prompt = if (self.mode == .command) self.command_buffer.items else self.search_buffer.items;
         const prefix: []const u8 = if (self.mode == .command) ":" else if (self.search_forward) "/" else "?";
         return try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, prompt });
+    }
+
+    fn jsonStringLiteral(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        var out = std.array_list.Managed(u8).init(allocator);
+        errdefer out.deinit();
+        try out.append('"');
+        for (text) |byte| {
+            switch (byte) {
+                '"' => try out.appendSlice("\\\""),
+                '\\' => try out.appendSlice("\\\\"),
+                '\n' => try out.appendSlice("\\n"),
+                '\r' => try out.appendSlice("\\r"),
+                '\t' => try out.appendSlice("\\t"),
+                else => try out.append(byte),
+            }
+        }
+        try out.append('"');
+        return try out.toOwnedSlice();
     }
 
     fn toggleSplitFocus(self: *App) void {
@@ -6509,20 +6707,27 @@ pub const App = struct {
 
     fn syncActiveSyntax(self: *App) void {
         const buf = self.activeBuffer();
+        if (self.syntax.snapshotGeneration(buf.id)) |generation| {
+            if (generation == buf.generation) return;
+        }
         const snapshot = buf.readSnapshot() catch return;
         defer buf.freeReadSnapshot(snapshot);
         self.syntax.updateSnapshot(snapshot) catch {};
+        self.syntax.applyDecorations(&self.diagnostics, snapshot) catch {};
     }
 
     fn builtinHost(self: *App) builtins_mod.Host {
         return .{
             .ctx = self,
-            .caps = .{ .command = true, .event = true, .status = true },
+            .caps = .{ .command = true, .event = true, .status = true, .jobs = true, .pane = true, .decoration = true },
             .set_status = builtinSetStatus,
             .set_extension_status = builtinSetExtensionStatus,
             .set_plugin_activity = builtinSetPluginActivity,
             .register_command = builtinRegisterCommand,
             .register_event = builtinRegisterEvent,
+            .spawn_job = builtinSpawnJob,
+            .add_decoration = builtinAddDecoration,
+            .set_pane_text = builtinSetPaneText,
         };
     }
 
@@ -6563,6 +6768,7 @@ pub const App = struct {
             \\  :tabonly       keep only the current tab
             \\  :tabmove N     move current tab to index N
             \\  :refresh-sources refresh picker and diagnostics sources
+            \\  :lsp ACTION      issue an LSP request (definition, hover, completion, references, rename, code-action, semantic-tokens)
             \\  :plugins        show loaded plugin manifests
             \\  :vimgrep /pat/ [path] search files for a pattern
             \\  :pickgrep /pat/ [path] search files into the picker
@@ -6584,7 +6790,7 @@ pub const App = struct {
             \\  Ctrl+w w      switch windows
             \\  Ctrl+w q      quit a window
             \\  Ctrl+w T      move split into its own tab
-            \\  Normal mode   motions compose with operators and text objects
+            \\  Normal mode   motions compose with operators and text objects; Zig block objects prefer Tree-sitter
             \\                examples: dw, ciw, d$, y$, VG
             \\  Normal mode   line anchors: 0 ^ $ and g0 g^ g$
             \\  Normal mode   local find motions: f/F/t/T with ; and ,
@@ -6626,6 +6832,23 @@ fn builtinRegisterEvent(ctx: *anyopaque, event: []const u8, handler: builtins_mo
     try app.builtins.registerExtensionEvent(event, handler);
 }
 
+fn builtinSpawnJob(ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.scheduler.spawn(kind, request_generation, workspace_generation);
+}
+
+fn builtinAddDecoration(ctx: *anyopaque, decoration: diagnostics_mod.Decoration) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    try app.diagnostics.addDecoration(decoration);
+}
+
+fn builtinSetPaneText(ctx: *anyopaque, pane_id: u64, title: []const u8, text: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    if (!try app.panes.updateTitle(pane_id, title)) return;
+    _ = app.panes.clearStreaming(pane_id);
+    _ = try app.panes.appendStreaming(pane_id, text);
+}
+
 fn testInteractiveCommandHook(app: *App, argv: []const []const u8) bool {
     if (app.last_interactive_command) |cmd| app.allocator.free(cmd);
     app.last_interactive_command = std.mem.join(app.allocator, "\t", argv) catch return false;
@@ -6651,6 +6874,16 @@ fn makeTestApp(allocator: std.mem.Allocator, text: []const u8) !App {
     try buf.setText(text);
     try app.buffers.append(buf);
     app.active_index = 0;
+    return app;
+}
+
+fn makeTestAppWithFiletype(allocator: std.mem.Allocator, text: []const u8, filetype: []const u8) !App {
+    var app = try makeTestApp(allocator, text);
+    errdefer app.deinit();
+    var buf = app.activeBuffer();
+    buf.allocator.free(buf.filetype);
+    buf.filetype = try buf.allocator.dupe(u8, filetype);
+    app.syncActiveSyntax();
     return app;
 }
 
@@ -8469,6 +8702,44 @@ test "visual text objects cover paired delimiters" {
     try expectVisualTextObjectYank("<tag>body</tag>", 0, 0, "i<", "tag");
     try expectVisualTextObjectYank("<tag>body</tag>", 0, 0, "a>", "<tag>");
     try expectVisualTextObjectYank("<tag>body</tag>", 0, 0, "i>", "tag");
+}
+
+test "visual text objects prefer tree-sitter blocks in zig buffers" {
+    var app = try makeTestAppWithFiletype(std.testing.allocator, "pub fn demo() void {\n    const value = 1;\n}\n", "zig");
+    defer app.deinit();
+
+    setCursor(&app, 1, 10);
+    const snapshot = try app.activeBuffer().readSnapshot();
+    defer app.activeBuffer().freeReadSnapshot(snapshot);
+    const expected_range = app.syntax.textObjectRange(snapshot, true) orelse return error.TestExpected;
+
+    try app.handleNormalByte('v');
+    try app.handleVisualByte('i');
+    try app.handleVisualByte('{');
+    try app.handleVisualByte('y');
+
+    const expected = try app.selectedText(expected_range.start, expected_range.end);
+    defer app.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, app.registers.get('"').?);
+}
+
+test "zig open line actions use syntax-aware indentation" {
+    var app = try makeTestAppWithFiletype(std.testing.allocator, "pub fn demo() void {\n}\n", "zig");
+    defer app.deinit();
+
+    const snapshot = try app.activeBuffer().readSnapshot();
+    defer app.activeBuffer().freeReadSnapshot(snapshot);
+    const expected_indent = app.syntax.indentForRow(snapshot, 1);
+
+    setCursor(&app, 0, app.activeBuffer().lines.items[0].len);
+    try app.performNormalAction(.open_below, 1);
+
+    const blank = app.activeBuffer().lines.items[1];
+    var actual_indent: usize = 0;
+    while (actual_indent < blank.len and blank[actual_indent] == ' ') : (actual_indent += 1) {}
+
+    try std.testing.expectEqual(expected_indent, actual_indent);
+    try std.testing.expectEqual(.insert, app.mode);
 }
 
 test "visual text objects cover quotes and backticks" {

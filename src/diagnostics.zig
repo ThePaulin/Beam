@@ -13,12 +13,15 @@ pub const Diagnostic = struct {
 
 pub const DecorationKind = enum { highlight, sign, virtual_text, underline, hint };
 
+pub const DecorationSource = enum { diagnostics, lsp, treesitter, plugin, custom };
+
 pub const Decoration = struct {
     buffer_id: u64,
     row: usize,
     col: usize,
     len: usize,
     kind: DecorationKind,
+    source: DecorationSource = .custom,
     severity: ?Severity = null,
     text: ?[]u8 = null,
 };
@@ -62,8 +65,45 @@ pub const Store = struct {
             .col = diagnostic.col,
             .len = @max(diagnostic.message.len, 1),
             .kind = kind,
+            .source = .diagnostics,
             .severity = diagnostic.severity,
             .text = try self.allocator.dupe(u8, diagnostic.message),
+        });
+    }
+
+    pub fn addLspDecoration(self: *Store, buffer_id: u64, row: usize, col: usize, len: usize, text: []const u8, kind: DecorationKind) !void {
+        try self.decorations.append(.{
+            .buffer_id = buffer_id,
+            .row = row,
+            .col = col,
+            .len = @max(len, 1),
+            .kind = kind,
+            .source = .lsp,
+            .text = try self.allocator.dupe(u8, text),
+        });
+    }
+
+    pub fn addTreeDecoration(self: *Store, buffer_id: u64, row: usize, col: usize, len: usize, text: []const u8, kind: DecorationKind) !void {
+        try self.decorations.append(.{
+            .buffer_id = buffer_id,
+            .row = row,
+            .col = col,
+            .len = @max(len, 1),
+            .kind = kind,
+            .source = .treesitter,
+            .text = try self.allocator.dupe(u8, text),
+        });
+    }
+
+    pub fn addPluginDecoration(self: *Store, buffer_id: u64, row: usize, col: usize, len: usize, text: []const u8, kind: DecorationKind) !void {
+        try self.decorations.append(.{
+            .buffer_id = buffer_id,
+            .row = row,
+            .col = col,
+            .len = @max(len, 1),
+            .kind = kind,
+            .source = .plugin,
+            .text = try self.allocator.dupe(u8, text),
         });
     }
 
@@ -105,10 +145,41 @@ pub const Store = struct {
         }
     }
 
+    pub fn clearBufferSource(self: *Store, buffer_id: u64, source: DecorationSource) void {
+        var i: usize = 0;
+        while (i < self.decorations.items.len) {
+            if (self.decorations.items[i].buffer_id == buffer_id and self.decorations.items[i].source == source) {
+                const item = self.decorations.orderedRemove(i);
+                if (item.text) |text| self.allocator.free(text);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    pub fn bestDecorationForRow(self: *const Store, buffer_id: u64, row: usize) ?Decoration {
+        var best: ?Decoration = null;
+        for (self.decorations.items) |decoration| {
+            if (decoration.buffer_id != buffer_id or decoration.row != row) continue;
+            if (best == null or decorationPriority(decoration) > decorationPriority(best.?)) {
+                best = decoration;
+            }
+        }
+        return best;
+    }
+
     pub fn decorationsForRow(self: *const Store, buffer_id: u64, row: usize) usize {
         var total: usize = 0;
         for (self.decorations.items) |decoration| {
             if (decoration.buffer_id == buffer_id and decoration.row == row) total += 1;
+        }
+        return total;
+    }
+
+    pub fn decorationsForSource(self: *const Store, source: DecorationSource) usize {
+        var total: usize = 0;
+        for (self.decorations.items) |decoration| {
+            if (decoration.source == source) total += 1;
         }
         return total;
     }
@@ -137,6 +208,24 @@ pub const Store = struct {
     }
 };
 
+fn decorationPriority(decoration: Decoration) u8 {
+    const source_score: u8 = switch (decoration.source) {
+        .diagnostics => 5,
+        .lsp => 4,
+        .treesitter => 3,
+        .plugin => 2,
+        .custom => 1,
+    };
+    const kind_score: u8 = switch (decoration.kind) {
+        .hint => 5,
+        .virtual_text => 4,
+        .sign => 3,
+        .highlight => 2,
+        .underline => 1,
+    };
+    return source_score * 10 + kind_score;
+}
+
 test "diagnostics counts and buffer clearing" {
     var store = Store.init(std.testing.allocator);
     defer store.deinit();
@@ -150,4 +239,53 @@ test "diagnostics counts and buffer clearing" {
     try std.testing.expectEqual(@as(usize, 1), store.count(.err));
     store.clearBuffer(1);
     try std.testing.expectEqual(@as(usize, 0), store.count(.err));
+}
+
+test "diagnostics tracks decoration sources" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    try store.addTreeDecoration(1, 0, 0, 4, "node", .highlight);
+    try store.addPluginDecoration(1, 1, 0, 3, "plug", .sign);
+
+    try std.testing.expectEqual(@as(usize, 1), store.decorationsForSource(.treesitter));
+    try std.testing.expectEqual(@as(usize, 1), store.decorationsForSource(.plugin));
+}
+
+test "diagnostics clears decorations for a single source" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    try store.addTreeDecoration(1, 0, 0, 4, "node", .highlight);
+    try store.addPluginDecoration(1, 1, 0, 3, "plug", .sign);
+
+    store.clearBufferSource(1, .treesitter);
+
+    try std.testing.expectEqual(@as(usize, 0), store.decorationsForSource(.treesitter));
+    try std.testing.expectEqual(@as(usize, 1), store.decorationsForSource(.plugin));
+}
+
+test "diagnostics chooses row decorations by explicit priority" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    try store.addPluginDecoration(1, 0, 0, 3, "plugin", .hint);
+    try store.addTreeDecoration(1, 0, 0, 4, "tree", .highlight);
+    try store.addLspDecoration(1, 0, 0, 5, "lsp", .virtual_text);
+
+    const best = store.bestDecorationForRow(1, 0) orelse return error.TestExpected;
+    try std.testing.expectEqualStrings("lsp", best.text.?);
+    try std.testing.expectEqual(.lsp, best.source);
+}
+
+test "diagnostics prefers tree-sitter hints over highlights on the same row" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    try store.addTreeDecoration(1, 0, 0, 2, "kw", .highlight);
+    try store.addTreeDecoration(1, 0, 0, 3, "def", .hint);
+
+    const best = store.bestDecorationForRow(1, 0) orelse return error.TestExpected;
+    try std.testing.expectEqualStrings("def", best.text.?);
+    try std.testing.expectEqual(.hint, best.kind);
 }

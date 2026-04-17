@@ -10,6 +10,71 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const tree_sitter_lib = b.addLibrary(.{
+        .name = "tree-sitter",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    // Keep the parser runtime vendored so Beam builds the exact C runtime it links against.
+    tree_sitter_lib.root_module.addCMacro("_POSIX_C_SOURCE", "200112L");
+    tree_sitter_lib.root_module.addCMacro("_DEFAULT_SOURCE", "");
+    tree_sitter_lib.addCSourceFile(.{
+        .file = b.path("vendor/tree-sitter-runtime/lib/src/lib.c"),
+        .flags = &.{"-std=c11"},
+    });
+    tree_sitter_lib.addIncludePath(b.path("vendor/tree-sitter-runtime/lib/include"));
+    tree_sitter_lib.addIncludePath(b.path("vendor/tree-sitter-runtime/lib/src"));
+    const tree_sitter_module = b.addModule("tree-sitter", .{
+        .root_source_file = b.path("vendor/tree-sitter-bindings/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tree_sitter_module.linkLibrary(tree_sitter_lib);
+    root_module.addImport("tree-sitter", tree_sitter_module);
+
+    const tree_sitter_zig_lib = b.addLibrary(.{
+        .name = "tree-sitter-zig",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    // The Zig grammar is also vendored and compiled directly into the Beam binary.
+    tree_sitter_zig_lib.addCSourceFile(.{
+        .file = b.path("vendor/tree-sitter-zig/src/parser.c"),
+        .flags = &.{"-std=c11"},
+    });
+    tree_sitter_zig_lib.addIncludePath(b.path("vendor/tree-sitter-zig/src"));
+    const tree_sitter_zig_module = b.addModule("tree-sitter-zig", .{
+        .root_source_file = b.path("vendor/tree-sitter-zig/bindings/zig/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tree_sitter_zig_module.linkLibrary(tree_sitter_zig_lib);
+    root_module.addImport("tree-sitter-zig", tree_sitter_zig_module);
+
+    // Embed query sources so the executable does not need to read them from the checkout at runtime.
+    const tree_sitter_queries = b.addWriteFiles();
+    _ = tree_sitter_queries.addCopyFile(b.path("vendor/tree-sitter-zig/queries/highlights.scm"), "highlights.scm");
+    _ = tree_sitter_queries.addCopyFile(b.path("vendor/tree-sitter-zig/queries/locals.scm"), "locals.scm");
+    _ = tree_sitter_queries.addCopyFile(b.path("vendor/tree-sitter-zig/queries/folds.scm"), "folds.scm");
+    const tree_sitter_queries_source = tree_sitter_queries.add(
+        "queries.zig",
+        \\pub const zig_highlights_query_source = @embedFile("highlights.scm");
+        \\pub const zig_locals_query_source = @embedFile("locals.scm");
+        \\pub const zig_folds_query_source = @embedFile("folds.scm");
+    );
+    const tree_sitter_queries_module = b.addModule("tree-sitter-queries", .{
+        .root_source_file = tree_sitter_queries_source,
+        .target = target,
+        .optimize = optimize,
+    });
+    root_module.addImport("tree-sitter-queries", tree_sitter_queries_module);
+
     const exe = b.addExecutable(.{
         .name = "beam",
         .root_module = root_module,
