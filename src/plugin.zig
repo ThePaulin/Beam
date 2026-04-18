@@ -71,10 +71,14 @@ pub const Manifest = struct {
     capabilities: Capabilities = .{},
 };
 
+pub const RequestHandle = scheduler_mod.RequestHandle;
+pub const CompletionKind = scheduler_mod.CompletionKind;
+
 pub const CommandHandler = *const fn (ctx: *anyopaque, args: []const []const u8) anyerror!void;
 pub const EventHandler = *const fn (ctx: *anyopaque, payload: []const u8) anyerror!void;
-pub const JobHandler = *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64;
-pub const JobResultHandler = *const fn (ctx: *anyopaque, job_id: u64, request_generation: u64, workspace_generation: u64, success: bool, payload: []const u8) anyerror!void;
+pub const JobHandler = *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!RequestHandle;
+pub const CompletionHandler = *const fn (ctx: *anyopaque, kind: CompletionKind, handle: RequestHandle, success: bool, payload: []const u8) anyerror!void;
+pub const JobResultHandler = CompletionHandler;
 pub const DecorationHandler = *const fn (ctx: *anyopaque, owner: []const u8, decoration: diagnostics_mod.Decoration) anyerror!void;
 pub const DecorationClearHandler = *const fn (ctx: *anyopaque, owner: []const u8) anyerror!void;
 pub const DecorationBufferClearHandler = *const fn (ctx: *anyopaque, owner: []const u8, buffer_id: u64) anyerror!void;
@@ -114,15 +118,15 @@ fn defaultSetPluginActivity(_: *anyopaque, _: []const u8) anyerror!void {
     return error.PermissionDenied;
 }
 
-fn defaultSpawnJob(_: *anyopaque, _: scheduler_mod.JobKind, _: u64, _: u64) anyerror!u64 {
+fn defaultSpawnJob(_: *anyopaque, _: scheduler_mod.JobKind, _: u64, _: u64) anyerror!RequestHandle {
     return error.PermissionDenied;
 }
 
-fn defaultCancelJob(_: *anyopaque, _: u64) bool {
+fn defaultCancelJob(_: *anyopaque, _: RequestHandle) bool {
     return false;
 }
 
-fn defaultRegisterJobResult(_: *anyopaque, _: u64, _: u64, _: u64, _: JobResultHandler) anyerror!void {
+fn defaultRegisterCompletion(_: *anyopaque, _: CompletionKind, _: RequestHandle, _: CompletionHandler) anyerror!void {
     return error.PermissionDenied;
 }
 
@@ -228,7 +232,7 @@ fn defaultSyntaxTextObjectRange(_: *anyopaque, _: u64, _: bool) anyerror!?syntax
     return error.PermissionDenied;
 }
 
-fn defaultRequestLsp(_: *anyopaque, _: []const u8) anyerror!u64 {
+fn defaultRequestLsp(_: *anyopaque, _: []const u8) anyerror!RequestHandle {
     return error.PermissionDenied;
 }
 
@@ -242,9 +246,9 @@ pub const Host = struct {
     set_plugin_activity: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void = defaultSetPluginActivity,
     register_command: *const fn (ctx: *anyopaque, name: []const u8, description: []const u8, handler: CommandHandler) anyerror!void = defaultRegisterCommand,
     register_event: *const fn (ctx: *anyopaque, event: []const u8, handler: EventHandler) anyerror!void = defaultRegisterEvent,
-    spawn_job: *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64 = defaultSpawnJob,
-    cancel_job: *const fn (ctx: *anyopaque, job_id: u64) bool = defaultCancelJob,
-    register_job_result: *const fn (ctx: *anyopaque, job_id: u64, request_generation: u64, workspace_generation: u64, handler: JobResultHandler) anyerror!void = defaultRegisterJobResult,
+    spawn_job: *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!RequestHandle = defaultSpawnJob,
+    cancel_job: *const fn (ctx: *anyopaque, handle: RequestHandle) bool = defaultCancelJob,
+    register_completion: *const fn (ctx: *anyopaque, kind: CompletionKind, handle: RequestHandle, handler: CompletionHandler) anyerror!void = defaultRegisterCompletion,
     add_decoration: *const fn (ctx: *anyopaque, owner: []const u8, decoration: diagnostics_mod.Decoration) anyerror!void = defaultAddDecoration,
     clear_decorations: *const fn (ctx: *anyopaque, owner: []const u8) anyerror!void = defaultClearDecorations,
     clear_buffer_decorations: *const fn (ctx: *anyopaque, owner: []const u8, buffer_id: u64) anyerror!void = defaultClearBufferDecorations,
@@ -272,13 +276,13 @@ pub const Host = struct {
     syntax_enclosing_scope: *const fn (ctx: *anyopaque, buffer_id: u64) anyerror!?syntax_mod.FoldRange = defaultSyntaxEnclosingScope,
     syntax_indent_for_row: *const fn (ctx: *anyopaque, buffer_id: u64, row: usize) anyerror!usize = defaultSyntaxIndentForRow,
     syntax_text_object_range: *const fn (ctx: *anyopaque, buffer_id: u64, inner: bool) anyerror!?syntax_mod.TextRange = defaultSyntaxTextObjectRange,
-    request_definition: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
-    request_references: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
-    request_rename: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
-    request_completion: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
-    request_hover: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
-    request_code_action: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
-    request_semantic_tokens: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!u64 = defaultRequestLsp,
+    request_definition: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!RequestHandle = defaultRequestLsp,
+    request_references: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!RequestHandle = defaultRequestLsp,
+    request_rename: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!RequestHandle = defaultRequestLsp,
+    request_completion: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!RequestHandle = defaultRequestLsp,
+    request_hover: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!RequestHandle = defaultRequestLsp,
+    request_code_action: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!RequestHandle = defaultRequestLsp,
+    request_semantic_tokens: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!RequestHandle = defaultRequestLsp,
 
     pub fn require(self: *const Host, capability: Capability) !void {
         if (!self.caps.allows(capability)) return error.PermissionDenied;
@@ -309,18 +313,26 @@ pub const Host = struct {
         try self.register_event(self.ctx, event, handler);
     }
 
-    pub fn spawnJob(self: *const Host, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) !u64 {
+    pub fn spawnJob(self: *const Host, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) !RequestHandle {
         try self.require(.jobs);
         return try self.spawn_job(self.ctx, kind, request_generation, workspace_generation);
     }
 
-    pub fn cancelJob(self: *const Host, job_id: u64) bool {
-        return self.cancel_job(self.ctx, job_id);
+    pub fn cancelJob(self: *const Host, handle: RequestHandle) bool {
+        return self.cancel_job(self.ctx, handle);
     }
 
-    pub fn registerJobResultHandler(self: *const Host, job_id: u64, request_generation: u64, workspace_generation: u64, handler: JobResultHandler) !void {
+    pub fn registerCompletionHandler(self: *const Host, kind: CompletionKind, handle: RequestHandle, handler: CompletionHandler) !void {
         try self.require(.job_results);
-        try self.register_job_result(self.ctx, job_id, request_generation, workspace_generation, handler);
+        try self.register_completion(self.ctx, kind, handle, handler);
+    }
+
+    pub fn registerJobResultHandler(self: *const Host, handle: RequestHandle, handler: JobResultHandler) !void {
+        try self.registerCompletionHandler(.job, handle, handler);
+    }
+
+    pub fn registerServiceResultHandler(self: *const Host, handle: RequestHandle, handler: CompletionHandler) !void {
+        try self.registerCompletionHandler(.service, handle, handler);
     }
 
     pub fn addDecoration(self: *const Host, decoration: diagnostics_mod.Decoration) !void {
@@ -459,37 +471,37 @@ pub const Host = struct {
         return try self.syntax_text_object_range(self.ctx, buffer_id, inner);
     }
 
-    pub fn requestDefinition(self: *const Host, payload: []const u8) !u64 {
+    pub fn requestDefinition(self: *const Host, payload: []const u8) !RequestHandle {
         try self.require(.lsp);
         return try self.request_definition(self.ctx, payload);
     }
 
-    pub fn requestReferences(self: *const Host, payload: []const u8) !u64 {
+    pub fn requestReferences(self: *const Host, payload: []const u8) !RequestHandle {
         try self.require(.lsp);
         return try self.request_references(self.ctx, payload);
     }
 
-    pub fn requestRename(self: *const Host, payload: []const u8) !u64 {
+    pub fn requestRename(self: *const Host, payload: []const u8) !RequestHandle {
         try self.require(.lsp);
         return try self.request_rename(self.ctx, payload);
     }
 
-    pub fn requestCompletion(self: *const Host, payload: []const u8) !u64 {
+    pub fn requestCompletion(self: *const Host, payload: []const u8) !RequestHandle {
         try self.require(.lsp);
         return try self.request_completion(self.ctx, payload);
     }
 
-    pub fn requestHover(self: *const Host, payload: []const u8) !u64 {
+    pub fn requestHover(self: *const Host, payload: []const u8) !RequestHandle {
         try self.require(.lsp);
         return try self.request_hover(self.ctx, payload);
     }
 
-    pub fn requestCodeAction(self: *const Host, payload: []const u8) !u64 {
+    pub fn requestCodeAction(self: *const Host, payload: []const u8) !RequestHandle {
         try self.require(.lsp);
         return try self.request_code_action(self.ctx, payload);
     }
 
-    pub fn requestSemanticTokens(self: *const Host, payload: []const u8) !u64 {
+    pub fn requestSemanticTokens(self: *const Host, payload: []const u8) !RequestHandle {
         try self.require(.lsp);
         return try self.request_semantic_tokens(self.ctx, payload);
     }
@@ -549,10 +561,12 @@ test "new capability flags are recognized" {
         .tree_query = true,
         .decoration = true,
         .lsp = true,
+        .job_results = true,
     };
     try std.testing.expect(caps.allows(.tree_query));
     try std.testing.expect(caps.allows(.decoration));
     try std.testing.expect(caps.allows(.lsp));
+    try std.testing.expect(caps.allows(.job_results));
 }
 
 test "plugin abi symbols are exposed" {

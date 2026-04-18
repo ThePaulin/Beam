@@ -9,7 +9,9 @@ pub const Manifest = plugin_mod.Manifest;
 
 pub const CommandHandler = plugin_mod.CommandHandler;
 pub const EventHandler = plugin_mod.EventHandler;
-pub const JobResultHandler = plugin_mod.JobResultHandler;
+pub const AsyncResultKind = plugin_mod.CompletionKind;
+pub const AsyncResultHandler = plugin_mod.CompletionHandler;
+pub const RequestHandle = plugin_mod.RequestHandle;
 
 pub const Command = struct {
     name: []u8,
@@ -22,11 +24,10 @@ pub const EventListener = struct {
     handler: EventHandler,
 };
 
-pub const JobResultListener = struct {
-    job_id: u64,
-    request_generation: u64,
-    workspace_generation: u64,
-    handler: JobResultHandler,
+pub const AsyncResultListener = struct {
+    kind: AsyncResultKind,
+    handle: RequestHandle,
+    handler: AsyncResultHandler,
 };
 
 pub const Registry = struct {
@@ -37,7 +38,7 @@ pub const Registry = struct {
     extension_commands: std.array_list.Managed(Command),
     events: std.array_list.Managed(EventListener),
     extension_events: std.array_list.Managed(EventListener),
-    job_results: std.array_list.Managed(JobResultListener),
+    async_results: std.array_list.Managed(AsyncResultListener),
     status: std.array_list.Managed(u8),
 
     pub fn init(allocator: std.mem.Allocator) Registry {
@@ -47,7 +48,7 @@ pub const Registry = struct {
             .extension_commands = std.array_list.Managed(Command).init(allocator),
             .events = std.array_list.Managed(EventListener).init(allocator),
             .extension_events = std.array_list.Managed(EventListener).init(allocator),
-            .job_results = std.array_list.Managed(JobResultListener).init(allocator),
+            .async_results = std.array_list.Managed(AsyncResultListener).init(allocator),
             .status = std.array_list.Managed(u8).init(allocator),
         };
     }
@@ -55,18 +56,19 @@ pub const Registry = struct {
     pub fn deinit(self: *Registry) void {
         self.clearRegistrations();
         self.clearExtensionRegistrations();
-        self.clearJobResults();
+        self.clearAsyncResults();
         self.commands.deinit();
         self.extension_commands.deinit();
         self.events.deinit();
         self.extension_events.deinit();
-        self.job_results.deinit();
+        self.async_results.deinit();
         self.status.deinit();
     }
 
     pub fn rebuild(self: *Registry, host: *Host, requested_api_version: u32, manifests: []const Manifest) !void {
         if (requested_api_version != Registry.api_version) return error.IncompatibleBuiltinApiVersion;
         self.clearRegistrations();
+        self.clearAsyncResults();
         self.status.clearRetainingCapacity();
         try self.registerCoreModules(host, manifests);
     }
@@ -108,27 +110,47 @@ pub const Registry = struct {
         });
     }
 
-    pub fn registerJobResultHandler(self: *Registry, job_id: u64, request_generation: u64, workspace_generation: u64, handler: JobResultHandler) !void {
-        try self.job_results.append(.{
-            .job_id = job_id,
-            .request_generation = request_generation,
-            .workspace_generation = workspace_generation,
+    pub fn registerAsyncResultHandler(self: *Registry, kind: AsyncResultKind, handle: RequestHandle, handler: AsyncResultHandler) !void {
+        try self.async_results.append(.{
+            .kind = kind,
+            .handle = handle,
             .handler = handler,
         });
     }
 
-    pub fn emitJobResult(self: *Registry, host: *Host, job_id: u64, request_generation: u64, workspace_generation: u64, success: bool, payload: []const u8) void {
-        for (self.job_results.items) |listener| {
-            if (listener.job_id != job_id) continue;
-            if (listener.request_generation != request_generation or listener.workspace_generation != workspace_generation) continue;
-            listener.handler(host, job_id, request_generation, workspace_generation, success, payload) catch |err| {
-                std.debug.print("[beam] job result handler failed: {s}\n", .{@errorName(err)});
+    pub fn registerJobResultHandler(self: *Registry, handle: RequestHandle, handler: AsyncResultHandler) !void {
+        try self.registerAsyncResultHandler(.job, handle, handler);
+    }
+
+    pub fn registerServiceResultHandler(self: *Registry, handle: RequestHandle, handler: AsyncResultHandler) !void {
+        try self.registerAsyncResultHandler(.service, handle, handler);
+    }
+
+    pub fn emitAsyncResult(self: *Registry, host: *Host, kind: AsyncResultKind, handle: RequestHandle, success: bool, payload: []const u8) void {
+        var index: usize = 0;
+        while (index < self.async_results.items.len) {
+            const listener = self.async_results.items[index];
+            if (listener.kind != kind or !listener.handle.matches(handle)) {
+                index += 1;
+                continue;
+            }
+            _ = self.async_results.orderedRemove(index);
+            listener.handler(host, kind, handle, success, payload) catch |err| {
+                std.debug.print("[beam] async result handler failed: {s}\n", .{@errorName(err)});
             };
         }
     }
 
-    pub fn clearJobResults(self: *Registry) void {
-        self.job_results.clearRetainingCapacity();
+    pub fn emitJobResult(self: *Registry, host: *Host, handle: RequestHandle, success: bool, payload: []const u8) void {
+        self.emitAsyncResult(host, .job, handle, success, payload);
+    }
+
+    pub fn emitServiceResult(self: *Registry, host: *Host, handle: RequestHandle, success: bool, payload: []const u8) void {
+        self.emitAsyncResult(host, .service, handle, success, payload);
+    }
+
+    pub fn clearAsyncResults(self: *Registry) void {
+        self.async_results.clearRetainingCapacity();
     }
 
     pub fn emit(self: *Registry, host: *Host, event: []const u8, payload: []const u8) void {
@@ -227,6 +249,7 @@ pub const Registry = struct {
             self.allocator.free(listener.event);
         }
         self.extension_events.clearRetainingCapacity();
+        self.clearAsyncResults();
     }
 };
 
@@ -350,6 +373,55 @@ test "builtin registry invokes extension commands and events" {
     try std.testing.expectEqualStrings("extension command invoked", state.ext_status);
     registry.emit(&host, "buffer_open", "{}");
     try std.testing.expectEqualStrings("extension event invoked", state.ext_status);
+}
+
+test "builtin registry routes async results by handle" {
+    const TestState = struct {
+        handled: usize = 0,
+        payload: []u8 = &[_]u8{},
+
+        fn setStatus(ctx: *anyopaque, text: []const u8) anyerror!void {
+            _ = ctx;
+            _ = text;
+        }
+
+        fn setExtStatus(ctx: *anyopaque, text: []const u8) anyerror!void {
+            _ = ctx;
+            _ = text;
+        }
+
+        fn handle(ctx: *anyopaque, kind: AsyncResultKind, request_handle: RequestHandle, success: bool, payload: []const u8) anyerror!void {
+            _ = kind;
+            _ = request_handle;
+            _ = success;
+            const host: *Host = @ptrCast(@alignCast(ctx));
+            const state: *@This() = @ptrCast(@alignCast(host.ctx));
+            state.handled += 1;
+            if (state.payload.len > 0) std.testing.allocator.free(state.payload);
+            state.payload = try std.testing.allocator.dupe(u8, payload);
+        }
+    };
+
+    var state = TestState{};
+    defer if (state.payload.len > 0) std.testing.allocator.free(state.payload);
+    var host = Host{
+        .ctx = &state,
+        .caps = .{ .status = true, .command = true, .event = true, .job_results = true },
+        .set_status = TestState.setStatus,
+        .set_extension_status = TestState.setExtStatus,
+    };
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const handle = RequestHandle{ .id = 7, .request_generation = 11, .workspace_generation = 13 };
+    try registry.registerAsyncResultHandler(.job, handle, TestState.handle);
+    registry.emitJobResult(&host, handle, true, "done");
+    try std.testing.expectEqual(@as(usize, 1), state.handled);
+    try std.testing.expectEqualStrings("done", state.payload);
+
+    const stale = RequestHandle{ .id = 7, .request_generation = 12, .workspace_generation = 13 };
+    registry.emitJobResult(&host, stale, true, "ignored");
+    try std.testing.expectEqual(@as(usize, 1), state.handled);
 }
 
 test "capability denial fails clearly" {
