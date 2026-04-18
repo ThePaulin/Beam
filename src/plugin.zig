@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const buffer_mod = @import("buffer.zig");
 const diagnostics_mod = @import("diagnostics.zig");
 const listpane_mod = @import("listpane.zig");
@@ -6,7 +7,18 @@ const pane_mod = @import("pane.zig");
 const scheduler_mod = @import("scheduler.zig");
 const syntax_mod = @import("treesitter.zig");
 
+pub const manifest_version: u32 = 1;
 pub const api_version: u32 = 1;
+pub const wasm_runtime_enabled: bool = build_options.enable_wasm_plugins;
+
+pub const Runtime = enum {
+    native,
+    wasm,
+
+    pub fn label(self: Runtime) []const u8 {
+        return @tagName(self);
+    }
+};
 
 pub const Capability = enum {
     command,
@@ -67,7 +79,9 @@ pub const Capabilities = struct {
 pub const Manifest = struct {
     name: []const u8,
     version: []const u8,
+    manifest_version: u32 = manifest_version,
     api_version: u32 = api_version,
+    runtime: Runtime = .native,
     capabilities: Capabilities = .{},
 };
 
@@ -510,7 +524,9 @@ pub const Host = struct {
 pub fn validateManifest(manifest: Manifest) !void {
     if (manifest.name.len == 0) return error.InvalidManifest;
     if (manifest.version.len == 0) return error.InvalidManifest;
+    if (manifest.manifest_version != manifest_version) return error.IncompatibleManifestVersion;
     if (manifest.api_version != api_version) return error.IncompatiblePluginApiVersion;
+    if (manifest.runtime == .wasm and !wasm_runtime_enabled) return error.UnsupportedPluginRuntime;
 }
 
 test "manifest validation rejects incompatible api versions" {
@@ -520,6 +536,28 @@ test "manifest validation rejects incompatible api versions" {
             .name = "sample",
             .version = "0.1.0",
             .api_version = api_version + 1,
+        }),
+    );
+}
+
+test "manifest validation rejects incompatible manifest versions" {
+    try std.testing.expectError(
+        error.IncompatibleManifestVersion,
+        validateManifest(.{
+            .name = "sample",
+            .version = "0.1.0",
+            .manifest_version = manifest_version + 1,
+        }),
+    );
+}
+
+test "manifest validation rejects disabled wasm runtimes" {
+    try std.testing.expectError(
+        error.UnsupportedPluginRuntime,
+        validateManifest(.{
+            .name = "sample",
+            .version = "0.1.0",
+            .runtime = .wasm,
         }),
     );
 }

@@ -3,12 +3,17 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const enable_wasm_plugins = b.option(bool, "wasm-plugins", "Enable experimental WASM plugin manifests and runtime loading") orelse false;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "enable_wasm_plugins", enable_wasm_plugins);
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    root_module.addOptions("build_options", build_options);
 
     const tree_sitter_lib = b.addLibrary(.{
         .name = "tree-sitter",
@@ -87,6 +92,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    plugin_api_module.addOptions("build_options", build_options);
     const example_plugin_module = b.createModule(.{
         .root_source_file = b.path("examples/plugins/hello/plugin.zig"),
         .target = target,

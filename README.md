@@ -146,11 +146,52 @@ Built-ins are compiled with Beam and can:
 
 ## Plugins
 
-Plugins are loaded from the configured plugin root and use the QuickJS bridge exposed by `src/plugin.zig`.
+Plugins are loaded from the configured plugin root and use the native host bridge exposed by `src/plugin.zig`.
 
 - the example plugin lives in `examples/plugins/hello`
 - the sample config points `[plugins].root` at `zig-out/plugins`
 - `zig build run -- --config examples/beam.toml` enables the sample `hello` plugin
+
+Plugin manifests now use an explicit schema:
+
+```toml
+[plugin]
+name = "hello"
+version = "0.1.0"
+manifest_version = 1
+api_version = 1
+runtime = "native"
+
+[capabilities]
+command = true
+event = true
+status = true
+pane = true
+decoration = true
+```
+
+- `manifest_version` versions the manifest schema itself
+- `api_version` versions the Beam host API expected by the plugin
+- `runtime` selects the plugin tier: `native` is the default dynamic library path, while `wasm` is recognized and reported cleanly as unavailable in builds without a WASM runtime
+- capability keys are validated strictly; unknown capability names reject the manifest
+
+Supported capability keys in the current host surface are:
+
+- `command`
+- `event`
+- `status`
+- `buffer_read`
+- `buffer_edit`
+- `jobs`
+- `workspace`
+- `diagnostics`
+- `picker`
+- `pane`
+- `fs_read`
+- `tree_query`
+- `decoration`
+- `lsp`
+- `job_results`
 
 ## Contributing
 

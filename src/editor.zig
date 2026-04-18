@@ -5430,7 +5430,10 @@ pub const App = struct {
             if (manifest_name) |name| {
                 if (self.plugin_catalog.findEntry(name)) |entry| {
                     try self.appendPluginDetailRow("manifest", null, .none, null);
+                    try self.appendPluginDetailRow("schema", "v1", .none, null);
                     try self.appendPluginDetailRow("version", entry.manifest.version, .none, null);
+                    try self.appendPluginDetailRow("api", "v1", .none, null);
+                    try self.appendPluginDetailRow("runtime", @tagName(entry.manifest.runtime), .none, null);
                     try self.appendPluginDetailRow("source", @tagName(entry.source), .none, null);
                     try self.appendPluginDetailRow("state", @tagName(entry.state), .none, null);
                     try self.appendPluginDetailRow("capabilities", null, .none, null);
@@ -7703,19 +7706,28 @@ test "plugin detail pane shows manifest metadata" {
 
     try std.testing.expect(app.plugin_details_pane_id != null);
     const detail_pane_id = app.plugin_details_pane_id.?;
+    var saw_schema = false;
     var saw_version = false;
+    var saw_api = false;
+    var saw_runtime = false;
     var saw_source = false;
     var saw_state = false;
     var saw_caps = false;
     for (app.panes.panes.items) |pane| {
         if (pane.id != detail_pane_id) continue;
+        saw_schema = std.mem.indexOf(u8, pane.streaming.items, "schema: v1") != null;
         saw_version = std.mem.indexOf(u8, pane.streaming.items, "version: 0.1.0") != null;
+        saw_api = std.mem.indexOf(u8, pane.streaming.items, "api: v1") != null;
+        saw_runtime = std.mem.indexOf(u8, pane.streaming.items, "runtime: native") != null;
         saw_source = std.mem.indexOf(u8, pane.streaming.items, "source: filesystem") != null;
         saw_state = std.mem.indexOf(u8, pane.streaming.items, "state: loaded") != null;
         saw_caps = std.mem.indexOf(u8, pane.streaming.items, "capabilities:") != null;
         break;
     }
+    try std.testing.expect(saw_schema);
     try std.testing.expect(saw_version);
+    try std.testing.expect(saw_api);
+    try std.testing.expect(saw_runtime);
     try std.testing.expect(saw_source);
     try std.testing.expect(saw_state);
     try std.testing.expect(saw_caps);
