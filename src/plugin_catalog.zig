@@ -299,7 +299,9 @@ pub const Catalog = struct {
     fn unloadAll(self: *Catalog) void {
         for (self.loaded_plugins.items) |*plugin| {
             if (plugin.deinit_fn) |deinit_fn| {
-                deinit_fn(&plugin.host);
+                var shutdown_host = plugin.host;
+                shutdown_host.caps = .{};
+                deinit_fn(&shutdown_host);
             }
             self.allocator.free(plugin.name);
             plugin.lib.close();
@@ -313,7 +315,9 @@ pub const Catalog = struct {
         const plugin = self.loaded_plugins.items[idx];
         self.loaded_plugins.items.len = idx;
         if (plugin.deinit_fn) |deinit_fn| {
-            deinit_fn(&plugin.host);
+            var shutdown_host = plugin.host;
+            shutdown_host.caps = .{};
+            deinit_fn(&shutdown_host);
         }
         self.allocator.free(plugin.name);
         var lib = plugin.lib;

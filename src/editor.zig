@@ -819,13 +819,22 @@ pub const App = struct {
 
     fn clearPrompt(self: *App, mode: Mode) void {
         if (mode == .command) self.command_buffer.clearRetainingCapacity();
-        if (mode == .search) self.search_buffer.clearRetainingCapacity();
+        if (mode == .search) {
+            self.search_buffer.clearRetainingCapacity();
+            self.clearSearchPreview();
+            self.clearSearchHighlight();
+        }
         self.mode = .normal;
     }
 
     fn clearSearchPreview(self: *App) void {
         if (self.search_preview_highlight) |needle| self.allocator.free(needle);
         self.search_preview_highlight = null;
+    }
+
+    fn clearSearchHighlight(self: *App) void {
+        if (self.search_highlight) |needle| self.allocator.free(needle);
+        self.search_highlight = null;
     }
 
     fn updateSearchHighlight(self: *App, slot: *?[]u8, needle: []const u8) !void {
@@ -1164,6 +1173,10 @@ pub const App = struct {
 
         if (byte == 0x1b or byte == 0x03) {
             self.resetNormalInput();
+            if (self.search_highlight != null or self.search_preview_highlight != null) {
+                self.clearSearchPreview();
+                self.clearSearchHighlight();
+            }
             self.visual_mode = .none;
             self.visual_anchor = null;
             return;
@@ -4091,7 +4104,7 @@ pub const App = struct {
     }
 
     fn repeatSearch(self: *App, forward: bool) !void {
-        const needle = self.activeSearchHighlight(true) orelse {
+        const needle = self.search_highlight orelse {
             try self.setStatus("no search term");
             return;
         };
@@ -4099,14 +4112,12 @@ pub const App = struct {
         const text = try buf.serialize();
         defer self.allocator.free(text);
         const cursor_offset = self.positionToOffset(buf.cursor, text);
-        const actual_forward = if (forward) self.search_forward else !self.search_forward;
-        const found = findSubstringOccurrence(text, needle, cursor_offset, actual_forward);
+        const found = findSubstringOccurrenceCyclic(text, needle, cursor_offset, forward) orelse findSubstringOccurrence(text, needle, cursor_offset, forward);
         if (found) |offset| {
             buf.cursor = self.offsetToPosition(text, offset);
         } else {
             try self.setStatus("not found");
         }
-        self.search_forward = actual_forward;
     }
 
     fn openCursorPath(self: *App, link: bool) !void {
@@ -4331,6 +4342,32 @@ pub const App = struct {
         }
         var idx = @min(start_offset, text.len);
         while (idx > 0) : (idx -= 1) {
+            if (idx >= needle.len and std.mem.eql(u8, text[idx - needle.len .. idx], needle)) return idx - needle.len;
+        }
+        return null;
+    }
+
+    fn findSubstringOccurrenceCyclic(text: []const u8, needle: []const u8, start_offset: usize, forward: bool) ?usize {
+        if (needle.len == 0 or text.len < needle.len) return null;
+        const cursor = @min(start_offset, text.len);
+        if (forward) {
+            var idx = @min(cursor + 1, text.len);
+            while (idx + needle.len <= text.len) : (idx += 1) {
+                if (std.mem.eql(u8, text[idx .. idx + needle.len], needle)) return idx;
+            }
+            idx = 0;
+            while (idx < cursor + 1 and idx + needle.len <= text.len) : (idx += 1) {
+                if (std.mem.eql(u8, text[idx .. idx + needle.len], needle)) return idx;
+            }
+            return null;
+        }
+
+        var idx = cursor;
+        while (idx > 0) : (idx -= 1) {
+            if (idx >= needle.len and std.mem.eql(u8, text[idx - needle.len .. idx], needle)) return idx - needle.len;
+        }
+        idx = text.len;
+        while (idx > cursor) : (idx -= 1) {
             if (idx >= needle.len and std.mem.eql(u8, text[idx - needle.len .. idx], needle)) return idx - needle.len;
         }
         return null;
@@ -7075,7 +7112,19 @@ fn builtinRegisterJobResult(ctx: *anyopaque, job_id: u64, request_generation: u6
 fn builtinAddDecoration(ctx: *anyopaque, owner: []const u8, decoration: diagnostics_mod.Decoration) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const owner_id = try app.diagnostics.registerDecorationOwner(owner);
-    try app.diagnostics.addDecorationOwned(owner_id, decoration);
+    const normalized: diagnostics_mod.Decoration = .{
+        .buffer_id = decoration.buffer_id,
+        .row = decoration.row,
+        .col = decoration.col,
+        .len = @max(decoration.len, 1),
+        .kind = decoration.kind,
+        // Plugin decorations come from dynamic modules; keep owned state local.
+        .source = .plugin,
+        .owner_id = 0,
+        .severity = null,
+        .text = null,
+    };
+    try app.diagnostics.addDecorationOwned(owner_id, normalized);
 }
 
 fn builtinClearDecorations(ctx: *anyopaque, owner: []const u8) anyerror!void {
@@ -9105,8 +9154,18 @@ test "reverse search uses ? and repeats with n and N" {
     try pressNormalKeys(&app, "n");
     try std.testing.expectEqual(@as(usize, 0), app.activeBuffer().cursor.col);
 
-    try pressNormalKeys(&app, "N");
+    try pressNormalKeys(&app, "n");
     try std.testing.expectEqual(@as(usize, 8), app.activeBuffer().cursor.col);
+
+    try app.handleNormalByte(0x1b);
+    try std.testing.expect(app.activeSearchHighlight(true) == null);
+    const before_cancel = app.activeBuffer().cursor.col;
+
+    try pressNormalKeys(&app, "n");
+    try std.testing.expectEqual(before_cancel, app.activeBuffer().cursor.col);
+
+    try pressNormalKeys(&app, "N");
+    try std.testing.expectEqual(before_cancel, app.activeBuffer().cursor.col);
 }
 
 test "visual binding checklist tracks verified and todo entries" {
@@ -9440,6 +9499,8 @@ test "search and visual highlights compute the right spans" {
     app.clearSearchPreview();
     app.mode = .normal;
     try std.testing.expectEqualStrings("be", app.activeSearchHighlight(true).?);
+    try app.handleNormalByte(0x1b);
+    try std.testing.expect(app.activeSearchHighlight(true) == null);
 
     app.visual_mode = .character;
     app.visual_anchor = .{ .row = 0, .col = 1 };
@@ -9706,6 +9767,30 @@ test "example leader bindings dispatch end to end" {
     try force_quit_app.activeBuffer().insertByte('!');
     try pressNormalKeys(&force_quit_app, " Q");
     try std.testing.expect(force_quit_app.should_quit);
+
+    const home_dir = try std.process.getEnvVarOwned(std.testing.allocator, "HOME");
+    defer std.testing.allocator.free(home_dir);
+    const sample_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ home_dir, "Desktop", "test.md" });
+    defer std.testing.allocator.free(sample_path);
+    const sample_path_z = try std.testing.allocator.dupeZ(u8, sample_path);
+    defer std.testing.allocator.free(sample_path_z);
+
+    const args = [_][:0]const u8{
+        "beam",
+        sample_path_z,
+        "--config",
+        "examples/beam.toml",
+    };
+    var config_app = try App.init(std.testing.allocator, args[0..]);
+    defer config_app.deinit();
+    var render_buf = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer render_buf.deinit();
+    try config_app.renderPane(render_buf.writer(), config_app.activeBuffer(), 0, 80, 24, true);
+    try config_app.handleNormalByte(':');
+    try config_app.handleByte('q', std.fs.File.stdin());
+    try config_app.handleByte('\n', std.fs.File.stdin());
+    config_app.syncActiveSyntax();
+    try std.testing.expect(config_app.should_quit);
 
     var split_app = try makeTestApp(std.testing.allocator, "left");
     defer split_app.deinit();

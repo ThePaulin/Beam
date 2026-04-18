@@ -67,6 +67,10 @@ pub const Store = struct {
     pub fn addDecorationOwned(self: *Store, owner_id: u64, decoration: Decoration) !void {
         var next = decoration;
         next.owner_id = owner_id;
+        next.text = null;
+        if (decoration.text) |text| {
+            next.text = try self.allocator.dupe(u8, text);
+        }
         try self.decorations.append(next);
     }
 
