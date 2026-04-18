@@ -160,7 +160,8 @@ pub const App = struct {
     picker_source_spec: ?listsource_mod.SourceSpec = null,
     picker_source_pattern: ?[]u8 = null,
     picker_source_pathspec: ?[]u8 = null,
-    picker_job_id: ?u64 = null,
+    picker_job_id: ?scheduler_mod.RequestHandle = null,
+    pending_lsp_results: std.AutoHashMap(u64, scheduler_mod.RequestHandle),
     search: search_mod.SearchIndex,
     workspace: workspace_mod.Workspace,
     should_quit: bool = false,
@@ -356,6 +357,7 @@ pub const App = struct {
                     .plugin_activity = std.array_list.Managed(u8).init(allocator),
                     .picker_source_key = null,
                     .picker_source_spec = null,
+                    .pending_lsp_results = std.AutoHashMap(u64, scheduler_mod.RequestHandle).init(allocator),
                     .search = search,
                     .workspace = workspace,
                     .file_to_open = file_to_open,
@@ -409,6 +411,7 @@ pub const App = struct {
             .picker_source_key = null,
             .picker_source_spec = null,
             .picker_job_id = null,
+            .pending_lsp_results = std.AutoHashMap(u64, scheduler_mod.RequestHandle).init(allocator),
             .search = search,
             .workspace = workspace,
             .file_to_open = file_to_open,
@@ -459,10 +462,11 @@ pub const App = struct {
         self.picker_source_key = null;
         self.picker_source_spec = null;
         self.plugins_pane_id = null;
-        if (self.picker_job_id) |job_id| {
-            _ = self.scheduler.cancel(job_id);
+        if (self.picker_job_id) |handle| {
+            _ = self.scheduler.cancel(handle);
             self.picker_job_id = null;
         }
+        self.pending_lsp_results.deinit();
         if (self.picker_source_pattern) |pattern| self.allocator.free(pattern);
         if (self.picker_source_pathspec) |pathspec| self.allocator.free(pathspec);
         self.workspace.deinit();
@@ -535,13 +539,20 @@ pub const App = struct {
             while (server.pollMessage()) |raw_message| {
                 var message = raw_message;
                 defer message.deinit(self.allocator);
-                self.lsp.handleMessage(message) catch |err| {
+                const response = self.lsp.handleMessage(message) catch |err| {
                     if (err == error.InvalidJsonRpcMessage) {
                         self.setStatus("lsp malformed JSON-RPC") catch {};
                     } else {
                         self.setStatus("lsp message error") catch {};
                     }
+                    continue;
                 };
+                if (response) |completion| {
+                    if (self.pending_lsp_results.fetchRemove(completion.id)) |entry| {
+                        var host = self.builtinHost();
+                        self.builtins.emitServiceResult(&host, entry.value, !completion.has_error, completion.body);
+                    }
+                }
             }
             if (server.takeMalformedJsonRpc()) {
                 self.setStatus("lsp malformed JSON-RPC") catch {};
@@ -676,7 +687,12 @@ pub const App = struct {
     fn serviceJobs(self: *App) void {
         while (self.scheduler.popCompleted()) |result| {
             var host = self.builtinHost();
-            self.builtins.emitJobResult(&host, result.job_id, result.request_generation, result.workspace_generation, result.success, result.payload);
+            const handle = scheduler_mod.RequestHandle{
+                .id = result.job_id,
+                .request_generation = result.request_generation,
+                .workspace_generation = result.workspace_generation,
+            };
+            self.builtins.emitJobResult(&host, handle, result.success, result.payload);
             self.allocator.free(result.payload);
         }
     }
@@ -4794,10 +4810,10 @@ pub const App = struct {
             .diagnostics => .custom,
             .custom => .custom,
         };
-        const job_id = try self.scheduler.spawn(job_kind, self.workspace.session_generation, self.workspace.session_generation);
-        self.picker_job_id = job_id;
+        const handle = try self.scheduler.spawn(job_kind, self.workspace.session_generation, self.workspace.session_generation);
+        self.picker_job_id = handle;
         const key = listsource_mod.SourceKey{
-            .request_id = job_id,
+            .request_id = handle.id,
             .workspace_generation = self.workspace.session_generation,
         };
         collector.request_key = key;
@@ -4830,15 +4846,19 @@ pub const App = struct {
         };
         _ = search_result catch |err| {
             try self.picker.setError(@errorName(err));
-            _ = self.scheduler.complete(job_id, @errorName(err), false) catch {};
-            if (self.picker_job_id == job_id) self.picker_job_id = null;
+            _ = self.scheduler.completeHandle(handle, @errorName(err), false) catch {};
+            if (self.picker_job_id) |active| {
+                if (active.matches(handle)) self.picker_job_id = null;
+            }
             try self.setStatus(spec.failure_message);
             return err;
         };
 
         collector.source.complete(key);
-        _ = self.scheduler.complete(job_id, "picker completed", true) catch {};
-        if (self.picker_job_id == job_id) self.picker_job_id = null;
+        _ = self.scheduler.completeHandle(handle, "picker completed", true) catch {};
+        if (self.picker_job_id) |active| {
+            if (active.matches(handle)) self.picker_job_id = null;
+        }
         try self.picker.setItems(collector.source.items.items);
         self.picker.selected = if (self.picker.items.items.len == 0) 0 else @min(restored_picker_selection, self.picker.items.items.len - 1);
         self.picker.setState(.ready);
@@ -6554,32 +6574,81 @@ pub const App = struct {
         return self.syntax.textObjectRange(snapshot, inner);
     }
 
-    fn lspRequestDefinition(self: *App, payload: []const u8) !u64 {
-        return try self.lsp.requestDefinition(payload);
+    fn lspRequestDefinition(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestDefinition(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
     }
 
-    fn lspRequestReferences(self: *App, payload: []const u8) !u64 {
-        return try self.lsp.requestReferences(payload);
+    fn lspRequestReferences(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestReferences(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
     }
 
-    fn lspRequestRename(self: *App, payload: []const u8) !u64 {
-        return try self.lsp.requestRename(payload);
+    fn lspRequestRename(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestRename(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
     }
 
-    fn lspRequestCompletion(self: *App, payload: []const u8) !u64 {
-        return try self.lsp.requestCompletion(payload);
+    fn lspRequestCompletion(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestCompletion(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
     }
 
-    fn lspRequestHover(self: *App, payload: []const u8) !u64 {
-        return try self.lsp.requestHover(payload);
+    fn lspRequestHover(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestHover(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
     }
 
-    fn lspRequestCodeAction(self: *App, payload: []const u8) !u64 {
-        return try self.lsp.requestCodeActions(payload);
+    fn lspRequestCodeAction(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestCodeActions(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
     }
 
-    fn lspRequestSemanticTokens(self: *App, payload: []const u8) !u64 {
-        return try self.lsp.requestSemanticTokens(payload);
+    fn lspRequestSemanticTokens(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestSemanticTokens(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
     }
 
     fn activeSearchHighlight(self: *App, active: bool) ?[]const u8 {
@@ -6953,7 +7022,7 @@ pub const App = struct {
             .register_event = builtinRegisterEvent,
             .spawn_job = builtinSpawnJob,
             .cancel_job = builtinCancelJob,
-            .register_job_result = builtinRegisterJobResult,
+            .register_completion = builtinRegisterCompletion,
             .add_decoration = builtinAddDecoration,
             .clear_decorations = builtinClearDecorations,
             .clear_buffer_decorations = builtinClearBufferDecorations,
@@ -7094,19 +7163,19 @@ fn builtinRegisterEvent(ctx: *anyopaque, event: []const u8, handler: builtins_mo
     try app.builtins.registerExtensionEvent(event, handler);
 }
 
-fn builtinSpawnJob(ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!u64 {
+fn builtinSpawnJob(ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!scheduler_mod.RequestHandle {
     const app: *App = @ptrCast(@alignCast(ctx));
     return try app.scheduler.spawn(kind, request_generation, workspace_generation);
 }
 
-fn builtinCancelJob(ctx: *anyopaque, job_id: u64) bool {
+fn builtinCancelJob(ctx: *anyopaque, handle: scheduler_mod.RequestHandle) bool {
     const app: *App = @ptrCast(@alignCast(ctx));
-    return app.scheduler.cancel(job_id);
+    return app.scheduler.cancel(handle);
 }
 
-fn builtinRegisterJobResult(ctx: *anyopaque, job_id: u64, request_generation: u64, workspace_generation: u64, handler: builtins_mod.JobResultHandler) anyerror!void {
+fn builtinRegisterCompletion(ctx: *anyopaque, kind: scheduler_mod.CompletionKind, handle: scheduler_mod.RequestHandle, handler: builtins_mod.AsyncResultHandler) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx));
-    try app.builtins.registerJobResultHandler(job_id, request_generation, workspace_generation, handler);
+    try app.builtins.registerAsyncResultHandler(kind, handle, handler);
 }
 
 fn builtinAddDecoration(ctx: *anyopaque, owner: []const u8, decoration: diagnostics_mod.Decoration) anyerror!void {
@@ -7270,37 +7339,37 @@ fn builtinSyntaxTextObjectRange(ctx: *anyopaque, buffer_id: u64, inner: bool) an
     return try app.syntaxTextObjectRange(buffer_id, inner);
 }
 
-fn builtinRequestDefinition(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+fn builtinRequestDefinition(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
     const app: *App = @ptrCast(@alignCast(ctx));
     return try app.lspRequestDefinition(payload);
 }
 
-fn builtinRequestReferences(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+fn builtinRequestReferences(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
     const app: *App = @ptrCast(@alignCast(ctx));
     return try app.lspRequestReferences(payload);
 }
 
-fn builtinRequestRename(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+fn builtinRequestRename(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
     const app: *App = @ptrCast(@alignCast(ctx));
     return try app.lspRequestRename(payload);
 }
 
-fn builtinRequestCompletion(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+fn builtinRequestCompletion(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
     const app: *App = @ptrCast(@alignCast(ctx));
     return try app.lspRequestCompletion(payload);
 }
 
-fn builtinRequestHover(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+fn builtinRequestHover(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
     const app: *App = @ptrCast(@alignCast(ctx));
     return try app.lspRequestHover(payload);
 }
 
-fn builtinRequestCodeAction(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+fn builtinRequestCodeAction(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
     const app: *App = @ptrCast(@alignCast(ctx));
     return try app.lspRequestCodeAction(payload);
 }
 
-fn builtinRequestSemanticTokens(ctx: *anyopaque, payload: []const u8) anyerror!u64 {
+fn builtinRequestSemanticTokens(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
     const app: *App = @ptrCast(@alignCast(ctx));
     return try app.lspRequestSemanticTokens(payload);
 }
