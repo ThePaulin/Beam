@@ -2,6 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const listpane_mod = @import("listpane.zig");
 const plugin_mod = @import("plugin.zig");
+const plugin_wasm_mod = if (plugin_mod.wasm_runtime_enabled) @import("plugin_wasm.zig") else struct {
+    pub const Runtime = opaque {};
+};
 
 pub const EntrySource = enum {
     builtin,
@@ -24,8 +27,9 @@ pub const Entry = struct {
 
 const LoadedPlugin = struct {
     name: []u8,
-    lib: std.DynLib,
     host: plugin_mod.Host,
+    lib: ?std.DynLib = null,
+    wasm_runtime: ?*plugin_wasm_mod.Runtime = null,
     deinit_fn: ?plugin_mod.PluginDeinitFn = null,
 };
 
@@ -187,11 +191,6 @@ pub const Catalog = struct {
                         try self.appendDisabledEntry(.filesystem, entry.name, "wasm runtime disabled");
                         continue;
                     },
-                    error.WasmRuntimeUnavailable => {
-                        self.freeManifest(manifest.manifest);
-                        try self.appendDisabledEntry(.filesystem, entry.name, "wasm runtime unavailable");
-                        continue;
-                    },
                     error.PermissionDenied => {
                         self.freeManifest(manifest.manifest);
                         try self.appendUnknownEntry(.filesystem, entry.name, "plugin load denied");
@@ -259,6 +258,13 @@ pub const Catalog = struct {
                     .note = "wasm runtime disabled",
                 };
             },
+            error.UnsupportedPluginCapability => {
+                return .{
+                    .manifest = manifest,
+                    .state = .unknown,
+                    .note = "unsupported wasm capability set",
+                };
+            },
             error.InvalidManifest => {
                 return .{
                     .manifest = manifest,
@@ -317,7 +323,19 @@ pub const Catalog = struct {
     fn tryLoadFilesystemPlugin(self: *Catalog, host: *const plugin_mod.Host, plugin_root: []const u8, plugin_name: []const u8, manifest: plugin_mod.Manifest) anyerror!LoadedPlugin {
         if (manifest.runtime == .wasm) {
             if (!plugin_mod.wasm_runtime_enabled) return error.UnsupportedPluginRuntime;
-            return error.WasmRuntimeUnavailable;
+            const wasm_path = try self.resolvePluginModulePath(plugin_root, plugin_name, "plugin.wasm");
+            defer self.allocator.free(wasm_path);
+            try std.fs.cwd().access(wasm_path, .{});
+
+            var plugin_host = host.*;
+            plugin_host.decoration_owner = manifest.name;
+            plugin_host.pane_owner = manifest.name;
+            const runtime = try plugin_wasm_mod.Runtime.init(self.allocator, &plugin_host, manifest, wasm_path);
+            return .{
+                .name = try self.allocator.dupe(u8, manifest.name),
+                .host = plugin_host,
+                .wasm_runtime = runtime,
+            };
         }
         const plugin_path = try self.resolvePluginLibraryPath(plugin_root, plugin_name);
         defer self.allocator.free(plugin_path);
@@ -335,21 +353,24 @@ pub const Catalog = struct {
 
         return .{
             .name = try self.allocator.dupe(u8, manifest.name),
-            .lib = lib,
             .host = plugin_host,
+            .lib = lib,
             .deinit_fn = deinit_fn,
         };
     }
 
     fn unloadAll(self: *Catalog) void {
         for (self.loaded_plugins.items) |*plugin| {
-            if (plugin.deinit_fn) |deinit_fn| {
+            if (plugin_mod.wasm_runtime_enabled and plugin.wasm_runtime != null) {
+                const runtime = plugin.wasm_runtime.?;
+                runtime.deinit();
+            } else if (plugin.deinit_fn) |deinit_fn| {
                 var shutdown_host = plugin.host;
                 shutdown_host.caps = .{};
                 deinit_fn(&shutdown_host);
             }
             self.allocator.free(plugin.name);
-            plugin.lib.close();
+            if (plugin.lib) |*lib| lib.close();
         }
         self.loaded_plugins.clearRetainingCapacity();
     }
@@ -359,14 +380,23 @@ pub const Catalog = struct {
         const idx = self.loaded_plugins.items.len - 1;
         const plugin = self.loaded_plugins.items[idx];
         self.loaded_plugins.items.len = idx;
-        if (plugin.deinit_fn) |deinit_fn| {
+        if (plugin_mod.wasm_runtime_enabled and plugin.wasm_runtime != null) {
+            const runtime = plugin.wasm_runtime.?;
+            runtime.deinit();
+        } else if (plugin.deinit_fn) |deinit_fn| {
             var shutdown_host = plugin.host;
             shutdown_host.caps = .{};
             deinit_fn(&shutdown_host);
         }
         self.allocator.free(plugin.name);
-        var lib = plugin.lib;
-        lib.close();
+        if (plugin.lib) |lib| {
+            var close_lib = lib;
+            close_lib.close();
+        }
+    }
+
+    fn resolvePluginModulePath(self: *Catalog, plugin_root: []const u8, plugin_name: []const u8, filename: []const u8) ![]u8 {
+        return try std.fs.path.join(self.allocator, &[_][]const u8{ plugin_root, plugin_name, filename });
     }
 
     fn resolvePluginLibraryPath(self: *Catalog, plugin_root: []const u8, plugin_name: []const u8) ![]u8 {
@@ -673,8 +703,13 @@ test "plugin catalog marks disabled wasm manifests cleanly" {
 
     try catalog.rebuild(&host, &.{}, "plugins", &.{"hello"});
     try std.testing.expectEqual(@as(usize, 1), catalog.entries.items.len);
-    try std.testing.expectEqual(EntryState.disabled, catalog.entries.items[0].state);
-    try std.testing.expectEqualStrings("wasm runtime disabled", catalog.entries.items[0].note.?);
+    if (plugin_mod.wasm_runtime_enabled) {
+        try std.testing.expectEqual(EntryState.unknown, catalog.entries.items[0].state);
+        try std.testing.expectEqualStrings("plugin binary not found", catalog.entries.items[0].note.?);
+    } else {
+        try std.testing.expectEqual(EntryState.disabled, catalog.entries.items[0].state);
+        try std.testing.expectEqualStrings("wasm runtime disabled", catalog.entries.items[0].note.?);
+    }
 }
 
 test "plugin catalog tracks missing filesystem entries" {

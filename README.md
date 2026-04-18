@@ -28,7 +28,8 @@ Beam aims to be a fast editor for the terminal:
 - `src/lsp.zig` - language-server client integration
 - `src/workspace.zig` - workspace/session persistence
 - `examples/beam.toml` - example configuration
-- `examples/plugins/hello` - sample plugin manifest and implementation
+- `examples/plugins/hello` - sample native plugin manifest and implementation
+- `examples/plugins/hello-wasm` - sample WASM plugin manifest and implementation
 
 ## Build And Run
 
@@ -149,6 +150,7 @@ Built-ins are compiled with Beam and can:
 Plugins are loaded from the configured plugin root and use the native host bridge exposed by `src/plugin.zig`.
 
 - the example plugin lives in `examples/plugins/hello`
+- the example wasm plugin lives in `examples/plugins/hello-wasm`
 - the sample config points `[plugins].root` at `zig-out/plugins`
 - `zig build run -- --config examples/beam.toml` enables the sample `hello` plugin
 
@@ -173,6 +175,7 @@ decoration = true
 - `manifest_version` versions the manifest schema itself
 - `api_version` versions the Beam host API expected by the plugin
 - `runtime` selects the plugin tier: `native` is the default dynamic library path, while `wasm` is recognized and reported cleanly as unavailable in builds without a WASM runtime
+- `zig build run -Dwasm-plugins=true -- --help` enables the embedded Wasmtime backend and stages the sample `hello-wasm` plugin artifact
 - capability keys are validated strictly; unknown capability names reject the manifest
 
 Supported capability keys in the current host surface are:
@@ -192,6 +195,14 @@ Supported capability keys in the current host surface are:
 - `decoration`
 - `lsp`
 - `job_results`
+
+The current WASM host bridge is intentionally narrower than the native one. Today the Wasmtime-backed runtime supports plugins that use:
+
+- `command`
+- `event`
+- `status`
+
+The `hello-wasm` sample shows the current ABI shape: plugins register commands and events through host imports, export dispatcher entrypoints for command and event delivery, and exchange strings through the module's linear memory.
 
 ## Contributing
 

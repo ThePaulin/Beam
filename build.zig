@@ -15,6 +15,9 @@ pub fn build(b: *std.Build) void {
     });
     root_module.addOptions("build_options", build_options);
 
+    const local_wasmtime = findLocalWasmtime();
+    const wasmtime = if (enable_wasm_plugins and local_wasmtime == null) b.lazyDependency(wasmtimeDep(target.result), .{}) else null;
+
     const tree_sitter_lib = b.addLibrary(.{
         .name = "tree-sitter",
         .root_module = b.createModule(.{
@@ -84,6 +87,7 @@ pub fn build(b: *std.Build) void {
         .name = "beam",
         .root_module = root_module,
     });
+    if (enable_wasm_plugins) configureWasmtime(exe, local_wasmtime, wasmtime);
 
     b.installArtifact(exe);
 
@@ -112,9 +116,41 @@ pub fn build(b: *std.Build) void {
         "plugins/hello/plugin.toml",
     );
 
+    const WasmExampleInstall = struct {
+        plugin: ?*std.Build.Step.InstallArtifact,
+        manifest: ?*std.Build.Step.InstallFile,
+    };
+    const wasm_example_install: WasmExampleInstall = if (enable_wasm_plugins) blk: {
+        const wasm_target = b.resolveTargetQuery(.{
+            .cpu_arch = .wasm32,
+            .os_tag = .freestanding,
+        });
+        const example_wasm_plugin_module = b.createModule(.{
+            .root_source_file = b.path("examples/plugins/hello-wasm/plugin.zig"),
+            .target = wasm_target,
+            .optimize = optimize,
+        });
+        const example_wasm_plugin = b.addExecutable(.{
+            .name = "plugin",
+            .root_module = example_wasm_plugin_module,
+        });
+        example_wasm_plugin.entry = .disabled;
+        example_wasm_plugin.rdynamic = true;
+        const install_plugin = b.addInstallArtifact(example_wasm_plugin, .{
+            .dest_dir = .{ .override = .{ .custom = "plugins/hello-wasm" } },
+        });
+        const install_manifest = b.addInstallFile(
+            b.path("examples/plugins/hello-wasm/plugin.toml"),
+            "plugins/hello-wasm/plugin.toml",
+        );
+        break :blk .{ .plugin = install_plugin, .manifest = install_manifest };
+    } else .{ .plugin = null, .manifest = null };
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(&install_example_plugin.step);
     run_cmd.step.dependOn(&install_example_plugin_manifest.step);
+    if (wasm_example_install.plugin) |step| run_cmd.step.dependOn(&step.step);
+    if (wasm_example_install.manifest) |step| run_cmd.step.dependOn(&step.step);
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
@@ -125,8 +161,89 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{
         .root_module = root_module,
     });
+    if (enable_wasm_plugins) configureWasmtime(tests, local_wasmtime, wasmtime);
 
     const run_tests = b.addRunArtifact(tests);
+    if (wasm_example_install.plugin) |step| run_tests.step.dependOn(&step.step);
+    if (wasm_example_install.manifest) |step| run_tests.step.dependOn(&step.step);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+}
+
+fn configureWasmtime(step: *std.Build.Step.Compile, local: ?WasmtimePaths, dep: ?*std.Build.Dependency) void {
+    if (local) |paths| {
+        step.root_module.addSystemIncludePath(.{ .cwd_relative = paths.include_dir });
+        step.addLibraryPath(.{ .cwd_relative = paths.lib_dir });
+        step.linkSystemLibrary("wasmtime");
+        return;
+    }
+
+    const wasmtime = dep orelse @panic("missing wasmtime dependency");
+    step.root_module.addSystemIncludePath(wasmtime.path("include"));
+    step.addLibraryPath(wasmtime.path("lib"));
+    step.linkSystemLibrary("wasmtime");
+}
+
+const WasmtimePaths = struct {
+    include_dir: []const u8,
+    lib_dir: []const u8,
+};
+
+fn findLocalWasmtime() ?WasmtimePaths {
+    const candidates = [_]WasmtimePaths{
+        .{ .include_dir = "/opt/homebrew/include", .lib_dir = "/opt/homebrew/lib" },
+        .{ .include_dir = "/usr/local/include", .lib_dir = "/usr/local/lib" },
+    };
+
+    for (candidates) |candidate| {
+        const header_path = std.fs.path.join(std.heap.page_allocator, &.{ candidate.include_dir, "wasmtime.h" }) catch continue;
+        defer std.heap.page_allocator.free(header_path);
+        const dylib_path = std.fs.path.join(std.heap.page_allocator, &.{ candidate.lib_dir, "libwasmtime.dylib" }) catch continue;
+        defer std.heap.page_allocator.free(dylib_path);
+        std.fs.accessAbsolute(header_path, .{}) catch continue;
+        std.fs.accessAbsolute(dylib_path, .{}) catch continue;
+        return candidate;
+    }
+    return null;
+}
+
+fn wasmtimeDep(target: std.Target) []const u8 {
+    const arch = target.cpu.arch;
+    const os = target.os.tag;
+    const abi = target.abi;
+    return switch (os) {
+        .linux => switch (arch) {
+            .x86_64 => switch (abi) {
+                .gnu => "wasmtime_c_api_x86_64_linux",
+                .musl => "wasmtime_c_api_x86_64_musl",
+                .android => "wasmtime_c_api_x86_64_android",
+                else => null,
+            },
+            .aarch64 => switch (abi) {
+                .gnu => "wasmtime_c_api_aarch64_linux",
+                .android => "wasmtime_c_api_aarch64_android",
+                else => null,
+            },
+            .s390x => "wasmtime_c_api_s390x_linux",
+            .riscv64 => "wasmtime_c_api_riscv64gc_linux",
+            else => null,
+        },
+        .windows => switch (arch) {
+            .x86_64 => switch (abi) {
+                .gnu => "wasmtime_c_api_x86_64_mingw",
+                .msvc => "wasmtime_c_api_x86_64_windows",
+                else => null,
+            },
+            else => null,
+        },
+        .macos => switch (arch) {
+            .x86_64 => "wasmtime_c_api_x86_64_macos",
+            .aarch64 => "wasmtime_c_api_aarch64_macos",
+            else => null,
+        },
+        else => null,
+    } orelse std.debug.panic(
+        "Unsupported target for wasmtime: {s}-{s}-{s}",
+        .{ @tagName(arch), @tagName(os), @tagName(abi) },
+    );
 }

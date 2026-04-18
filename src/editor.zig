@@ -7022,7 +7022,9 @@ pub const App = struct {
             .set_extension_status = builtinSetExtensionStatus,
             .set_plugin_activity = builtinSetPluginActivity,
             .register_command = builtinRegisterCommand,
+            .register_command_with_context = builtinRegisterCommandWithContext,
             .register_event = builtinRegisterEvent,
+            .register_event_with_context = builtinRegisterEventWithContext,
             .spawn_job = builtinSpawnJob,
             .cancel_job = builtinCancelJob,
             .register_completion = builtinRegisterCompletion,
@@ -7161,9 +7163,19 @@ fn builtinRegisterCommand(ctx: *anyopaque, name: []const u8, description: []cons
     try app.builtins.registerExtensionCommand(name, description, handler);
 }
 
+fn builtinRegisterCommandWithContext(ctx: *anyopaque, name: []const u8, description: []const u8, handler: builtins_mod.CommandHandler, handler_ctx: *anyopaque, handler_ctx_free: ?plugin_mod.HandlerContextFreeFn) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    try app.builtins.registerExtensionCommandWithContext(name, description, handler, handler_ctx, handler_ctx_free);
+}
+
 fn builtinRegisterEvent(ctx: *anyopaque, event: []const u8, handler: builtins_mod.EventHandler) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx));
     try app.builtins.registerExtensionEvent(event, handler);
+}
+
+fn builtinRegisterEventWithContext(ctx: *anyopaque, event: []const u8, handler: builtins_mod.EventHandler, handler_ctx: *anyopaque, handler_ctx_free: ?plugin_mod.HandlerContextFreeFn) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    try app.builtins.registerExtensionEventWithContext(event, handler, handler_ctx, handler_ctx_free);
 }
 
 fn builtinSpawnJob(ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!scheduler_mod.RequestHandle {

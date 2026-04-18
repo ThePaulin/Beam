@@ -85,11 +85,20 @@ pub const Manifest = struct {
     capabilities: Capabilities = .{},
 };
 
+pub const wasm_supported_capabilities = Capabilities{
+    .command = true,
+    .event = true,
+    .status = true,
+};
+
 pub const RequestHandle = scheduler_mod.RequestHandle;
 pub const CompletionKind = scheduler_mod.CompletionKind;
 
 pub const CommandHandler = *const fn (ctx: *anyopaque, args: []const []const u8) anyerror!void;
 pub const EventHandler = *const fn (ctx: *anyopaque, payload: []const u8) anyerror!void;
+pub const HandlerContextFreeFn = *const fn (allocator: std.mem.Allocator, ctx: *anyopaque) void;
+pub const RegisterCommandContextHandler = *const fn (ctx: *anyopaque, name: []const u8, description: []const u8, handler: CommandHandler, handler_ctx: *anyopaque, handler_ctx_free: ?HandlerContextFreeFn) anyerror!void;
+pub const RegisterEventContextHandler = *const fn (ctx: *anyopaque, event: []const u8, handler: EventHandler, handler_ctx: *anyopaque, handler_ctx_free: ?HandlerContextFreeFn) anyerror!void;
 pub const JobHandler = *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!RequestHandle;
 pub const CompletionHandler = *const fn (ctx: *anyopaque, kind: CompletionKind, handle: RequestHandle, success: bool, payload: []const u8) anyerror!void;
 pub const JobResultHandler = CompletionHandler;
@@ -124,7 +133,15 @@ fn defaultRegisterCommand(_: *anyopaque, _: []const u8, _: []const u8, _: Comman
     return error.PermissionDenied;
 }
 
+fn defaultRegisterCommandWithContext(_: *anyopaque, _: []const u8, _: []const u8, _: CommandHandler, _: *anyopaque, _: ?HandlerContextFreeFn) anyerror!void {
+    return error.PermissionDenied;
+}
+
 fn defaultRegisterEvent(_: *anyopaque, _: []const u8, _: EventHandler) anyerror!void {
+    return error.PermissionDenied;
+}
+
+fn defaultRegisterEventWithContext(_: *anyopaque, _: []const u8, _: EventHandler, _: *anyopaque, _: ?HandlerContextFreeFn) anyerror!void {
     return error.PermissionDenied;
 }
 
@@ -259,7 +276,9 @@ pub const Host = struct {
     set_extension_status: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,
     set_plugin_activity: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void = defaultSetPluginActivity,
     register_command: *const fn (ctx: *anyopaque, name: []const u8, description: []const u8, handler: CommandHandler) anyerror!void = defaultRegisterCommand,
+    register_command_with_context: RegisterCommandContextHandler = defaultRegisterCommandWithContext,
     register_event: *const fn (ctx: *anyopaque, event: []const u8, handler: EventHandler) anyerror!void = defaultRegisterEvent,
+    register_event_with_context: RegisterEventContextHandler = defaultRegisterEventWithContext,
     spawn_job: *const fn (ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!RequestHandle = defaultSpawnJob,
     cancel_job: *const fn (ctx: *anyopaque, handle: RequestHandle) bool = defaultCancelJob,
     register_completion: *const fn (ctx: *anyopaque, kind: CompletionKind, handle: RequestHandle, handler: CompletionHandler) anyerror!void = defaultRegisterCompletion,
@@ -322,9 +341,19 @@ pub const Host = struct {
         try self.register_command(self.ctx, name, description, handler);
     }
 
+    pub fn registerCommandWithContext(self: *const Host, name: []const u8, description: []const u8, handler: CommandHandler, handler_ctx: *anyopaque, handler_ctx_free: ?HandlerContextFreeFn) !void {
+        try self.require(.command);
+        try self.register_command_with_context(self.ctx, name, description, handler, handler_ctx, handler_ctx_free);
+    }
+
     pub fn registerEvent(self: *const Host, event: []const u8, handler: EventHandler) !void {
         try self.require(.event);
         try self.register_event(self.ctx, event, handler);
+    }
+
+    pub fn registerEventWithContext(self: *const Host, event: []const u8, handler: EventHandler, handler_ctx: *anyopaque, handler_ctx_free: ?HandlerContextFreeFn) !void {
+        try self.require(.event);
+        try self.register_event_with_context(self.ctx, event, handler, handler_ctx, handler_ctx_free);
     }
 
     pub fn spawnJob(self: *const Host, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) !RequestHandle {
@@ -521,12 +550,34 @@ pub const Host = struct {
     }
 };
 
-pub fn validateManifest(manifest: Manifest) !void {
+pub fn validateManifest(manifest: Manifest) error{
+    InvalidManifest,
+    IncompatibleManifestVersion,
+    IncompatiblePluginApiVersion,
+    UnsupportedPluginCapability,
+    UnsupportedPluginRuntime,
+}!void {
     if (manifest.name.len == 0) return error.InvalidManifest;
     if (manifest.version.len == 0) return error.InvalidManifest;
     if (manifest.manifest_version != manifest_version) return error.IncompatibleManifestVersion;
     if (manifest.api_version != api_version) return error.IncompatiblePluginApiVersion;
+    if (manifest.runtime == .wasm and !supportsWasmCapabilities(manifest.capabilities)) return error.UnsupportedPluginCapability;
     if (manifest.runtime == .wasm and !wasm_runtime_enabled) return error.UnsupportedPluginRuntime;
+}
+
+pub fn supportsWasmCapabilities(caps: Capabilities) bool {
+    return (!caps.buffer_read and
+        !caps.buffer_edit and
+        !caps.jobs and
+        !caps.workspace and
+        !caps.diagnostics and
+        !caps.picker and
+        !caps.pane and
+        !caps.fs_read and
+        !caps.tree_query and
+        !caps.decoration and
+        !caps.lsp and
+        !caps.job_results);
 }
 
 test "manifest validation rejects incompatible api versions" {
@@ -552,14 +603,28 @@ test "manifest validation rejects incompatible manifest versions" {
 }
 
 test "manifest validation rejects disabled wasm runtimes" {
-    try std.testing.expectError(
-        error.UnsupportedPluginRuntime,
-        validateManifest(.{
-            .name = "sample",
-            .version = "0.1.0",
-            .runtime = .wasm,
-        }),
-    );
+    const manifest: Manifest = .{
+        .name = "sample",
+        .version = "0.1.0",
+        .runtime = .wasm,
+    };
+    if (wasm_runtime_enabled) {
+        try validateManifest(manifest);
+    } else {
+        try std.testing.expectError(error.UnsupportedPluginRuntime, validateManifest(manifest));
+    }
+}
+
+test "wasm capability support is limited to the current host bridge" {
+    try std.testing.expect(supportsWasmCapabilities(.{
+        .command = true,
+        .event = true,
+        .status = true,
+    }));
+    try std.testing.expect(!supportsWasmCapabilities(.{
+        .command = true,
+        .pane = true,
+    }));
 }
 
 test "manifest validation rejects missing names" {
