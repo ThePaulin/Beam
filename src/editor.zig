@@ -6279,15 +6279,13 @@ pub const App = struct {
             self.picker.error_message orelse "picker"
         else
             "picker";
+        const title_text = clipText(title, if (cols > 3) cols - 3 else 0);
         try writer.print("\x1b[{d};1H", .{row});
         try writeStyle(writer, pane_style);
         try writer.writeByte(' ');
         try writer.writeAll("󰌑 ");
-        try writeStyledText(writer, pane_style, title);
-        while (displayWidth(title) + 3 < cols) {
-            try writer.writeByte(' ');
-            if (displayWidth("picker") + 3 >= cols) break;
-        }
+        try writer.writeAll(title_text);
+        try render_mod.padToColumns(writer, 3 + displayWidth(title_text), cols);
         try writer.writeAll("\x1b[0m");
 
         if (height < 2) return;
@@ -6301,17 +6299,9 @@ pub const App = struct {
             const current_row = row + idx + 1;
             try writer.print("\x1b[{d};1H", .{current_row});
             if (item_index >= total_items) {
-                try writeStyle(writer, pane_style);
                 while (idx < visible_rows) : (idx += 1) {
                     try writer.print("\x1b[{d};1H", .{row + idx + 1});
-                    try writeStyle(writer, pane_style);
-                    try writer.writeByte(' ');
-                    while (displayWidth("") + 1 < cols) {
-                        try writer.writeByte(' ');
-                        if (cols <= 1) break;
-                        break;
-                    }
-                    try writer.writeAll("\x1b[0m");
+                    try render_mod.renderBlankRow(writer, pane_style, cols);
                 }
                 break;
             }
@@ -6325,18 +6315,18 @@ pub const App = struct {
             try writer.writeByte(' ');
             const label_budget = if (cols > 4) cols - 4 else 0;
             const label = clipText(item.label, label_budget);
-            try writeStyledText(writer, prefix_style, label);
+            try writer.writeAll(label);
+            var used_width: usize = 3 + displayWidth(label);
             if (item.detail) |detail| {
-                const room = if (cols > displayWidth(label) + 7) cols - displayWidth(label) - 7 else 0;
+                const room = if (cols > used_width + 3) cols - used_width - 3 else 0;
                 if (room > 0) {
                     try writeStyledText(writer, pane_style, " │ ");
-                    try writeStyledText(writer, pane_style, clipText(detail, room));
+                    const clipped_detail = clipText(detail, room);
+                    try writeStyledText(writer, pane_style, clipped_detail);
+                    used_width += 3 + displayWidth(clipped_detail);
                 }
             }
-            while (displayWidth(label) + 4 < cols) {
-                try writer.writeByte(' ');
-                if (displayWidth(label) + 4 >= cols) break;
-            }
+            try render_mod.padToColumns(writer, used_width, cols);
             try writer.writeAll("\x1b[0m");
         }
     }
@@ -6345,33 +6335,14 @@ pub const App = struct {
         if (height == 0) return;
         const pane_style = self.theme.statusStyle();
         try writer.print("\x1b[{d};1H", .{row});
-        try writeStyle(writer, pane_style);
-        try writer.writeByte(' ');
-        try writer.writeAll(title);
-        while (displayWidth(title) + 1 < cols) {
-            try writer.writeByte(' ');
-            if (cols <= displayWidth(title) + 1) break;
-        }
-        try writer.writeAll("\x1b[0m");
+        try render_mod.renderOverlayTitle(writer, pane_style, cols, title);
 
         if (height < 2) return;
         var lines = std.mem.splitScalar(u8, text, '\n');
         var current_row: usize = row + 1;
         while (current_row < row + height) : (current_row += 1) {
             try writer.print("\x1b[{d};1H", .{current_row});
-            try writeStyle(writer, pane_style);
-            if (lines.next()) |line| {
-                try writer.writeByte(' ');
-                try writer.writeAll(clipText(line, if (cols > 1) cols - 1 else 0));
-            } else {
-                try writer.writeByte(' ');
-            }
-            while (displayWidth("") + 1 < cols) {
-                try writer.writeByte(' ');
-                if (cols <= 1) break;
-                break;
-            }
-            try writer.writeAll("\x1b[0m");
+            try render_mod.renderOverlayLine(writer, pane_style, cols, lines.next());
         }
     }
 
@@ -7841,6 +7812,69 @@ test "plugin detail pane refresh resets stale row selection" {
     }
     try std.testing.expect(saw_manifest);
     try std.testing.expect(!saw_stale_runnable);
+}
+
+test "plugins command produces bounded overlay content for rendering" {
+    var app = try makeTestApp(std.testing.allocator, "hello world");
+    defer app.deinit();
+
+    try app.builtins.registerExtensionCommand("hello-plugin", "announce that the hello plugin is loaded", pluginCommandSmoke);
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":plugins");
+    try app.executeCommand();
+
+    try std.testing.expect(app.plugins_pane_id != null);
+    const pane_id = app.plugins_pane_id.?;
+    const pane = app.findPaneById(pane_id).?;
+    try std.testing.expect(std.mem.indexOf(u8, pane.streaming.items, "hello [filesystem]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pane.streaming.items, "cmd hello-plugin") != null);
+
+    var backing: [1024]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&backing);
+    try app.renderTextOverlayPane(stream.writer(), 32, 2, 4, pane.title, pane.streaming.items);
+
+    const rendered = stream.getWritten();
+    try std.testing.expect(rendered.len < backing.len);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, " plugins") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "hello [filesystem]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "cmd hello-plugin") != null);
+}
+
+test "picker pane rendering stays bounded with empty results" {
+    var app = try makeTestApp(std.testing.allocator, "hello world");
+    defer app.deinit();
+
+    app.picker.setState(.loading);
+
+    var backing: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&backing);
+    try app.renderPickerPane(stream.writer(), 8, 2, 3);
+
+    const rendered = stream.getWritten();
+    try std.testing.expect(rendered.len < backing.len);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[2;1H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[3;1H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "󰌑") != null);
+}
+
+test "picker pane item rows clip and pad within width" {
+    var app = try makeTestApp(std.testing.allocator, "hello world");
+    defer app.deinit();
+
+    try app.picker.setItems(&.{
+        .{ .id = 1, .label = "alpha", .detail = "first item" },
+    });
+    app.picker.setState(.ready);
+
+    var backing: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&backing);
+    try app.renderPickerPane(stream.writer(), 16, 2, 2);
+
+    const rendered = stream.getWritten();
+    try std.testing.expect(rendered.len < backing.len);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "first item") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[0m") != null);
 }
 
 test "command saveas writes the buffer and updates the path" {

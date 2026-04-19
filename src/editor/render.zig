@@ -280,6 +280,44 @@ pub fn writeStyledText(writer: anytype, style: Style, text: []const u8) !void {
     try writer.writeAll(text);
 }
 
+pub fn renderOverlayTitle(writer: anytype, style: Style, cols: usize, title: []const u8) !void {
+    try writeStyle(writer, style);
+    try writer.writeByte(' ');
+    const title_text = clipText(title, if (cols > 1) cols - 1 else 0);
+    try writer.writeAll(title_text);
+    const title_width = displayWidth(title_text) + 1;
+    try padToColumns(writer, title_width, cols);
+    try writer.writeAll("\x1b[0m");
+}
+
+pub fn renderOverlayLine(writer: anytype, style: Style, cols: usize, line: ?[]const u8) !void {
+    try writeStyle(writer, style);
+    if (line) |body| {
+        try writer.writeByte(' ');
+        try writer.writeAll(clipText(body, if (cols > 1) cols - 1 else 0));
+    } else {
+        try writer.writeByte(' ');
+    }
+    try padToColumns(writer, 1, cols);
+    try writer.writeAll("\x1b[0m");
+}
+
+pub fn renderBlankRow(writer: anytype, style: Style, cols: usize) !void {
+    try writeStyle(writer, style);
+    try writer.writeByte(' ');
+    try padToColumns(writer, 1, cols);
+    try writer.writeAll("\x1b[0m");
+}
+
+pub fn padToColumns(writer: anytype, width: usize, cols: usize) !void {
+    if (cols > width) {
+        var padding = cols - width;
+        while (padding > 0) : (padding -= 1) {
+            try writer.writeByte(' ');
+        }
+    }
+}
+
 pub fn utf8CharLen(byte: u8) usize {
     return if (byte < 0x80) 1 else if ((byte & 0xe0) == 0xc0) 2 else if ((byte & 0xf0) == 0xe0) 3 else if ((byte & 0xf8) == 0xf0) 4 else 1;
 }
@@ -319,4 +357,28 @@ test "theme resolution keeps beam default and recognizes nvchad" {
     try std.testing.expect(beam_theme.content_bg == null);
     try std.testing.expect(fallback_theme.content_bg != null);
     try std.testing.expect(nvchad_theme.content_bg != null);
+}
+
+test "overlay title clips to the available width" {
+    var backing: [64]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&backing);
+
+    try renderOverlayTitle(stream.writer(), .{ .fg = 252, .bg = 235 }, 6, "plugins");
+
+    const rendered = stream.getWritten();
+    try std.testing.expect(rendered.len < backing.len);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, " plugi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, " plugins") == null);
+}
+
+test "overlay body line pads within bounds" {
+    var backing: [64]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&backing);
+
+    try renderOverlayLine(stream.writer(), .{ .fg = 252, .bg = 235 }, 8, "> hello");
+
+    const rendered = stream.getWritten();
+    try std.testing.expect(rendered.len < backing.len);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "> hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[0m") != null);
 }
