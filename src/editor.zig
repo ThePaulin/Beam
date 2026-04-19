@@ -203,6 +203,10 @@ pub const App = struct {
     last_repeatable_edit: ?RepeatableEdit = null,
     registers: RegisterStore,
     marks: [26]?buffer_mod.Position = [_]?buffer_mod.Position{null} ** 26,
+    command_completion: ?struct {
+        items: []const commands_mod.CommandSpec,
+        selected: usize,
+    } = null,
 
     const VisualMode = enum { none, character, line, block };
     const VisualPending = enum { ctrl_backslash, g_prefix, replace_char, textobject_outer, textobject_inner };
@@ -750,12 +754,42 @@ pub const App = struct {
                 else => try self.handleReplaceByte(byte),
             },
             .command => switch (byte) {
-                0x1b => self.clearPrompt(.command),
+                0x1b, 0x03 => {
+                    if (self.command_completion) |compl| {
+                        self.allocator.free(compl.items);
+                        self.command_completion = null;
+                    } else {
+                        self.clearPrompt(.command);
+                    }
+                },
                 0x7f => {
                     if (self.command_buffer.items.len > 0) _ = self.command_buffer.pop();
+                    if (self.command_completion) |*compl| {
+                        self.allocator.free(compl.items);
+                        self.command_completion = null;
+                    }
                 },
-                '\r', '\n' => try self.executeCommand(),
-                else => try self.command_buffer.append(byte),
+                '\t' => {
+                    if (self.command_completion) |*compl| {
+                        compl.selected = (compl.selected + 1) % compl.items.len;
+                    } else {
+                        try self.triggerCommandCompletion();
+                    }
+                },
+                '\r', '\n' => {
+                    if (self.command_completion != null) {
+                        try self.applyCommandCompletion();
+                    } else {
+                        try self.executeCommand();
+                    }
+                },
+                else => {
+                    if (self.command_completion != null) {
+                        self.allocator.free(self.command_completion.?.items);
+                        self.command_completion = null;
+                    }
+                    try self.command_buffer.append(byte);
+                },
             },
             .search => switch (byte) {
                 0x1b => {
@@ -834,7 +868,13 @@ pub const App = struct {
     }
 
     fn clearPrompt(self: *App, mode: Mode) void {
-        if (mode == .command) self.command_buffer.clearRetainingCapacity();
+        if (mode == .command) {
+            if (self.command_completion) |compl| {
+                self.allocator.free(compl.items);
+                self.command_completion = null;
+            }
+            self.command_buffer.clearRetainingCapacity();
+        }
         if (mode == .search) {
             self.search_buffer.clearRetainingCapacity();
             self.clearSearchPreview();
@@ -1159,6 +1199,33 @@ pub const App = struct {
         }
 
         try self.setStatus("unknown command");
+    }
+
+    fn triggerCommandCompletion(self: *App) !void {
+        const input = self.command_buffer.items;
+        const prefix = if (std.mem.indexOfScalar(u8, input, ' ')) |idx| input[0..idx] else input;
+        const matches = try commands_mod.matchCompletions(prefix, self.allocator);
+        if (matches.len == 0) {
+            self.allocator.free(matches);
+            return;
+        }
+        self.command_completion = .{
+            .items = matches,
+            .selected = 0,
+        };
+    }
+
+    fn applyCommandCompletion(self: *App) !void {
+        if (self.command_completion) |compl| {
+            const selected = compl.items[compl.selected];
+            self.command_buffer.clearRetainingCapacity();
+            try self.command_buffer.appendSlice(selected.name);
+            if (selected.description.len > 0) {
+                try self.command_buffer.appendSlice(" ");
+            }
+            self.allocator.free(compl.items);
+            self.command_completion = null;
+        }
     }
 
     fn handleNormalByte(self: *App, byte: u8) anyerror!void {
@@ -6208,6 +6275,29 @@ pub const App = struct {
             try writer.writeByte(' ');
         }
         try writer.writeAll("\x1b[0m");
+
+        if (self.command_completion) |compl| {
+            var i: usize = 0;
+            while (i < compl.items.len and i < 10) : (i += 1) {
+                const item = compl.items[i];
+                const is_selected = i == compl.selected;
+                const row_offset = row + 1 + i;
+                try writer.print("\x1b[{d};1H", .{row_offset});
+                if (is_selected) {
+                    try writeStyle(writer, .{ .fg = self.theme.accent, .bg = self.theme.prompt_bg });
+                } else {
+                    try writeStyle(writer, .{ .fg = self.theme.prompt_fg, .bg = self.theme.prompt_bg });
+                }
+                const label = try std.fmt.allocPrint(self.allocator, "  {s}", .{item.name});
+                defer self.allocator.free(label);
+                try writeStyledText(writer, self.theme.promptStyle(), label);
+                var label_used = label.len;
+                while (label_used < cols) : (label_used += 1) {
+                    try writer.writeByte(' ');
+                }
+            }
+            try writer.writeAll("\x1b[0m");
+        }
     }
 
     fn renderPaneSeparator(self: *App, writer: anytype, x: usize, height: usize) !void {
