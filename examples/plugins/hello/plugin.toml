@@ -1,9 +1,13 @@
 [plugin]
 name = "hello"
 version = "0.1.0"
+manifest_version = 1
 api_version = 1
+runtime = "native"
 
 [capabilities]
 command = true
 event = true
 status = true
+pane = true
+decoration = true

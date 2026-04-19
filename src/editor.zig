@@ -12,6 +12,7 @@ const pane_mod = @import("pane.zig");
 const listsource_mod = @import("listsource.zig");
 const listpane_mod = @import("listpane.zig");
 const picker_mod = @import("picker.zig");
+const plugin_mod = @import("plugin.zig");
 const plugin_catalog_mod = @import("plugin_catalog.zig");
 const search_mod = @import("search.zig");
 const scheduler_mod = @import("scheduler.zig");
@@ -159,7 +160,8 @@ pub const App = struct {
     picker_source_spec: ?listsource_mod.SourceSpec = null,
     picker_source_pattern: ?[]u8 = null,
     picker_source_pathspec: ?[]u8 = null,
-    picker_job_id: ?u64 = null,
+    picker_job_id: ?scheduler_mod.RequestHandle = null,
+    pending_lsp_results: std.AutoHashMap(u64, scheduler_mod.RequestHandle),
     search: search_mod.SearchIndex,
     workspace: workspace_mod.Workspace,
     should_quit: bool = false,
@@ -355,6 +357,7 @@ pub const App = struct {
                     .plugin_activity = std.array_list.Managed(u8).init(allocator),
                     .picker_source_key = null,
                     .picker_source_spec = null,
+                    .pending_lsp_results = std.AutoHashMap(u64, scheduler_mod.RequestHandle).init(allocator),
                     .search = search,
                     .workspace = workspace,
                     .file_to_open = file_to_open,
@@ -408,6 +411,7 @@ pub const App = struct {
             .picker_source_key = null,
             .picker_source_spec = null,
             .picker_job_id = null,
+            .pending_lsp_results = std.AutoHashMap(u64, scheduler_mod.RequestHandle).init(allocator),
             .search = search,
             .workspace = workspace,
             .file_to_open = file_to_open,
@@ -458,10 +462,11 @@ pub const App = struct {
         self.picker_source_key = null;
         self.picker_source_spec = null;
         self.plugins_pane_id = null;
-        if (self.picker_job_id) |job_id| {
-            _ = self.scheduler.cancel(job_id);
+        if (self.picker_job_id) |handle| {
+            _ = self.scheduler.cancel(handle);
             self.picker_job_id = null;
         }
+        self.pending_lsp_results.deinit();
         if (self.picker_source_pattern) |pattern| self.allocator.free(pattern);
         if (self.picker_source_pathspec) |pathspec| self.allocator.free(pathspec);
         self.workspace.deinit();
@@ -534,13 +539,20 @@ pub const App = struct {
             while (server.pollMessage()) |raw_message| {
                 var message = raw_message;
                 defer message.deinit(self.allocator);
-                self.lsp.handleMessage(message) catch |err| {
+                const response = self.lsp.handleMessage(message) catch |err| {
                     if (err == error.InvalidJsonRpcMessage) {
                         self.setStatus("lsp malformed JSON-RPC") catch {};
                     } else {
                         self.setStatus("lsp message error") catch {};
                     }
+                    continue;
                 };
+                if (response) |completion| {
+                    if (self.pending_lsp_results.fetchRemove(completion.id)) |entry| {
+                        var host = self.builtinHost();
+                        self.builtins.emitServiceResult(&host, entry.value, !completion.has_error, completion.body);
+                    }
+                }
             }
             if (server.takeMalformedJsonRpc()) {
                 self.setStatus("lsp malformed JSON-RPC") catch {};
@@ -662,11 +674,26 @@ pub const App = struct {
         var input_buf: [1]u8 = undefined;
         while (!self.should_quit) {
             self.serviceLsp();
+            self.serviceJobs();
             try self.render();
             const n = stdin_file.read(&input_buf) catch break;
             if (n == 0) break;
             try self.handleByte(input_buf[0], stdin_file);
+            self.syncActiveSyntax();
             self.serviceLsp();
+        }
+    }
+
+    fn serviceJobs(self: *App) void {
+        while (self.scheduler.popCompleted()) |result| {
+            var host = self.builtinHost();
+            const handle = scheduler_mod.RequestHandle{
+                .id = result.job_id,
+                .request_generation = result.request_generation,
+                .workspace_generation = result.workspace_generation,
+            };
+            self.builtins.emitJobResult(&host, handle, result.success, result.payload);
+            self.allocator.free(result.payload);
         }
     }
 
@@ -808,13 +835,22 @@ pub const App = struct {
 
     fn clearPrompt(self: *App, mode: Mode) void {
         if (mode == .command) self.command_buffer.clearRetainingCapacity();
-        if (mode == .search) self.search_buffer.clearRetainingCapacity();
+        if (mode == .search) {
+            self.search_buffer.clearRetainingCapacity();
+            self.clearSearchPreview();
+            self.clearSearchHighlight();
+        }
         self.mode = .normal;
     }
 
     fn clearSearchPreview(self: *App) void {
         if (self.search_preview_highlight) |needle| self.allocator.free(needle);
         self.search_preview_highlight = null;
+    }
+
+    fn clearSearchHighlight(self: *App) void {
+        if (self.search_highlight) |needle| self.allocator.free(needle);
+        self.search_highlight = null;
     }
 
     fn updateSearchHighlight(self: *App, slot: *?[]u8, needle: []const u8) !void {
@@ -916,6 +952,10 @@ pub const App = struct {
         }
         if (matchesCommand(head, &.{"symbols"}, "symbols")) {
             try self.runSymbolPickerSearch(tail);
+            return;
+        }
+        if (matchesCommand(head, &.{"lsp"}, "lsp")) {
+            try self.runLspCommand(tail);
             return;
         }
         if (matchesCommand(head, &.{"diagnostics"}, "diagnostics")) {
@@ -1149,6 +1189,10 @@ pub const App = struct {
 
         if (byte == 0x1b or byte == 0x03) {
             self.resetNormalInput();
+            if (self.search_highlight != null or self.search_preview_highlight != null) {
+                self.clearSearchPreview();
+                self.clearSearchHighlight();
+            }
             self.visual_mode = .none;
             self.visual_anchor = null;
             return;
@@ -1763,23 +1807,20 @@ pub const App = struct {
                 self.mode = .insert;
             },
             .open_below => {
-                try buf.insertNewline();
+                try self.insertIndentedBlankLine(false);
                 self.mode = .insert;
             },
             .open_above => {
-                buf.moveUp();
-                buf.moveLineStart();
-                try buf.insertNewline();
-                buf.moveUp();
+                try self.insertIndentedBlankLine(true);
                 self.mode = .insert;
             },
             .insert_line_below => {
                 var i: usize = 0;
-                while (i < count) : (i += 1) try buf.insertBlankLineBelow();
+                while (i < count) : (i += 1) try self.insertIndentedBlankLine(false);
             },
             .insert_line_above => {
                 var i: usize = 0;
-                while (i < count) : (i += 1) try buf.insertBlankLineAbove();
+                while (i < count) : (i += 1) try self.insertIndentedBlankLine(true);
             },
             .delete_line => {
                 const removed = try buf.deleteLine(count);
@@ -2858,10 +2899,13 @@ pub const App = struct {
         return switch (byte) {
             'w' => self.wordObjectRange(false, inner),
             'W' => self.wordObjectRange(true, inner),
-            '(', ')', 'b' => self.pairedObjectRange('(', ')', inner),
-            '[', ']' => self.pairedObjectRange('[', ']', inner),
-            '{', '}', 'B' => self.pairedObjectRange('{', '}', inner),
-            '<', '>' => self.angleObjectRange(inner),
+            '(', ')', 'b', '[', ']', '{', '}', 'B', '<', '>' => self.syntaxAwareBlockObjectRange(inner) orelse switch (byte) {
+                '(', ')', 'b' => self.pairedObjectRange('(', ')', inner),
+                '[', ']' => self.pairedObjectRange('[', ']', inner),
+                '{', '}', 'B' => self.pairedObjectRange('{', '}', inner),
+                '<', '>' => self.angleObjectRange(inner),
+                else => null,
+            },
             '"' => self.quoteObjectRange('"', inner),
             '\'' => self.quoteObjectRange('\'', inner),
             '`' => self.quoteObjectRange('`', inner),
@@ -2946,6 +2990,43 @@ pub const App = struct {
 
     fn angleObjectRange(self: *App, inner: bool) ?VisualTextRange {
         return self.pairedObjectRange('<', '>', inner);
+    }
+
+    fn syntaxAwareBlockObjectRange(self: *App, inner: bool) ?VisualTextRange {
+        const buf = self.activeBuffer();
+        if (!std.mem.eql(u8, buf.filetypeText(), "zig")) return null;
+        if (!self.syntax.hasParsedTree(buf.id)) return null;
+        const snapshot = buf.readSnapshot(null) catch return null;
+        defer buf.freeReadSnapshot(snapshot);
+        const range = self.syntax.textObjectRange(snapshot, inner) orelse return null;
+        return .{ .start = range.start, .end = range.end };
+    }
+
+    fn insertIndentedBlankLine(self: *App, above: bool) !void {
+        const buf = self.activeBuffer();
+        const indent_row = if (above or buf.cursor.row + 1 >= buf.lines.items.len) buf.cursor.row else buf.cursor.row + 1;
+        const indent = self.syntaxIndentForRowFromActiveBuffer(indent_row);
+        if (above) {
+            try buf.insertBlankLineAboveIndented(indent);
+        } else {
+            try buf.insertBlankLineBelowIndented(indent);
+        }
+    }
+
+    fn syntaxIndentForRowFromActiveBuffer(self: *App, row: usize) usize {
+        const buf = self.activeBuffer();
+        const snapshot = buf.readSnapshot(null) catch return self.lineIndentForRow(row);
+        defer buf.freeReadSnapshot(snapshot);
+        return self.syntax.indentForRow(snapshot, row);
+    }
+
+    fn lineIndentForRow(self: *App, row: usize) usize {
+        const buf = self.activeBuffer();
+        if (row >= buf.lines.items.len) return 0;
+        const line = buf.lines.items[row];
+        var indent: usize = 0;
+        while (indent < line.len and line[indent] == ' ') : (indent += 1) {}
+        return indent;
     }
 
     fn paragraphObjectRange(self: *App, inner: bool) ?VisualTextRange {
@@ -3249,7 +3330,7 @@ pub const App = struct {
     }
 
     fn showReferenceHelp(self: *App) !void {
-        try self.setStatus("help: :help keyword | :w | :wq | :q | :q! | :saveas PATH | :close | :terminal | :edit PATH | :open PATH | :bd | :bn | :bp | :buffer N|PATH | :buffers | :split PATH | :sp PATH | :vs PATH | :tabnew | :tabclose | :tabonly | :tabmove N | :refresh-sources | :plugins | :vimgrep /pat/ [path] | :grep PAT [path] | :sort [u] | :!cmd | :cn | :cp | :cope | :ccl | :marks | :delmarks! | :zf | :za | :zo | :zc | :zE | :zr | :zm | :zi | :diffthis | :diffoff | :diffupdate | :diffget | :diffput | ]c/[c | () | n/N | * / # | m/'/` | Ctrl+u/d/i/o/^ | Ctrl+w s/v/n/q/x/+/-/</>/\\/|/_/=/T | leader x | :registers");
+        try self.setStatus("help: :help keyword | :w | :wq | :q | :q! | :saveas PATH | :close | :terminal | :edit PATH | :open PATH | :bd | :bn | :bp | :buffer N|PATH | :buffers | :split PATH | :sp PATH | :vs PATH | :tabnew | :tabclose | :tabonly | :tabmove N | :refresh-sources | :lsp ACTION | :plugins | :help plugin-pane | :help plugin-decorations | :vimgrep /pat/ [path] | :grep PAT [path] | :sort [u] | :!cmd | :cn | :cp | :cope | :ccl | :marks | :delmarks! | :zf | :za | :zo | :zc | :zE | :zr | :zm | :zi | :diffthis | :diffoff | :diffupdate | :diffget | :diffput | ]c/[c | syntax-aware a{/i{/a(/i( in Zig | n/N | * / # | m/'/` | Ctrl+u/d/i/o/^ | Ctrl+w s/v/n/q/x/+/-/</>/\\/|/_/=/T | leader x | :registers");
     }
 
     fn showHelpForCurrentWord(self: *App) !void {
@@ -4039,7 +4120,7 @@ pub const App = struct {
     }
 
     fn repeatSearch(self: *App, forward: bool) !void {
-        const needle = self.activeSearchHighlight(true) orelse {
+        const needle = self.search_highlight orelse {
             try self.setStatus("no search term");
             return;
         };
@@ -4047,14 +4128,12 @@ pub const App = struct {
         const text = try buf.serialize();
         defer self.allocator.free(text);
         const cursor_offset = self.positionToOffset(buf.cursor, text);
-        const actual_forward = if (forward) self.search_forward else !self.search_forward;
-        const found = findSubstringOccurrence(text, needle, cursor_offset, actual_forward);
+        const found = findSubstringOccurrenceCyclic(text, needle, cursor_offset, forward) orelse findSubstringOccurrence(text, needle, cursor_offset, forward);
         if (found) |offset| {
             buf.cursor = self.offsetToPosition(text, offset);
         } else {
             try self.setStatus("not found");
         }
-        self.search_forward = actual_forward;
     }
 
     fn openCursorPath(self: *App, link: bool) !void {
@@ -4284,6 +4363,32 @@ pub const App = struct {
         return null;
     }
 
+    fn findSubstringOccurrenceCyclic(text: []const u8, needle: []const u8, start_offset: usize, forward: bool) ?usize {
+        if (needle.len == 0 or text.len < needle.len) return null;
+        const cursor = @min(start_offset, text.len);
+        if (forward) {
+            var idx = @min(cursor + 1, text.len);
+            while (idx + needle.len <= text.len) : (idx += 1) {
+                if (std.mem.eql(u8, text[idx .. idx + needle.len], needle)) return idx;
+            }
+            idx = 0;
+            while (idx < cursor + 1 and idx + needle.len <= text.len) : (idx += 1) {
+                if (std.mem.eql(u8, text[idx .. idx + needle.len], needle)) return idx;
+            }
+            return null;
+        }
+
+        var idx = cursor;
+        while (idx > 0) : (idx -= 1) {
+            if (idx >= needle.len and std.mem.eql(u8, text[idx - needle.len .. idx], needle)) return idx - needle.len;
+        }
+        idx = text.len;
+        while (idx > cursor) : (idx -= 1) {
+            if (idx >= needle.len and std.mem.eql(u8, text[idx - needle.len .. idx], needle)) return idx - needle.len;
+        }
+        return null;
+    }
+
     fn repeatLastCommand(self: *App) anyerror!void {
         const repeatable = self.last_repeatable_edit orelse {
             try self.setStatus("no repeatable command");
@@ -4297,7 +4402,7 @@ pub const App = struct {
 
     fn createFoldAtCursor(self: *App) !void {
         const buf = self.activeBuffer();
-        const snapshot = buf.readSnapshot() catch {
+        const snapshot = buf.readSnapshot(null) catch {
             try buf.createParagraphFold();
             try self.setStatus("fold created");
             return;
@@ -4606,6 +4711,93 @@ pub const App = struct {
         try self.runPickerSource(.{ .command = "symbols", .kind = .symbols, .title = "symbols" }, pattern, "");
     }
 
+    fn runLspCommand(self: *App, tail: []const u8) !void {
+        const arg_split = std.mem.indexOfScalar(u8, tail, ' ');
+        const head = if (arg_split) |idx| tail[0..idx] else tail;
+        const rest = if (arg_split) |idx| std.mem.trim(u8, tail[idx + 1 ..], " \t") else "";
+        if (head.len == 0) {
+            try self.setStatus("lsp commands: definition|references|hover|completion|rename NAME|code-action|semantic-tokens");
+            return;
+        }
+        if (std.mem.eql(u8, head, "definition")) {
+            try self.requestLspAction("definition", null);
+            return;
+        }
+        if (std.mem.eql(u8, head, "references")) {
+            try self.requestLspAction("references", null);
+            return;
+        }
+        if (std.mem.eql(u8, head, "hover")) {
+            try self.requestLspAction("hover", null);
+            return;
+        }
+        if (std.mem.eql(u8, head, "completion")) {
+            try self.requestLspAction("completion", null);
+            return;
+        }
+        if (std.mem.eql(u8, head, "code-action")) {
+            try self.requestLspAction("code-action", null);
+            return;
+        }
+        if (std.mem.eql(u8, head, "semantic-tokens")) {
+            try self.requestLspAction("semantic-tokens", null);
+            return;
+        }
+        if (std.mem.eql(u8, head, "rename")) {
+            if (rest.len == 0) {
+                try self.setStatus("lsp rename requires a new name");
+                return;
+            }
+            try self.requestLspAction("rename", rest);
+            return;
+        }
+        try self.setStatus("unknown lsp command");
+    }
+
+    fn requestLspAction(self: *App, action: []const u8, tail: ?[]const u8) !void {
+        const buf = self.activeBuffer();
+        const path = buf.path orelse {
+            try self.setStatus("current buffer has no path");
+            return;
+        };
+        const payload = try self.lspPositionPayload(path, tail);
+        defer self.allocator.free(payload);
+        if (std.mem.eql(u8, action, "definition")) {
+            _ = try self.lsp.requestDefinition(payload);
+        } else if (std.mem.eql(u8, action, "references")) {
+            _ = try self.lsp.requestReferences(payload);
+        } else if (std.mem.eql(u8, action, "rename")) {
+            _ = try self.lsp.requestRename(payload);
+        } else if (std.mem.eql(u8, action, "completion")) {
+            _ = try self.lsp.requestCompletion(payload);
+        } else if (std.mem.eql(u8, action, "hover")) {
+            _ = try self.lsp.requestHover(payload);
+        } else if (std.mem.eql(u8, action, "code-action")) {
+            _ = try self.lsp.requestCodeActions(payload);
+        } else if (std.mem.eql(u8, action, "semantic-tokens")) {
+            _ = try self.lsp.requestSemanticTokens(payload);
+        } else {
+            _ = try self.lsp.request(action, payload);
+        }
+        try self.setStatus("lsp request sent");
+    }
+
+    fn lspPositionPayload(self: *App, path: []const u8, tail: ?[]const u8) ![]u8 {
+        const buf = self.activeBuffer();
+        const row = buf.cursor.row;
+        const col = buf.cursor.col;
+        if (tail) |text| {
+            return try std.fmt.allocPrint(self.allocator,
+                "{{\"textDocument\":{{\"uri\":\"file://{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}},\"newName\":{s}}}",
+                .{ path, row, col, try jsonStringLiteral(self.allocator, text) },
+            );
+        }
+        return try std.fmt.allocPrint(self.allocator,
+            "{{\"textDocument\":{{\"uri\":\"file://{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}",
+            .{ path, row, col },
+        );
+    }
+
     fn runPickerSource(self: *App, spec: listsource_mod.SourceSpec, pattern: []const u8, pathspec: []const u8) !void {
         self.cancelActivePickerSource();
         var collector = SearchCollector.init(self, spec.kind, spec.emit_quickfix);
@@ -4618,10 +4810,10 @@ pub const App = struct {
             .diagnostics => .custom,
             .custom => .custom,
         };
-        const job_id = try self.scheduler.spawn(job_kind, self.workspace.session_generation, self.workspace.session_generation);
-        self.picker_job_id = job_id;
+        const handle = try self.scheduler.spawn(job_kind, self.workspace.session_generation, self.workspace.session_generation);
+        self.picker_job_id = handle;
         const key = listsource_mod.SourceKey{
-            .request_id = job_id,
+            .request_id = handle.id,
             .workspace_generation = self.workspace.session_generation,
         };
         collector.request_key = key;
@@ -4654,15 +4846,19 @@ pub const App = struct {
         };
         _ = search_result catch |err| {
             try self.picker.setError(@errorName(err));
-            _ = self.scheduler.complete(job_id, @errorName(err), false) catch {};
-            if (self.picker_job_id == job_id) self.picker_job_id = null;
+            _ = self.scheduler.completeHandle(handle, @errorName(err), false) catch {};
+            if (self.picker_job_id) |active| {
+                if (active.matches(handle)) self.picker_job_id = null;
+            }
             try self.setStatus(spec.failure_message);
             return err;
         };
 
         collector.source.complete(key);
-        _ = self.scheduler.complete(job_id, "picker completed", true) catch {};
-        if (self.picker_job_id == job_id) self.picker_job_id = null;
+        _ = self.scheduler.completeHandle(handle, "picker completed", true) catch {};
+        if (self.picker_job_id) |active| {
+            if (active.matches(handle)) self.picker_job_id = null;
+        }
         try self.picker.setItems(collector.source.items.items);
         self.picker.selected = if (self.picker.items.items.len == 0) 0 else @min(restored_picker_selection, self.picker.items.items.len - 1);
         self.picker.setState(.ready);
@@ -4686,6 +4882,51 @@ pub const App = struct {
         self.picker.clearError();
         self.picker.clearPreview();
         self.picker.setState(.idle);
+    }
+
+    fn openPluginPicker(self: *App, title: []const u8, query: []const u8) !void {
+        self.cancelActivePickerSource();
+        self.picker.clear();
+        try self.picker.setQuery(query);
+        self.picker.setState(.loading);
+        try self.ensurePickerPane();
+        try self.syncPickerPaneTitle(title);
+    }
+
+    fn setPluginPickerItems(self: *App, items: []const listpane_mod.Item) !void {
+        try self.ensurePickerPane();
+        try self.picker.setItems(items);
+        self.picker.setState(.ready);
+        if (self.picker.selectedItem()) |item| {
+            try self.syncPluginPickerPreviewForSelection(item);
+        } else {
+            self.picker.clearPreview();
+        }
+        if (self.picker.items.items.len == 0) {
+            try self.setStatus("picker empty");
+        }
+    }
+
+    fn appendPluginPickerItem(self: *App, item: listpane_mod.Item) !void {
+        try self.ensurePickerPane();
+        try self.picker.appendItem(item);
+        self.picker.setState(.ready);
+    }
+
+    fn setPluginPickerPreview(self: *App, preview: ?[]const u8) !void {
+        try self.picker.setPreview(preview);
+    }
+
+    fn cancelPluginPicker(self: *App) void {
+        self.picker.clear();
+    }
+
+    fn syncPluginPickerPreviewForSelection(self: *App, item: listpane_mod.Item) !void {
+        if (item.detail) |detail| {
+            try self.picker.setPreview(detail);
+        } else {
+            self.picker.clearPreview();
+        }
     }
 
     fn refreshDerivedSources(self: *App) !void {
@@ -4942,19 +5183,24 @@ pub const App = struct {
     }
 
     fn syncPickerPreviewForSelection(self: *App, item: listpane_mod.Item) !void {
-        const spec = self.picker_source_spec orelse {
-            self.picker.clearPreview();
+        if (self.picker_source_spec) |spec| {
+            switch (spec.preview) {
+                .none => self.picker.clearPreview(),
+                .detail => if (item.detail) |detail| try self.picker.setPreview(detail) else self.picker.clearPreview(),
+            }
             return;
-        };
-        switch (spec.preview) {
-            .none => self.picker.clearPreview(),
-            .detail => if (item.detail) |detail| try self.picker.setPreview(detail) else self.picker.clearPreview(),
+        }
+        if (item.detail) |detail| {
+            try self.picker.setPreview(detail);
+        } else {
+            self.picker.clearPreview();
         }
     }
 
     fn syncDiagnosticsPane(self: *App) !void {
         const id = self.diagnostics_pane_id orelse return;
-        self.diagnostics.clearDecorations();
+        const diagnostics_owner = try self.diagnostics.registerDecorationOwner("diagnostics");
+        self.diagnostics.clearOwner(diagnostics_owner);
         const errors = self.diagnostics.count(.err);
         const warnings = self.diagnostics.count(.warning);
         const infos = self.diagnostics.count(.info);
@@ -4982,7 +5228,7 @@ pub const App = struct {
                 diag.col + 1,
             });
             const detail = try std.fmt.allocPrint(self.allocator, "[{s}] {s}", .{ severity, diag.message });
-            self.diagnostics.addDiagnosticDecoration(diag) catch {};
+            self.diagnostics.addDiagnosticDecorationOwned(diagnostics_owner, diag) catch {};
             try source.append(key, .{
                 .id = source.items.items.len + 1,
                 .path = if (diag.path) |p| try self.allocator.dupe(u8, p) else null,
@@ -5184,7 +5430,10 @@ pub const App = struct {
             if (manifest_name) |name| {
                 if (self.plugin_catalog.findEntry(name)) |entry| {
                     try self.appendPluginDetailRow("manifest", null, .none, null);
+                    try self.appendPluginDetailRow("schema", "v1", .none, null);
                     try self.appendPluginDetailRow("version", entry.manifest.version, .none, null);
+                    try self.appendPluginDetailRow("api", "v1", .none, null);
+                    try self.appendPluginDetailRow("runtime", @tagName(entry.manifest.runtime), .none, null);
                     try self.appendPluginDetailRow("source", @tagName(entry.source), .none, null);
                     try self.appendPluginDetailRow("state", @tagName(entry.state), .none, null);
                     try self.appendPluginDetailRow("capabilities", null, .none, null);
@@ -5222,6 +5471,9 @@ pub const App = struct {
             .{ .name = "picker", .enabled = caps.picker },
             .{ .name = "pane", .enabled = caps.pane },
             .{ .name = "fs_read", .enabled = caps.fs_read },
+            .{ .name = "tree_query", .enabled = caps.tree_query },
+            .{ .name = "decoration", .enabled = caps.decoration },
+            .{ .name = "lsp", .enabled = caps.lsp },
         };
         var any = false;
         for (capabilities) |cap| {
@@ -5475,6 +5727,14 @@ pub const App = struct {
         }
         if (std.mem.eql(u8, stripped, "diffput") or std.mem.eql(u8, stripped, "dp")) {
             try self.setStatus("put the current line into the diff peer");
+            return;
+        }
+        if (std.mem.eql(u8, stripped, "plugin-pane") or std.mem.eql(u8, stripped, "plugin-panes")) {
+            try self.setStatus("plugin pane API: registerPaneType, createPaneOfType, updatePaneState, updatePaneTitle; see examples/plugins/hello/plugin.zig");
+            return;
+        }
+        if (std.mem.eql(u8, stripped, "plugin-decorations") or std.mem.eql(u8, stripped, "plugin-decoration")) {
+            try self.setStatus("plugin decoration API: addDecoration(buffer_id, row, col, len, kind, source), clearDecorations; see examples/plugins/hello/plugin.zig");
             return;
         }
         if (std.mem.eql(u8, stripped, "q") or std.mem.eql(u8, stripped, "quit")) {
@@ -6019,15 +6279,13 @@ pub const App = struct {
             self.picker.error_message orelse "picker"
         else
             "picker";
+        const title_text = clipText(title, if (cols > 3) cols - 3 else 0);
         try writer.print("\x1b[{d};1H", .{row});
         try writeStyle(writer, pane_style);
         try writer.writeByte(' ');
         try writer.writeAll("󰌑 ");
-        try writeStyledText(writer, pane_style, title);
-        while (displayWidth(title) + 3 < cols) {
-            try writer.writeByte(' ');
-            if (displayWidth("picker") + 3 >= cols) break;
-        }
+        try writer.writeAll(title_text);
+        try render_mod.padToColumns(writer, 3 + displayWidth(title_text), cols);
         try writer.writeAll("\x1b[0m");
 
         if (height < 2) return;
@@ -6041,17 +6299,9 @@ pub const App = struct {
             const current_row = row + idx + 1;
             try writer.print("\x1b[{d};1H", .{current_row});
             if (item_index >= total_items) {
-                try writeStyle(writer, pane_style);
                 while (idx < visible_rows) : (idx += 1) {
                     try writer.print("\x1b[{d};1H", .{row + idx + 1});
-                    try writeStyle(writer, pane_style);
-                    try writer.writeByte(' ');
-                    while (displayWidth("") + 1 < cols) {
-                        try writer.writeByte(' ');
-                        if (cols <= 1) break;
-                        break;
-                    }
-                    try writer.writeAll("\x1b[0m");
+                    try render_mod.renderBlankRow(writer, pane_style, cols);
                 }
                 break;
             }
@@ -6065,18 +6315,18 @@ pub const App = struct {
             try writer.writeByte(' ');
             const label_budget = if (cols > 4) cols - 4 else 0;
             const label = clipText(item.label, label_budget);
-            try writeStyledText(writer, prefix_style, label);
+            try writer.writeAll(label);
+            var used_width: usize = 3 + displayWidth(label);
             if (item.detail) |detail| {
-                const room = if (cols > displayWidth(label) + 7) cols - displayWidth(label) - 7 else 0;
+                const room = if (cols > used_width + 3) cols - used_width - 3 else 0;
                 if (room > 0) {
                     try writeStyledText(writer, pane_style, " │ ");
-                    try writeStyledText(writer, pane_style, clipText(detail, room));
+                    const clipped_detail = clipText(detail, room);
+                    try writeStyledText(writer, pane_style, clipped_detail);
+                    used_width += 3 + displayWidth(clipped_detail);
                 }
             }
-            while (displayWidth(label) + 4 < cols) {
-                try writer.writeByte(' ');
-                if (displayWidth(label) + 4 >= cols) break;
-            }
+            try render_mod.padToColumns(writer, used_width, cols);
             try writer.writeAll("\x1b[0m");
         }
     }
@@ -6085,33 +6335,14 @@ pub const App = struct {
         if (height == 0) return;
         const pane_style = self.theme.statusStyle();
         try writer.print("\x1b[{d};1H", .{row});
-        try writeStyle(writer, pane_style);
-        try writer.writeByte(' ');
-        try writer.writeAll(title);
-        while (displayWidth(title) + 1 < cols) {
-            try writer.writeByte(' ');
-            if (cols <= displayWidth(title) + 1) break;
-        }
-        try writer.writeAll("\x1b[0m");
+        try render_mod.renderOverlayTitle(writer, pane_style, cols, title);
 
         if (height < 2) return;
         var lines = std.mem.splitScalar(u8, text, '\n');
         var current_row: usize = row + 1;
         while (current_row < row + height) : (current_row += 1) {
             try writer.print("\x1b[{d};1H", .{current_row});
-            try writeStyle(writer, pane_style);
-            if (lines.next()) |line| {
-                try writer.writeByte(' ');
-                try writer.writeAll(clipText(line, if (cols > 1) cols - 1 else 0));
-            } else {
-                try writer.writeByte(' ');
-            }
-            while (displayWidth("") + 1 < cols) {
-                try writer.writeByte(' ');
-                if (cols <= 1) break;
-                break;
-            }
-            try writer.writeAll("\x1b[0m");
+            try render_mod.renderOverlayLine(writer, pane_style, cols, lines.next());
         }
     }
 
@@ -6190,11 +6421,6 @@ pub const App = struct {
     }
 
     fn rowDecorationForBuffer(self: *App, buffer: *buffer_mod.Buffer, row: usize) ?[]const u8 {
-        for (self.diagnostics.decorations.items) |decoration| {
-            if (decoration.buffer_id == buffer.id and decoration.row == row) {
-                if (decoration.text) |text| return text;
-            }
-        }
         for (self.diagnostics.diagnostics.items) |diagnostic| {
             if (diagnostic.buffer_id == buffer.id and diagnostic.row == row) {
                 return diagnostic.message;
@@ -6207,6 +6433,9 @@ pub const App = struct {
                     if (std.mem.eql(u8, diag_path, path)) return diagnostic.message;
                 }
             }
+        }
+        if (self.diagnostics.bestDecorationForRow(buffer.id, row)) |decoration| {
+            if (decoration.text) |text| return text;
         }
         return null;
     }
@@ -6242,6 +6471,158 @@ pub const App = struct {
             };
         }
         return &self.buffers.items[self.active_index];
+    }
+
+    fn bufferById(self: *App, buffer_id: u64) ?*buffer_mod.Buffer {
+        for (self.buffers.items) |*buffer| {
+            if (buffer.id == buffer_id) return buffer;
+        }
+        return null;
+    }
+
+    fn selectionForBuffer(self: *App, buffer_id: u64) ?buffer_mod.Selection {
+        const buffer = self.bufferById(buffer_id) orelse return null;
+        if (self.buffers.items.len == 0) return null;
+        if (buffer.id != self.activeBuffer().id) return null;
+        const visual = self.visualSelection() orelse return null;
+        return .{ .start = visual.start, .end = visual.end };
+    }
+
+    fn readBufferSnapshot(self: *App, buffer_id: u64) !buffer_mod.ReadSnapshot {
+        const buffer = self.bufferById(buffer_id) orelse return error.BufferNotFound;
+        return try buffer.readSnapshot(self.selectionForBuffer(buffer_id));
+    }
+
+    fn freeBufferSnapshot(self: *App, snapshot: buffer_mod.ReadSnapshot) void {
+        self.allocator.free(snapshot.text);
+    }
+
+    fn beginBufferEdit(self: *App, buffer_id: u64) !buffer_mod.EditTransaction {
+        const buffer = self.bufferById(buffer_id) orelse return error.BufferNotFound;
+        return try buffer.beginTransaction();
+    }
+
+    fn workspaceInfo(self: *App) !plugin_mod.WorkspaceInfo {
+        return .{
+            .root_path = try self.allocator.dupe(u8, self.workspace.root_path),
+            .session_generation = self.workspace.session_generation,
+            .open_buffer_count = self.workspace.session.open_buffers.items.len,
+        };
+    }
+
+    fn freeWorkspaceInfo(self: *App, info: plugin_mod.WorkspaceInfo) void {
+        self.allocator.free(info.root_path);
+    }
+
+    fn freeBytes(self: *App, bytes: []u8) void {
+        self.allocator.free(bytes);
+    }
+
+    fn syntaxNodeAtCursor(self: *App, buffer_id: u64) !?syntax_mod.Node {
+        const snapshot = try self.readBufferSnapshot(buffer_id);
+        defer self.freeBufferSnapshot(snapshot);
+        return self.syntax.nodeAtCursor(snapshot);
+    }
+
+    fn syntaxFoldRange(self: *App, buffer_id: u64) !?syntax_mod.FoldRange {
+        const snapshot = try self.readBufferSnapshot(buffer_id);
+        defer self.freeBufferSnapshot(snapshot);
+        return self.syntax.foldRangeForSnapshot(snapshot);
+    }
+
+    fn syntaxEnclosingScope(self: *App, buffer_id: u64) !?syntax_mod.FoldRange {
+        const snapshot = try self.readBufferSnapshot(buffer_id);
+        defer self.freeBufferSnapshot(snapshot);
+        return self.syntax.enclosingScope(snapshot);
+    }
+
+    fn syntaxIndentForBufferRow(self: *App, buffer_id: u64, row: usize) !usize {
+        const snapshot = try self.readBufferSnapshot(buffer_id);
+        defer self.freeBufferSnapshot(snapshot);
+        return self.syntax.indentForRow(snapshot, row);
+    }
+
+    fn syntaxTextObjectRange(self: *App, buffer_id: u64, inner: bool) !?syntax_mod.TextRange {
+        const snapshot = try self.readBufferSnapshot(buffer_id);
+        defer self.freeBufferSnapshot(snapshot);
+        return self.syntax.textObjectRange(snapshot, inner);
+    }
+
+    fn lspRequestDefinition(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestDefinition(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
+    }
+
+    fn lspRequestReferences(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestReferences(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
+    }
+
+    fn lspRequestRename(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestRename(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
+    }
+
+    fn lspRequestCompletion(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestCompletion(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
+    }
+
+    fn lspRequestHover(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestHover(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
+    }
+
+    fn lspRequestCodeAction(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestCodeActions(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
+    }
+
+    fn lspRequestSemanticTokens(self: *App, payload: []const u8) !scheduler_mod.RequestHandle {
+        const id = try self.lsp.requestSemanticTokens(payload);
+        const handle = scheduler_mod.RequestHandle{
+            .id = id,
+            .request_generation = self.workspace.session_generation,
+            .workspace_generation = self.workspace.session_generation,
+        };
+        try self.pending_lsp_results.put(id, handle);
+        return handle;
     }
 
     fn activeSearchHighlight(self: *App, active: bool) ?[]const u8 {
@@ -6318,6 +6699,12 @@ pub const App = struct {
         const builtin_status = self.builtins.statusText();
         const plugin_status_local = try self.plugin_catalog.statusText(self.allocator);
         defer self.allocator.free(plugin_status_local);
+        const git_branch = try self.workspace.gitBranchName(self.allocator);
+        defer self.allocator.free(git_branch);
+        const git_status = if (git_branch.len == 0) try self.allocator.dupe(u8, "") else blk: {
+            break :blk try std.fmt.allocPrint(self.allocator, "git {s}", .{git_branch});
+        };
+        defer self.allocator.free(git_status);
         const builtin_status_combined = if (builtin_status.len == 0) plugin_status_local else if (plugin_status_local.len == 0) builtin_status else blk: {
             break :blk try std.fmt.allocPrint(self.allocator, "{s} | {s}", .{ builtin_status, plugin_status_local });
         };
@@ -6336,28 +6723,48 @@ pub const App = struct {
         defer self.allocator.free(picker_status);
         const quickfix_status = if (self.quickfix_list.query.items.len > 0 or self.quickfix_list.items.items.len > 0) try self.quickfix_list.statusText(self.allocator, "quickfix") else try self.allocator.dupe(u8, "");
         defer self.allocator.free(quickfix_status);
+        const syntax_status = try self.syntax.statusText(self.allocator, buf.id, buf.filetypeText());
+        defer self.allocator.free(syntax_status);
+        const file_status = try std.fmt.allocPrint(self.allocator, "{s} {s} {s}", .{ buf.filetypeText(), buf.encodingText(), buf.lineEndingText() });
+        defer self.allocator.free(file_status);
+        const macro_status = if (self.macro_recording) |reg| blk: {
+            break :blk try std.fmt.allocPrint(self.allocator, "recording @{c}", .{reg});
+        } else try self.allocator.dupe(u8, "");
+        defer self.allocator.free(macro_status);
         const app_prefix = "󰞋 ";
         const builtin_prefix = "󰒓 ";
         const diagnostics_prefix = "󰧑 ";
         const pane_prefix = "󰓩 ";
         const picker_prefix = "󰌑 ";
         const quickfix_prefix = "󰜴 ";
+        const git_prefix = "󰓒 ";
+        const syntax_prefix = "󰚛 ";
+        const file_prefix = "󰏫 ";
+        const macro_prefix = "󰘥 ";
         const app_width = if (app_status.len > 0) displayWidth(app_prefix) + displayWidth(app_status) else 0;
         const builtin_width = if (builtin_status_combined.len > 0) displayWidth(builtin_prefix) + displayWidth(builtin_status_combined) else 0;
         const diagnostics_width = if (diagnostics_status.len > 0) displayWidth(diagnostics_prefix) + displayWidth(diagnostics_status) else 0;
         const pane_width = if (pane_status.len > 0) displayWidth(pane_prefix) + displayWidth(pane_status) else 0;
         const picker_width = if (picker_status.len > 0) displayWidth(picker_prefix) + displayWidth(picker_status) else 0;
         const quickfix_width = if (quickfix_status.len > 0) displayWidth(quickfix_prefix) + displayWidth(quickfix_status) else 0;
+        const git_width = if (git_status.len > 0) displayWidth(git_prefix) + displayWidth(git_status) else 0;
+        const syntax_width = if (syntax_status.len > 0) displayWidth(syntax_prefix) + displayWidth(syntax_status) else 0;
+        const file_width = if (file_status.len > 0) displayWidth(file_prefix) + displayWidth(file_status) else 0;
+        const macro_width = if (macro_status.len > 0) displayWidth(macro_prefix) + displayWidth(macro_status) else 0;
         const location_width = displayWidth(location);
         const progress_width = displayWidth(progress);
         const sep_width: usize = displayWidth(" │ ");
 
-        var include_app = app_width > 0 and max_width >= app_width + builtin_width + diagnostics_width + pane_width + picker_width + quickfix_width + location_width + progress_width;
-        var include_builtin = builtin_width > 0 and max_width >= builtin_width + diagnostics_width + pane_width + picker_width + quickfix_width + location_width + progress_width;
-        var include_diagnostics = diagnostics_width > 0 and max_width >= diagnostics_width + pane_width + picker_width + quickfix_width + location_width + progress_width;
-        var include_pane = pane_width > 0 and max_width >= pane_width + picker_width + quickfix_width + location_width + progress_width;
-        var include_picker = picker_width > 0 and max_width >= picker_width + quickfix_width + location_width + progress_width;
-        const include_quickfix = quickfix_width > 0 and max_width >= quickfix_width + location_width + progress_width;
+        var include_app = app_width > 0 and max_width >= app_width + builtin_width + diagnostics_width + pane_width + picker_width + quickfix_width + git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_builtin = builtin_width > 0 and max_width >= builtin_width + diagnostics_width + pane_width + picker_width + quickfix_width + git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_diagnostics = diagnostics_width > 0 and max_width >= diagnostics_width + pane_width + picker_width + quickfix_width + git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_pane = pane_width > 0 and max_width >= pane_width + picker_width + quickfix_width + git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_picker = picker_width > 0 and max_width >= picker_width + quickfix_width + git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_quickfix = quickfix_width > 0 and max_width >= quickfix_width + git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_git = git_width > 0 and max_width >= git_width + syntax_width + file_width + macro_width + location_width + progress_width;
+        const include_syntax = syntax_width > 0 and max_width >= syntax_width + file_width + macro_width + location_width + progress_width;
+        var include_file = file_width > 0 and max_width >= file_width + macro_width + location_width + progress_width;
+        var include_macro = macro_width > 0 and max_width >= macro_width + location_width + progress_width;
 
         const mandatory_width = location_width + progress_width + (if (location_width > 0 and progress_width > 0) sep_width else 0);
         if (mandatory_width > max_width) {
@@ -6406,6 +6813,26 @@ pub const App = struct {
             try out.appendSlice(quickfix_prefix);
             try out.appendSlice(quickfix_status);
         }
+        if (include_git) {
+            if (out.items.len > 0) try out.appendSlice(" │ ");
+            try out.appendSlice(git_prefix);
+            try out.appendSlice(git_status);
+        }
+        if (include_syntax) {
+            if (out.items.len > 0) try out.appendSlice(" │ ");
+            try out.appendSlice(syntax_prefix);
+            try out.appendSlice(syntax_status);
+        }
+        if (include_file) {
+            if (out.items.len > 0) try out.appendSlice(" │ ");
+            try out.appendSlice(file_prefix);
+            try out.appendSlice(file_status);
+        }
+        if (include_macro) {
+            if (out.items.len > 0) try out.appendSlice(" │ ");
+            try out.appendSlice(macro_prefix);
+            try out.appendSlice(macro_status);
+        }
         if (out.items.len > 0) try out.appendSlice(" │ ");
         try out.appendSlice(location);
         if (progress.len > 0) {
@@ -6423,6 +6850,10 @@ pub const App = struct {
         include_diagnostics = false;
         include_pane = false;
         include_picker = false;
+        include_quickfix = false;
+        include_git = false;
+        include_file = false;
+        include_macro = false;
         if (include_builtin) {
             try out.appendSlice(builtin_prefix);
             try out.appendSlice(builtin_status_combined);
@@ -6443,6 +6874,24 @@ pub const App = struct {
         const prompt = if (self.mode == .command) self.command_buffer.items else self.search_buffer.items;
         const prefix: []const u8 = if (self.mode == .command) ":" else if (self.search_forward) "/" else "?";
         return try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, prompt });
+    }
+
+    fn jsonStringLiteral(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        var out = std.array_list.Managed(u8).init(allocator);
+        errdefer out.deinit();
+        try out.append('"');
+        for (text) |byte| {
+            switch (byte) {
+                '"' => try out.appendSlice("\\\""),
+                '\\' => try out.appendSlice("\\\\"),
+                '\n' => try out.appendSlice("\\n"),
+                '\r' => try out.appendSlice("\\r"),
+                '\t' => try out.appendSlice("\\t"),
+                else => try out.append(byte),
+            }
+        }
+        try out.append('"');
+        return try out.toOwnedSlice();
     }
 
     fn toggleSplitFocus(self: *App) void {
@@ -6509,20 +6958,81 @@ pub const App = struct {
 
     fn syncActiveSyntax(self: *App) void {
         const buf = self.activeBuffer();
-        const snapshot = buf.readSnapshot() catch return;
+        if (self.syntax.snapshotGeneration(buf.id)) |generation| {
+            if (generation == buf.generation) return;
+        }
+        const snapshot = buf.readSnapshot(null) catch return;
         defer buf.freeReadSnapshot(snapshot);
         self.syntax.updateSnapshot(snapshot) catch {};
+        self.syntax.applyDecorations(&self.diagnostics, snapshot) catch {};
     }
 
     fn builtinHost(self: *App) builtins_mod.Host {
         return .{
             .ctx = self,
-            .caps = .{ .command = true, .event = true, .status = true },
+            .caps = .{
+                .command = true,
+                .event = true,
+                .status = true,
+                .buffer_read = true,
+                .buffer_edit = true,
+                .jobs = true,
+                .workspace = true,
+                .diagnostics = true,
+                .picker = true,
+                .pane = true,
+                .fs_read = true,
+                .tree_query = true,
+                .decoration = true,
+                .lsp = true,
+                .job_results = true,
+            },
+            .decoration_owner = "editor",
+            .pane_owner = "editor",
             .set_status = builtinSetStatus,
             .set_extension_status = builtinSetExtensionStatus,
             .set_plugin_activity = builtinSetPluginActivity,
             .register_command = builtinRegisterCommand,
+            .register_command_with_context = builtinRegisterCommandWithContext,
             .register_event = builtinRegisterEvent,
+            .register_event_with_context = builtinRegisterEventWithContext,
+            .spawn_job = builtinSpawnJob,
+            .cancel_job = builtinCancelJob,
+            .register_completion = builtinRegisterCompletion,
+            .add_decoration = builtinAddDecoration,
+            .clear_decorations = builtinClearDecorations,
+            .clear_buffer_decorations = builtinClearBufferDecorations,
+            .set_pane_text = builtinSetPaneText,
+            .create_pane = builtinCreatePane,
+            .register_pane_type = builtinRegisterPaneType,
+            .create_pane_of_type = builtinCreatePaneOfType,
+            .update_pane_state = builtinUpdatePaneState,
+            .trigger_pane_action = builtinTriggerPaneAction,
+            .focus_pane = builtinFocusPane,
+            .open_picker = builtinOpenPicker,
+            .set_picker_items = builtinSetPickerItems,
+            .append_picker_item = builtinAppendPickerItem,
+            .set_picker_preview = builtinSetPickerPreview,
+            .cancel_picker = builtinCancelPicker,
+            .read_buffer_snapshot = builtinReadBufferSnapshot,
+            .free_buffer_snapshot = builtinFreeBufferSnapshot,
+            .begin_buffer_edit = builtinBeginBufferEdit,
+            .read_buffer_selection = builtinReadBufferSelection,
+            .workspace_info = builtinWorkspaceInfo,
+            .read_file = builtinReadFile,
+            .free_bytes = builtinFreeBytes,
+            .syntax_node_at_cursor = builtinSyntaxNodeAtCursor,
+            .syntax_fold_range = builtinSyntaxFoldRange,
+            .syntax_enclosing_scope = builtinSyntaxEnclosingScope,
+            .syntax_indent_for_row = builtinSyntaxIndentForRow,
+            .syntax_text_object_range = builtinSyntaxTextObjectRange,
+            .request_definition = builtinRequestDefinition,
+            .request_references = builtinRequestReferences,
+            .request_rename = builtinRequestRename,
+            .request_completion = builtinRequestCompletion,
+            .request_hover = builtinRequestHover,
+            .request_code_action = builtinRequestCodeAction,
+            .request_semantic_tokens = builtinRequestSemanticTokens,
         };
     }
 
@@ -6563,7 +7073,10 @@ pub const App = struct {
             \\  :tabonly       keep only the current tab
             \\  :tabmove N     move current tab to index N
             \\  :refresh-sources refresh picker and diagnostics sources
+            \\  :lsp ACTION      issue an LSP request (definition, hover, completion, references, rename, code-action, semantic-tokens)
             \\  :plugins        show loaded plugin manifests
+            \\  :help plugin-pane  show plugin pane API reference
+            \\  :help plugin-decorations  show plugin decoration API reference
             \\  :vimgrep /pat/ [path] search files for a pattern
             \\  :pickgrep /pat/ [path] search files into the picker
             \\  :files [path]   list files into the picker
@@ -6584,7 +7097,7 @@ pub const App = struct {
             \\  Ctrl+w w      switch windows
             \\  Ctrl+w q      quit a window
             \\  Ctrl+w T      move split into its own tab
-            \\  Normal mode   motions compose with operators and text objects
+            \\  Normal mode   motions compose with operators and text objects; Zig block objects prefer Tree-sitter
             \\                examples: dw, ciw, d$, y$, VG
             \\  Normal mode   line anchors: 0 ^ $ and g0 g^ g$
             \\  Normal mode   local find motions: f/F/t/T with ; and ,
@@ -6621,9 +7134,230 @@ fn builtinRegisterCommand(ctx: *anyopaque, name: []const u8, description: []cons
     try app.builtins.registerExtensionCommand(name, description, handler);
 }
 
+fn builtinRegisterCommandWithContext(ctx: *anyopaque, name: []const u8, description: []const u8, handler: builtins_mod.CommandHandler, handler_ctx: *anyopaque, handler_ctx_free: ?plugin_mod.HandlerContextFreeFn) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    try app.builtins.registerExtensionCommandWithContext(name, description, handler, handler_ctx, handler_ctx_free);
+}
+
 fn builtinRegisterEvent(ctx: *anyopaque, event: []const u8, handler: builtins_mod.EventHandler) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx));
     try app.builtins.registerExtensionEvent(event, handler);
+}
+
+fn builtinRegisterEventWithContext(ctx: *anyopaque, event: []const u8, handler: builtins_mod.EventHandler, handler_ctx: *anyopaque, handler_ctx_free: ?plugin_mod.HandlerContextFreeFn) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    try app.builtins.registerExtensionEventWithContext(event, handler, handler_ctx, handler_ctx_free);
+}
+
+fn builtinSpawnJob(ctx: *anyopaque, kind: scheduler_mod.JobKind, request_generation: u64, workspace_generation: u64) anyerror!scheduler_mod.RequestHandle {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.scheduler.spawn(kind, request_generation, workspace_generation);
+}
+
+fn builtinCancelJob(ctx: *anyopaque, handle: scheduler_mod.RequestHandle) bool {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.scheduler.cancel(handle);
+}
+
+fn builtinRegisterCompletion(ctx: *anyopaque, kind: scheduler_mod.CompletionKind, handle: scheduler_mod.RequestHandle, handler: builtins_mod.AsyncResultHandler) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    try app.builtins.registerAsyncResultHandler(kind, handle, handler);
+}
+
+fn builtinAddDecoration(ctx: *anyopaque, owner: []const u8, decoration: diagnostics_mod.Decoration) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const owner_id = try app.diagnostics.registerDecorationOwner(owner);
+    const normalized: diagnostics_mod.Decoration = .{
+        .buffer_id = decoration.buffer_id,
+        .row = decoration.row,
+        .col = decoration.col,
+        .len = @max(decoration.len, 1),
+        .kind = decoration.kind,
+        // Plugin decorations come from dynamic modules; keep owned state local.
+        .source = .plugin,
+        .owner_id = 0,
+        .severity = null,
+        .text = null,
+    };
+    try app.diagnostics.addDecorationOwned(owner_id, normalized);
+}
+
+fn builtinClearDecorations(ctx: *anyopaque, owner: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const owner_id = try app.diagnostics.registerDecorationOwner(owner);
+    app.diagnostics.clearOwner(owner_id);
+}
+
+fn builtinClearBufferDecorations(ctx: *anyopaque, owner: []const u8, buffer_id: u64) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const owner_id = try app.diagnostics.registerDecorationOwner(owner);
+    app.diagnostics.clearBufferOwner(buffer_id, owner_id);
+}
+
+fn builtinSetPaneText(ctx: *anyopaque, pane_id: u64, title: []const u8, text: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    _ = try app.panes.updatePaneState(pane_id, title, text);
+}
+
+fn builtinCreatePane(ctx: *anyopaque, kind: plugin_mod.PaneKind, title: []const u8) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const id = try app.panes.open(kind, title);
+    _ = app.panes.focus(id);
+    return id;
+}
+
+fn builtinRegisterPaneType(ctx: *anyopaque, owner: []const u8, name: []const u8, handler: ?plugin_mod.PaneActionHandler) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.panes.registerPaneType(owner, name, app, handler);
+}
+
+fn builtinCreatePaneOfType(ctx: *anyopaque, type_id: u64, title: []const u8) anyerror!u64 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const id = try app.panes.createPaneOfType(type_id, title);
+    _ = app.panes.focus(id);
+    return id;
+}
+
+fn builtinUpdatePaneState(ctx: *anyopaque, pane_id: u64, title: ?[]const u8, body: ?[]const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    _ = try app.panes.updatePaneState(pane_id, title, body);
+}
+
+fn builtinTriggerPaneAction(ctx: *anyopaque, pane_id: u64, action: pane_mod.PaneAction, payload: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    if (!app.panes.triggerPaneAction(pane_id, action, payload)) return error.NotFound;
+}
+
+fn builtinFocusPane(ctx: *anyopaque, pane_id: u64) bool {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.panes.focus(pane_id);
+}
+
+    fn builtinOpenPicker(ctx: *anyopaque, title: []const u8, query: []const u8) anyerror!void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        try app.openPluginPicker(title, query);
+    }
+
+    fn builtinSetPickerItems(ctx: *anyopaque, items: []const listpane_mod.Item) anyerror!void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        try app.setPluginPickerItems(items);
+    }
+
+    fn builtinAppendPickerItem(ctx: *anyopaque, item: listpane_mod.Item) anyerror!void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        try app.appendPluginPickerItem(item);
+    }
+
+    fn builtinSetPickerPreview(ctx: *anyopaque, preview: ?[]const u8) anyerror!void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        try app.setPluginPickerPreview(preview);
+    }
+
+    fn builtinCancelPicker(ctx: *anyopaque) void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        app.cancelPluginPicker();
+    }
+
+    fn builtinReadBufferSnapshot(ctx: *anyopaque, buffer_id: u64) anyerror!buffer_mod.ReadSnapshot {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        return try app.readBufferSnapshot(buffer_id);
+    }
+
+fn builtinFreeBufferSnapshot(ctx: *anyopaque, snapshot: buffer_mod.ReadSnapshot) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    app.freeBufferSnapshot(snapshot);
+}
+
+fn builtinBeginBufferEdit(ctx: *anyopaque, buffer_id: u64) anyerror!buffer_mod.EditTransaction {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.beginBufferEdit(buffer_id);
+}
+
+fn builtinReadBufferSelection(ctx: *anyopaque, buffer_id: u64) anyerror!?buffer_mod.Selection {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.selectionForBuffer(buffer_id);
+}
+
+fn builtinWorkspaceInfo(ctx: *anyopaque) anyerror!plugin_mod.WorkspaceInfo {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.workspaceInfo();
+}
+
+fn builtinReadFile(ctx: *anyopaque, path: []const u8) anyerror![]u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const resolved = try std.fs.path.resolve(app.allocator, &[_][]const u8{ app.workspace.root_path, path });
+    defer app.allocator.free(resolved);
+    if (!std.mem.eql(u8, resolved, app.workspace.root_path)) {
+        if (resolved.len <= app.workspace.root_path.len) return error.AccessDenied;
+        if (!std.mem.eql(u8, resolved[0..app.workspace.root_path.len], app.workspace.root_path)) return error.AccessDenied;
+        if (resolved[app.workspace.root_path.len] != std.fs.path.sep) return error.AccessDenied;
+    }
+    return try std.fs.cwd().readFileAlloc(app.allocator, resolved, 1 << 26);
+}
+
+fn builtinFreeBytes(ctx: *anyopaque, bytes: []u8) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    app.freeBytes(bytes);
+}
+
+fn builtinSyntaxNodeAtCursor(ctx: *anyopaque, buffer_id: u64) anyerror!?syntax_mod.Node {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.syntaxNodeAtCursor(buffer_id);
+}
+
+fn builtinSyntaxFoldRange(ctx: *anyopaque, buffer_id: u64) anyerror!?syntax_mod.FoldRange {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.syntaxFoldRange(buffer_id);
+}
+
+fn builtinSyntaxEnclosingScope(ctx: *anyopaque, buffer_id: u64) anyerror!?syntax_mod.FoldRange {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.syntaxEnclosingScope(buffer_id);
+}
+
+fn builtinSyntaxIndentForRow(ctx: *anyopaque, buffer_id: u64, row: usize) anyerror!usize {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.syntaxIndentForBufferRow(buffer_id, row);
+}
+
+fn builtinSyntaxTextObjectRange(ctx: *anyopaque, buffer_id: u64, inner: bool) anyerror!?syntax_mod.TextRange {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.syntaxTextObjectRange(buffer_id, inner);
+}
+
+fn builtinRequestDefinition(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestDefinition(payload);
+}
+
+fn builtinRequestReferences(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestReferences(payload);
+}
+
+fn builtinRequestRename(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestRename(payload);
+}
+
+fn builtinRequestCompletion(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestCompletion(payload);
+}
+
+fn builtinRequestHover(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestHover(payload);
+}
+
+fn builtinRequestCodeAction(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestCodeAction(payload);
+}
+
+fn builtinRequestSemanticTokens(ctx: *anyopaque, payload: []const u8) anyerror!scheduler_mod.RequestHandle {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return try app.lspRequestSemanticTokens(payload);
 }
 
 fn testInteractiveCommandHook(app: *App, argv: []const []const u8) bool {
@@ -6651,6 +7385,16 @@ fn makeTestApp(allocator: std.mem.Allocator, text: []const u8) !App {
     try buf.setText(text);
     try app.buffers.append(buf);
     app.active_index = 0;
+    return app;
+}
+
+fn makeTestAppWithFiletype(allocator: std.mem.Allocator, text: []const u8, filetype: []const u8) !App {
+    var app = try makeTestApp(allocator, text);
+    errdefer app.deinit();
+    var buf = app.activeBuffer();
+    buf.allocator.free(buf.filetype);
+    buf.filetype = try buf.allocator.dupe(u8, filetype);
+    app.syncActiveSyntax();
     return app;
 }
 
@@ -6945,19 +7689,28 @@ test "plugin detail pane shows manifest metadata" {
 
     try std.testing.expect(app.plugin_details_pane_id != null);
     const detail_pane_id = app.plugin_details_pane_id.?;
+    var saw_schema = false;
     var saw_version = false;
+    var saw_api = false;
+    var saw_runtime = false;
     var saw_source = false;
     var saw_state = false;
     var saw_caps = false;
     for (app.panes.panes.items) |pane| {
         if (pane.id != detail_pane_id) continue;
+        saw_schema = std.mem.indexOf(u8, pane.streaming.items, "schema: v1") != null;
         saw_version = std.mem.indexOf(u8, pane.streaming.items, "version: 0.1.0") != null;
+        saw_api = std.mem.indexOf(u8, pane.streaming.items, "api: v1") != null;
+        saw_runtime = std.mem.indexOf(u8, pane.streaming.items, "runtime: native") != null;
         saw_source = std.mem.indexOf(u8, pane.streaming.items, "source: filesystem") != null;
         saw_state = std.mem.indexOf(u8, pane.streaming.items, "state: loaded") != null;
         saw_caps = std.mem.indexOf(u8, pane.streaming.items, "capabilities:") != null;
         break;
     }
+    try std.testing.expect(saw_schema);
     try std.testing.expect(saw_version);
+    try std.testing.expect(saw_api);
+    try std.testing.expect(saw_runtime);
     try std.testing.expect(saw_source);
     try std.testing.expect(saw_state);
     try std.testing.expect(saw_caps);
@@ -7059,6 +7812,69 @@ test "plugin detail pane refresh resets stale row selection" {
     }
     try std.testing.expect(saw_manifest);
     try std.testing.expect(!saw_stale_runnable);
+}
+
+test "plugins command produces bounded overlay content for rendering" {
+    var app = try makeTestApp(std.testing.allocator, "hello world");
+    defer app.deinit();
+
+    try app.builtins.registerExtensionCommand("hello-plugin", "announce that the hello plugin is loaded", pluginCommandSmoke);
+    app.command_buffer.clearRetainingCapacity();
+    try app.command_buffer.appendSlice(":plugins");
+    try app.executeCommand();
+
+    try std.testing.expect(app.plugins_pane_id != null);
+    const pane_id = app.plugins_pane_id.?;
+    const pane = app.findPaneById(pane_id).?;
+    try std.testing.expect(std.mem.indexOf(u8, pane.streaming.items, "hello [filesystem]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pane.streaming.items, "cmd hello-plugin") != null);
+
+    var backing: [1024]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&backing);
+    try app.renderTextOverlayPane(stream.writer(), 32, 2, 4, pane.title, pane.streaming.items);
+
+    const rendered = stream.getWritten();
+    try std.testing.expect(rendered.len < backing.len);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, " plugins") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "hello [filesystem]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "cmd hello-plugin") != null);
+}
+
+test "picker pane rendering stays bounded with empty results" {
+    var app = try makeTestApp(std.testing.allocator, "hello world");
+    defer app.deinit();
+
+    app.picker.setState(.loading);
+
+    var backing: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&backing);
+    try app.renderPickerPane(stream.writer(), 8, 2, 3);
+
+    const rendered = stream.getWritten();
+    try std.testing.expect(rendered.len < backing.len);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[2;1H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[3;1H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "󰌑") != null);
+}
+
+test "picker pane item rows clip and pad within width" {
+    var app = try makeTestApp(std.testing.allocator, "hello world");
+    defer app.deinit();
+
+    try app.picker.setItems(&.{
+        .{ .id = 1, .label = "alpha", .detail = "first item" },
+    });
+    app.picker.setState(.ready);
+
+    var backing: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&backing);
+    try app.renderPickerPane(stream.writer(), 16, 2, 2);
+
+    const rendered = stream.getWritten();
+    try std.testing.expect(rendered.len < backing.len);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "first item") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[0m") != null);
 }
 
 test "command saveas writes the buffer and updates the path" {
@@ -7233,6 +8049,20 @@ test "exact multi-key bindings execute once their sequence is complete" {
     try pressNormalKeys(&app, "dd");
     try std.testing.expectEqual(@as(usize, 1), app.activeBuffer().lineCount());
     try std.testing.expectEqualStrings("two", app.activeBuffer().currentLine());
+}
+
+test "linewise delete keeps the viewport stable" {
+    var app = try makeTestApp(std.testing.allocator, "one\ntwo\nthree\nfour");
+    defer app.deinit();
+
+    app.last_render_height = 3;
+    app.activeBuffer().scroll_row = 1;
+    setCursor(&app, 1, 0);
+
+    try pressNormalKeys(&app, "dd");
+    try std.testing.expectEqual(@as(usize, 1), app.activeBuffer().scroll_row);
+    try std.testing.expectEqual(@as(usize, 3), app.activeBuffer().lineCount());
+    try std.testing.expectEqualStrings("three", app.activeBuffer().currentLine());
 }
 
 test "cursor motion keys move within the buffer" {
@@ -7979,6 +8809,79 @@ test "refresh sources reruns the active picker search" {
     try std.testing.expectEqual(@as(usize, 2), app.picker.items.items.len);
 }
 
+test "plugin picker host can open update preview and cancel" {
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    const host = app.builtinHost();
+    try host.openPicker("plugin picker", "query");
+    try host.setPickerItems(&.{
+        .{ .id = 1, .label = "alpha", .detail = "first item" },
+        .{ .id = 2, .label = "beta", .detail = "second item" },
+    });
+    try host.setPickerPreview("preview text");
+
+    try std.testing.expect(app.picker_pane_id != null);
+    try std.testing.expectEqualStrings("query", app.picker.query.items);
+    try std.testing.expectEqual(@as(usize, 2), app.picker.items.items.len);
+    try std.testing.expect(app.picker.preview != null);
+    try std.testing.expectEqualStrings("preview text", app.picker.preview.?);
+    if (app.picker_pane_id) |pane_id| {
+        var found_title = false;
+        for (app.panes.panes.items) |pane| {
+            if (pane.id == pane_id) {
+                found_title = std.mem.indexOf(u8, pane.title, "plugin picker") != null;
+            }
+        }
+        try std.testing.expect(found_title);
+    }
+
+    host.cancelPicker();
+    try std.testing.expectEqual(@as(usize, 0), app.picker.items.items.len);
+    try std.testing.expectEqual(listpane_mod.SourceState.idle, app.picker.state);
+}
+
+test "plugin host can create and update a custom pane" {
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    const host = app.builtinHost();
+    const pane_id = try host.createPane(.custom, "plugin pane");
+    try std.testing.expect(host.focusPane(pane_id));
+    try host.setPaneText(pane_id, "plugin pane", "hello pane");
+
+    var found = false;
+    for (app.panes.panes.items) |pane| {
+        if (pane.id != pane_id) continue;
+        found = true;
+        try std.testing.expectEqualStrings("plugin pane", pane.title);
+        try std.testing.expectEqualStrings("hello pane", pane.streaming.items);
+    }
+    try std.testing.expect(found);
+    try std.testing.expectEqual(@as(?u64, pane_id), app.panes.focusedPaneId());
+}
+
+test "plugin host can register a pane type and update its state" {
+    var app = try makeTestApp(std.testing.allocator, "start");
+    defer app.deinit();
+
+    var host = app.builtinHost();
+    host.pane_owner = "plugin-hello";
+    const type_id = try host.registerPaneType("detail", null);
+    const pane_id = try host.createPaneOfType(type_id, "plugin pane");
+    try host.updatePaneState(pane_id, "plugin pane", "hello pane");
+
+    var found = false;
+    for (app.panes.panes.items) |pane| {
+        if (pane.id != pane_id) continue;
+        found = true;
+        try std.testing.expectEqualStrings("plugin pane", pane.title);
+        try std.testing.expectEqualStrings("hello pane", pane.streaming.items);
+    }
+    try std.testing.expect(found);
+    try std.testing.expectEqual(@as(?u64, pane_id), app.panes.focusedPaneId());
+}
+
 test "diagnostics pane opens and reflects diagnostics counts" {
     var app = try makeTestApp(std.testing.allocator, "start");
     defer app.deinit();
@@ -8378,8 +9281,18 @@ test "reverse search uses ? and repeats with n and N" {
     try pressNormalKeys(&app, "n");
     try std.testing.expectEqual(@as(usize, 0), app.activeBuffer().cursor.col);
 
-    try pressNormalKeys(&app, "N");
+    try pressNormalKeys(&app, "n");
     try std.testing.expectEqual(@as(usize, 8), app.activeBuffer().cursor.col);
+
+    try app.handleNormalByte(0x1b);
+    try std.testing.expect(app.activeSearchHighlight(true) == null);
+    const before_cancel = app.activeBuffer().cursor.col;
+
+    try pressNormalKeys(&app, "n");
+    try std.testing.expectEqual(before_cancel, app.activeBuffer().cursor.col);
+
+    try pressNormalKeys(&app, "N");
+    try std.testing.expectEqual(before_cancel, app.activeBuffer().cursor.col);
 }
 
 test "visual binding checklist tracks verified and todo entries" {
@@ -8469,6 +9382,44 @@ test "visual text objects cover paired delimiters" {
     try expectVisualTextObjectYank("<tag>body</tag>", 0, 0, "i<", "tag");
     try expectVisualTextObjectYank("<tag>body</tag>", 0, 0, "a>", "<tag>");
     try expectVisualTextObjectYank("<tag>body</tag>", 0, 0, "i>", "tag");
+}
+
+test "visual text objects prefer tree-sitter blocks in zig buffers" {
+    var app = try makeTestAppWithFiletype(std.testing.allocator, "pub fn demo() void {\n    const value = 1;\n}\n", "zig");
+    defer app.deinit();
+
+    setCursor(&app, 1, 10);
+        const snapshot = try app.activeBuffer().readSnapshot(app.selectionForBuffer(app.activeBuffer().id));
+    defer app.activeBuffer().freeReadSnapshot(snapshot);
+    const expected_range = app.syntax.textObjectRange(snapshot, true) orelse return error.TestExpected;
+
+    try app.handleNormalByte('v');
+    try app.handleVisualByte('i');
+    try app.handleVisualByte('{');
+    try app.handleVisualByte('y');
+
+    const expected = try app.selectedText(expected_range.start, expected_range.end);
+    defer app.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, app.registers.get('"').?);
+}
+
+test "zig open line actions use syntax-aware indentation" {
+    var app = try makeTestAppWithFiletype(std.testing.allocator, "pub fn demo() void {\n}\n", "zig");
+    defer app.deinit();
+
+    const snapshot = try app.activeBuffer().readSnapshot(app.selectionForBuffer(app.activeBuffer().id));
+    defer app.activeBuffer().freeReadSnapshot(snapshot);
+    const expected_indent = app.syntax.indentForRow(snapshot, 1);
+
+    setCursor(&app, 0, app.activeBuffer().lines.items[0].len);
+    try app.performNormalAction(.open_below, 1);
+
+    const blank = app.activeBuffer().lines.items[1];
+    var actual_indent: usize = 0;
+    while (actual_indent < blank.len and blank[actual_indent] == ' ') : (actual_indent += 1) {}
+
+    try std.testing.expectEqual(expected_indent, actual_indent);
+    try std.testing.expectEqual(.insert, app.mode);
 }
 
 test "visual text objects cover quotes and backticks" {
@@ -8675,6 +9626,8 @@ test "search and visual highlights compute the right spans" {
     app.clearSearchPreview();
     app.mode = .normal;
     try std.testing.expectEqualStrings("be", app.activeSearchHighlight(true).?);
+    try app.handleNormalByte(0x1b);
+    try std.testing.expect(app.activeSearchHighlight(true) == null);
 
     app.visual_mode = .character;
     app.visual_anchor = .{ .row = 0, .col = 1 };
@@ -8941,6 +9894,30 @@ test "example leader bindings dispatch end to end" {
     try force_quit_app.activeBuffer().insertByte('!');
     try pressNormalKeys(&force_quit_app, " Q");
     try std.testing.expect(force_quit_app.should_quit);
+
+    const home_dir = try std.process.getEnvVarOwned(std.testing.allocator, "HOME");
+    defer std.testing.allocator.free(home_dir);
+    const sample_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ home_dir, "Desktop", "test.md" });
+    defer std.testing.allocator.free(sample_path);
+    const sample_path_z = try std.testing.allocator.dupeZ(u8, sample_path);
+    defer std.testing.allocator.free(sample_path_z);
+
+    const args = [_][:0]const u8{
+        "beam",
+        sample_path_z,
+        "--config",
+        "examples/beam.toml",
+    };
+    var config_app = try App.init(std.testing.allocator, args[0..]);
+    defer config_app.deinit();
+    var render_buf = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer render_buf.deinit();
+    try config_app.renderPane(render_buf.writer(), config_app.activeBuffer(), 0, 80, 24, true);
+    try config_app.handleNormalByte(':');
+    try config_app.handleByte('q', std.fs.File.stdin());
+    try config_app.handleByte('\n', std.fs.File.stdin());
+    config_app.syncActiveSyntax();
+    try std.testing.expect(config_app.should_quit);
 
     var split_app = try makeTestApp(std.testing.allocator, "left");
     defer split_app.deinit();

@@ -11,6 +11,7 @@ Beam aims to be a fast editor for the terminal:
 - built-in modules can register commands, react to events, and update editor state
 - QuickJS plugins can extend the editor through a small native bridge
 - search, picker, diagnostics, and workspace state all live in the editor runtime
+- the editor also exposes `:lsp` request commands for definition, hover, completion, references, rename, code actions, and semantic tokens
 
 ## Repository Layout
 
@@ -27,7 +28,8 @@ Beam aims to be a fast editor for the terminal:
 - `src/lsp.zig` - language-server client integration
 - `src/workspace.zig` - workspace/session persistence
 - `examples/beam.toml` - example configuration
-- `examples/plugins/hello` - sample plugin manifest and implementation
+- `examples/plugins/hello` - sample native plugin manifest and implementation
+- `examples/plugins/hello-wasm` - sample WASM plugin manifest and implementation
 
 ## Build And Run
 
@@ -97,6 +99,19 @@ Beam's normal mode is built around composable motions and edits:
 
 Beam keeps the motion and editing grammar intentionally small, but the goal is for the pieces above to compose cleanly.
 
+For Zig buffers, Beam also uses Tree-sitter syntax data where it helps the editor stay structural:
+
+- block text objects prefer parser-backed ranges when available
+- fold creation prefers Tree-sitter fold queries before falling back to paragraph folds
+- open-line actions use syntax-aware indentation when the parser can provide it
+- the status bar shows whether Zig parsing is running in fallback, parser, or parser-plus-queries mode
+
+Beam keeps the Tree-sitter integration self-contained:
+
+- the Tree-sitter runtime and Zig grammar are vendored under `vendor/` and built directly
+- Tree-sitter query files are copied into the Zig build and embedded into the executable
+- the editor still falls back to its non-parser behavior when parser state or query data is unavailable
+
 ## Configuration
 
 The example config in `examples/beam.toml` shows the supported top-level sections:
@@ -132,11 +147,62 @@ Built-ins are compiled with Beam and can:
 
 ## Plugins
 
-Plugins are loaded from the configured plugin root and use the QuickJS bridge exposed by `src/plugin.zig`.
+Plugins are loaded from the configured plugin root and use the native host bridge exposed by `src/plugin.zig`.
 
 - the example plugin lives in `examples/plugins/hello`
+- the example wasm plugin lives in `examples/plugins/hello-wasm`
 - the sample config points `[plugins].root` at `zig-out/plugins`
 - `zig build run -- --config examples/beam.toml` enables the sample `hello` plugin
+
+Plugin manifests now use an explicit schema:
+
+```toml
+[plugin]
+name = "hello"
+version = "0.1.0"
+manifest_version = 1
+api_version = 1
+runtime = "native"
+
+[capabilities]
+command = true
+event = true
+status = true
+pane = true
+decoration = true
+```
+
+- `manifest_version` versions the manifest schema itself
+- `api_version` versions the Beam host API expected by the plugin
+- `runtime` selects the plugin tier: `native` is the default dynamic library path, while `wasm` is recognized and reported cleanly as unavailable in builds without a WASM runtime
+- `zig build run -Dwasm-plugins=true -- --help` enables the embedded Wasmtime backend and stages the sample `hello-wasm` plugin artifact
+- capability keys are validated strictly; unknown capability names reject the manifest
+
+Supported capability keys in the current host surface are:
+
+- `command`
+- `event`
+- `status`
+- `buffer_read`
+- `buffer_edit`
+- `jobs`
+- `workspace`
+- `diagnostics`
+- `picker`
+- `pane`
+- `fs_read`
+- `tree_query`
+- `decoration`
+- `lsp`
+- `job_results`
+
+The current WASM host bridge is intentionally narrower than the native one. Today the Wasmtime-backed runtime supports plugins that use:
+
+- `command`
+- `event`
+- `status`
+
+The `hello-wasm` sample shows the current ABI shape: plugins register commands and events through host imports, export dispatcher entrypoints for command and event delivery, and exchange strings through the module's linear memory.
 
 ## Contributing
 

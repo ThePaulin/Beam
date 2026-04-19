@@ -2,6 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const listpane_mod = @import("listpane.zig");
 const plugin_mod = @import("plugin.zig");
+const plugin_wasm_mod = if (plugin_mod.wasm_runtime_enabled) @import("plugin_wasm.zig") else struct {
+    pub const Runtime = opaque {};
+};
 
 pub const EntrySource = enum {
     builtin,
@@ -10,6 +13,7 @@ pub const EntrySource = enum {
 
 pub const EntryState = enum {
     loaded,
+    disabled,
     unknown,
     incompatible,
 };
@@ -23,7 +27,9 @@ pub const Entry = struct {
 
 const LoadedPlugin = struct {
     name: []u8,
-    lib: std.DynLib,
+    host: plugin_mod.Host,
+    lib: ?std.DynLib = null,
+    wasm_runtime: ?*plugin_wasm_mod.Runtime = null,
     deinit_fn: ?plugin_mod.PluginDeinitFn = null,
 };
 
@@ -82,16 +88,18 @@ pub const Catalog = struct {
 
     pub fn statusText(self: *const Catalog, allocator: std.mem.Allocator) ![]u8 {
         var loaded: usize = 0;
+        var disabled: usize = 0;
         var unknown: usize = 0;
         var incompatible: usize = 0;
         for (self.entries.items) |entry| {
             switch (entry.state) {
                 .loaded => loaded += 1,
+                .disabled => disabled += 1,
                 .unknown => unknown += 1,
                 .incompatible => incompatible += 1,
             }
         }
-        return try std.fmt.allocPrint(allocator, "plugins {d} loaded / {d} unknown / {d} incompatible", .{ loaded, unknown, incompatible });
+        return try std.fmt.allocPrint(allocator, "plugins {d} loaded / {d} disabled / {d} unknown / {d} incompatible", .{ loaded, disabled, unknown, incompatible });
     }
 
     pub fn fillListPane(self: *const Catalog, allocator: std.mem.Allocator, pane: *listpane_mod.ListPane) !void {
@@ -178,6 +186,11 @@ pub const Catalog = struct {
                         try self.appendUnknownEntry(.filesystem, entry.name, "plugin binary not found");
                         continue;
                     },
+                    error.UnsupportedPluginRuntime => {
+                        self.freeManifest(manifest.manifest);
+                        try self.appendDisabledEntry(.filesystem, entry.name, "wasm runtime disabled");
+                        continue;
+                    },
                     error.PermissionDenied => {
                         self.freeManifest(manifest.manifest);
                         try self.appendUnknownEntry(.filesystem, entry.name, "plugin load denied");
@@ -231,6 +244,27 @@ pub const Catalog = struct {
                     .note = "incompatible plugin api version",
                 };
             },
+            error.IncompatibleManifestVersion => {
+                return .{
+                    .manifest = manifest,
+                    .state = .incompatible,
+                    .note = "incompatible plugin manifest schema",
+                };
+            },
+            error.UnsupportedPluginRuntime => {
+                return .{
+                    .manifest = manifest,
+                    .state = .disabled,
+                    .note = "wasm runtime disabled",
+                };
+            },
+            error.UnsupportedPluginCapability => {
+                return .{
+                    .manifest = manifest,
+                    .state = .unknown,
+                    .note = "unsupported wasm capability set",
+                };
+            },
             error.InvalidManifest => {
                 return .{
                     .manifest = manifest,
@@ -246,10 +280,24 @@ pub const Catalog = struct {
         const manifest = plugin_mod.Manifest{
             .name = try self.allocator.dupe(u8, name),
             .version = try self.allocator.dupe(u8, "0.0.0"),
+            .manifest_version = plugin_mod.manifest_version,
             .api_version = plugin_mod.api_version,
+            .runtime = .native,
             .capabilities = .{},
         };
         try self.appendEntry(source, manifest, .unknown, note_text);
+    }
+
+    fn appendDisabledEntry(self: *Catalog, source: EntrySource, name: []const u8, note_text: []const u8) !void {
+        const manifest = plugin_mod.Manifest{
+            .name = try self.allocator.dupe(u8, name),
+            .version = try self.allocator.dupe(u8, "0.0.0"),
+            .manifest_version = plugin_mod.manifest_version,
+            .api_version = plugin_mod.api_version,
+            .runtime = .wasm,
+            .capabilities = .{},
+        };
+        try self.appendEntry(source, manifest, .disabled, note_text);
     }
 
     fn appendManifest(self: *Catalog, source: EntrySource, manifest: plugin_mod.Manifest, state: EntryState, note_text: ?[]const u8) !void {
@@ -272,7 +320,23 @@ pub const Catalog = struct {
         try self.appendManifest(source, manifest, state, note_text);
     }
 
-    fn tryLoadFilesystemPlugin(self: *Catalog, host: *const plugin_mod.Host, plugin_root: []const u8, plugin_name: []const u8, manifest: plugin_mod.Manifest) !LoadedPlugin {
+    fn tryLoadFilesystemPlugin(self: *Catalog, host: *const plugin_mod.Host, plugin_root: []const u8, plugin_name: []const u8, manifest: plugin_mod.Manifest) anyerror!LoadedPlugin {
+        if (manifest.runtime == .wasm) {
+            if (!plugin_mod.wasm_runtime_enabled) return error.UnsupportedPluginRuntime;
+            const wasm_path = try self.resolvePluginModulePath(plugin_root, plugin_name, "plugin.wasm");
+            defer self.allocator.free(wasm_path);
+            try std.fs.cwd().access(wasm_path, .{});
+
+            var plugin_host = host.*;
+            plugin_host.decoration_owner = manifest.name;
+            plugin_host.pane_owner = manifest.name;
+            const runtime = try plugin_wasm_mod.Runtime.init(self.allocator, &plugin_host, manifest, wasm_path);
+            return .{
+                .name = try self.allocator.dupe(u8, manifest.name),
+                .host = plugin_host,
+                .wasm_runtime = runtime,
+            };
+        }
         const plugin_path = try self.resolvePluginLibraryPath(plugin_root, plugin_name);
         defer self.allocator.free(plugin_path);
 
@@ -281,11 +345,15 @@ pub const Catalog = struct {
 
         const init_fn = lib.lookup(plugin_mod.PluginInitFn, plugin_mod.InitSymbol) orelse return error.PermissionDenied;
         const deinit_fn = lib.lookup(plugin_mod.PluginDeinitFn, plugin_mod.DeinitSymbol);
-        const rc = init_fn(host);
+        var plugin_host = host.*;
+        plugin_host.decoration_owner = manifest.name;
+        plugin_host.pane_owner = manifest.name;
+        const rc = init_fn(&plugin_host);
         if (rc != 0) return error.PermissionDenied;
 
         return .{
             .name = try self.allocator.dupe(u8, manifest.name),
+            .host = plugin_host,
             .lib = lib,
             .deinit_fn = deinit_fn,
         };
@@ -293,13 +361,16 @@ pub const Catalog = struct {
 
     fn unloadAll(self: *Catalog) void {
         for (self.loaded_plugins.items) |*plugin| {
-            if (plugin.deinit_fn) |deinit_fn| {
-                if (self.host) |plugin_host| {
-                    deinit_fn(&plugin_host);
-                }
+            if (plugin_mod.wasm_runtime_enabled and plugin.wasm_runtime != null) {
+                const runtime = plugin.wasm_runtime.?;
+                runtime.deinit();
+            } else if (plugin.deinit_fn) |deinit_fn| {
+                var shutdown_host = plugin.host;
+                shutdown_host.caps = .{};
+                deinit_fn(&shutdown_host);
             }
             self.allocator.free(plugin.name);
-            plugin.lib.close();
+            if (plugin.lib) |*lib| lib.close();
         }
         self.loaded_plugins.clearRetainingCapacity();
     }
@@ -309,14 +380,23 @@ pub const Catalog = struct {
         const idx = self.loaded_plugins.items.len - 1;
         const plugin = self.loaded_plugins.items[idx];
         self.loaded_plugins.items.len = idx;
-        if (plugin.deinit_fn) |deinit_fn| {
-            if (self.host) |plugin_host| {
-                deinit_fn(&plugin_host);
-            }
+        if (plugin_mod.wasm_runtime_enabled and plugin.wasm_runtime != null) {
+            const runtime = plugin.wasm_runtime.?;
+            runtime.deinit();
+        } else if (plugin.deinit_fn) |deinit_fn| {
+            var shutdown_host = plugin.host;
+            shutdown_host.caps = .{};
+            deinit_fn(&shutdown_host);
         }
         self.allocator.free(plugin.name);
-        var lib = plugin.lib;
-        lib.close();
+        if (plugin.lib) |lib| {
+            var close_lib = lib;
+            close_lib.close();
+        }
+    }
+
+    fn resolvePluginModulePath(self: *Catalog, plugin_root: []const u8, plugin_name: []const u8, filename: []const u8) ![]u8 {
+        return try std.fs.path.join(self.allocator, &[_][]const u8{ plugin_root, plugin_name, filename });
     }
 
     fn resolvePluginLibraryPath(self: *Catalog, plugin_root: []const u8, plugin_name: []const u8) ![]u8 {
@@ -336,7 +416,9 @@ pub const Catalog = struct {
         return .{
             .name = try allocator.dupe(u8, manifest.name),
             .version = try allocator.dupe(u8, manifest.version),
+            .manifest_version = manifest.manifest_version,
             .api_version = manifest.api_version,
+            .runtime = manifest.runtime,
             .capabilities = manifest.capabilities,
         };
     }
@@ -361,7 +443,9 @@ const LoadedManifest = struct {
 const ManifestDraft = struct {
     name: ?[]const u8 = null,
     version: ?[]const u8 = null,
+    manifest_version: ?u32 = null,
     api_version: ?u32 = null,
+    runtime: plugin_mod.Runtime = .native,
     capabilities: plugin_mod.Capabilities = .{},
 };
 
@@ -370,7 +454,9 @@ fn builtinManifestForName(name: []const u8) ?plugin_mod.Manifest {
         return .{
             .name = "hello",
             .version = "0.1.0",
+            .manifest_version = plugin_mod.manifest_version,
             .api_version = plugin_mod.api_version,
+            .runtime = .native,
             .capabilities = .{ .command = true, .event = true, .status = true },
         };
     }
@@ -411,8 +497,16 @@ fn parseManifestDraft(text: []const u8, fallback_name: []const u8) !ManifestDraf
                 draft.version = try parseString(value);
                 continue;
             }
+            if (std.mem.eql(u8, key, "manifest_version")) {
+                draft.manifest_version = try parseInt(value);
+                continue;
+            }
             if (std.mem.eql(u8, key, "api_version")) {
                 draft.api_version = try parseInt(value);
+                continue;
+            }
+            if (std.mem.eql(u8, key, "runtime")) {
+                draft.runtime = try parseRuntime(value);
                 continue;
             }
         }
@@ -430,6 +524,10 @@ fn parseManifestDraft(text: []const u8, fallback_name: []const u8) !ManifestDraf
             if (std.mem.eql(u8, key, "picker")) draft.capabilities.picker = enabled else
             if (std.mem.eql(u8, key, "pane")) draft.capabilities.pane = enabled else
             if (std.mem.eql(u8, key, "fs_read")) draft.capabilities.fs_read = enabled else
+            if (std.mem.eql(u8, key, "tree_query")) draft.capabilities.tree_query = enabled else
+            if (std.mem.eql(u8, key, "decoration")) draft.capabilities.decoration = enabled else
+            if (std.mem.eql(u8, key, "lsp")) draft.capabilities.lsp = enabled else
+            if (std.mem.eql(u8, key, "job_results")) draft.capabilities.job_results = enabled else
                 return error.InvalidManifest;
             continue;
         }
@@ -447,7 +545,9 @@ fn materializeManifest(allocator: std.mem.Allocator, draft: ManifestDraft) !plug
     return .{
         .name = try allocator.dupe(u8, name),
         .version = try allocator.dupe(u8, version),
+        .manifest_version = draft.manifest_version orelse plugin_mod.manifest_version,
         .api_version = draft.api_version orelse plugin_mod.api_version,
+        .runtime = draft.runtime,
         .capabilities = draft.capabilities,
     };
 }
@@ -460,6 +560,13 @@ fn parseString(value: []const u8) ![]const u8 {
 fn parseBool(value: []const u8) !bool {
     if (std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "false")) return false;
+    return error.InvalidManifest;
+}
+
+fn parseRuntime(value: []const u8) !plugin_mod.Runtime {
+    const text = try parseString(value);
+    if (std.mem.eql(u8, text, "native")) return .native;
+    if (std.mem.eql(u8, text, "wasm")) return .wasm;
     return error.InvalidManifest;
 }
 
@@ -528,7 +635,9 @@ test "plugin catalog loads builtin and filesystem manifests" {
         \\[plugin]
         \\name = "hello"
         \\version = "0.1.0"
+        \\manifest_version = 1
         \\api_version = 1
+        \\runtime = "native"
         \\
         \\[capabilities]
         \\command = true
@@ -546,6 +655,61 @@ test "plugin catalog loads builtin and filesystem manifests" {
     try std.testing.expectEqualStrings("hello", catalog.entries.items[0].manifest.name);
     try std.testing.expectEqualStrings("hello", catalog.entries.items[1].manifest.name);
     try std.testing.expectEqual(EntryState.unknown, catalog.entries.items[1].state);
+}
+
+test "plugin catalog marks disabled wasm manifests cleanly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const old_cwd = try std.process.getCwdAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(old_cwd);
+    try tmp.dir.setAsCwd();
+    defer std.process.changeCurDir(old_cwd) catch {};
+
+    const Dummy = struct {
+        fn setStatus(ctx: *anyopaque, text: []const u8) anyerror!void {
+            _ = ctx;
+            _ = text;
+        }
+
+        fn setExtStatus(ctx: *anyopaque, text: []const u8) anyerror!void {
+            _ = ctx;
+            _ = text;
+        }
+    };
+    var host = plugin_mod.Host{
+        .ctx = undefined,
+        .caps = .{ .status = true },
+        .set_status = Dummy.setStatus,
+        .set_extension_status = Dummy.setExtStatus,
+    };
+
+    try tmp.dir.makePath("plugins/hello");
+    try tmp.dir.writeFile(.{
+        .sub_path = "plugins/hello/plugin.toml",
+        .data =
+        \\[plugin]
+        \\name = "hello"
+        \\version = "0.1.0"
+        \\manifest_version = 1
+        \\api_version = 1
+        \\runtime = "wasm"
+        \\
+        \\[capabilities]
+        \\command = true
+    });
+
+    var catalog = Catalog.init(std.testing.allocator);
+    defer catalog.deinit();
+
+    try catalog.rebuild(&host, &.{}, "plugins", &.{"hello"});
+    try std.testing.expectEqual(@as(usize, 1), catalog.entries.items.len);
+    if (plugin_mod.wasm_runtime_enabled) {
+        try std.testing.expectEqual(EntryState.unknown, catalog.entries.items[0].state);
+        try std.testing.expectEqualStrings("plugin binary not found", catalog.entries.items[0].note.?);
+    } else {
+        try std.testing.expectEqual(EntryState.disabled, catalog.entries.items[0].state);
+        try std.testing.expectEqualStrings("wasm runtime disabled", catalog.entries.items[0].note.?);
+    }
 }
 
 test "plugin catalog tracks missing filesystem entries" {

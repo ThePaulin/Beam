@@ -398,6 +398,13 @@ pub const MessageHandler = struct {
     on_message: *const fn (ctx: *anyopaque, message: ParsedMessage) anyerror!void,
 };
 
+pub const ResponseEvent = struct {
+    id: u64,
+    kind: u8,
+    has_error: bool,
+    body: []const u8,
+};
+
 pub const Transport = struct {
     ctx: *anyopaque,
     send_request: *const fn (ctx: *anyopaque, request: Request) anyerror!void,
@@ -672,15 +679,15 @@ pub const Session = struct {
         self.symbols.clearRetainingCapacity();
     }
 
-    pub fn handleMessage(self: *Session, message: ParsedMessage) !void {
+    pub fn handleMessage(self: *Session, message: ParsedMessage) !?ResponseEvent {
         if (message.kind == .notification) {
             try self.handleNotification(message);
-            return;
+            return null;
         }
         if (message.kind == .response) {
-            try self.handleResponse(message);
-            return;
+            return try self.handleResponse(message);
         }
+        return null;
     }
 
     fn handleNotification(self: *Session, message: ParsedMessage) !void {
@@ -700,8 +707,8 @@ pub const Session = struct {
         }
     }
 
-    fn handleResponse(self: *Session, message: ParsedMessage) !void {
-        const pending_index = self.findPendingRequest(message.id orelse return error.InvalidJsonRpcMessage) orelse return;
+    fn handleResponse(self: *Session, message: ParsedMessage) !?ResponseEvent {
+        const pending_index = self.findPendingRequest(message.id orelse return error.InvalidJsonRpcMessage) orelse return null;
         const pending = self.pending_requests.orderedRemove(pending_index);
         switch (pending.kind) {
             .initialize => {
@@ -720,6 +727,12 @@ pub const Session = struct {
             .symbols => try self.handleSymbolsResult(message.body),
             .definition, .references, .rename, .completion, .hover, .code_action, .semantic_tokens, .custom => {},
         }
+        return .{
+            .id = pending.id,
+            .kind = @intFromEnum(pending.kind),
+            .has_error = message.has_error,
+            .body = message.body,
+        };
     }
 
     fn findPendingRequest(self: *Session, id: u64) ?usize {
@@ -1266,7 +1279,7 @@ test "lsp session initialize and shutdown sequence" {
         .body = try std.testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"),
     };
     defer initialize_response.deinit(std.testing.allocator);
-    try session.handleMessage(initialize_response);
+    _ = try session.handleMessage(initialize_response);
     try std.testing.expect(session.initialized);
     try std.testing.expectEqual(@as(usize, 1), capture.notifications.items.len);
     try std.testing.expectEqualStrings("initialized", capture.notifications.items[0].method);
@@ -1281,7 +1294,7 @@ test "lsp session initialize and shutdown sequence" {
         .body = try std.testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"),
     };
     defer shutdown_response.deinit(std.testing.allocator);
-    try session.handleMessage(shutdown_response);
+    _ = try session.handleMessage(shutdown_response);
     try std.testing.expect(session.shutdown_acknowledged);
     try std.testing.expectEqual(@as(usize, 2), capture.notifications.items.len);
     try std.testing.expectEqualStrings("exit", capture.notifications.items[1].method);
@@ -1300,7 +1313,7 @@ test "lsp session correlates responses by request id" {
         .body = try std.testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":[{\"name\":\"alpha\",\"location\":{\"uri\":\"file:///tmp/alpha.zig\",\"range\":{\"start\":{\"line\":3,\"character\":4}}},\"kind\":\"fn\"}]}"),
     };
     defer symbols_response.deinit(std.testing.allocator);
-    try session.handleMessage(symbols_response);
+    _ = try session.handleMessage(symbols_response);
     try std.testing.expectEqual(@as(usize, 1), session.symbols.items.len);
     try std.testing.expectEqualStrings("alpha", session.symbols.items[0].label);
     try std.testing.expectEqual(@as(usize, 0), session.diagnostics.items.len);
@@ -1311,7 +1324,7 @@ test "lsp session correlates responses by request id" {
         .body = try std.testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"uri\":\"file:///tmp/alpha.zig\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":5,\"character\":6}},\"severity\":1,\"message\":\"boom\"}]}}"),
     };
     defer diagnostics_response.deinit(std.testing.allocator);
-    try session.handleMessage(diagnostics_response);
+    _ = try session.handleMessage(diagnostics_response);
     try std.testing.expectEqual(@as(usize, 1), session.diagnostics.items.len);
     try std.testing.expectEqualStrings("boom", session.diagnostics.items[0].message);
     try std.testing.expectEqual(@as(usize, 1), session.symbols.items.len);
@@ -1326,7 +1339,7 @@ test "lsp publishDiagnostics replaces diagnostics for the same path" {
         .body = try std.testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///tmp/alpha.zig\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":1,\"character\":2}},\"severity\":2,\"message\":\"first\"},{\"range\":{\"start\":{\"line\":3,\"character\":4}},\"severity\":1,\"message\":\"second\"}]}}"),
     };
     defer first.deinit(std.testing.allocator);
-    try session.handleMessage(first);
+    _ = try session.handleMessage(first);
     try std.testing.expectEqual(@as(usize, 2), session.diagnostics.items.len);
 
     var second = ParsedMessage{
@@ -1334,7 +1347,7 @@ test "lsp publishDiagnostics replaces diagnostics for the same path" {
         .body = try std.testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///tmp/alpha.zig\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":7,\"character\":8}},\"severity\":3,\"message\":\"replacement\"}]}}"),
     };
     defer second.deinit(std.testing.allocator);
-    try session.handleMessage(second);
+    _ = try session.handleMessage(second);
     try std.testing.expectEqual(@as(usize, 1), session.diagnostics.items.len);
     try std.testing.expectEqualStrings("replacement", session.diagnostics.items[0].message);
     try std.testing.expectEqualStrings("/tmp/alpha.zig", session.diagnostics.items[0].path.?);
@@ -1351,7 +1364,7 @@ test "lsp workspace symbol responses replace the symbol cache" {
         .body = try std.testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[{\"name\":\"alpha\",\"location\":{\"uri\":\"file:///tmp/alpha.zig\",\"range\":{\"start\":{\"line\":0,\"character\":0}}},\"kind\":\"fn\"}]}"),
     };
     defer first.deinit(std.testing.allocator);
-    try session.handleMessage(first);
+    _ = try session.handleMessage(first);
     try std.testing.expectEqual(@as(usize, 1), session.symbols.items.len);
     try std.testing.expectEqualStrings("alpha", session.symbols.items[0].label);
 
@@ -1362,7 +1375,7 @@ test "lsp workspace symbol responses replace the symbol cache" {
         .body = try std.testing.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":[{\"name\":\"beta\",\"location\":{\"uri\":\"file:///tmp/beta.zig\",\"range\":{\"start\":{\"line\":1,\"character\":1}}},\"kind\":\"fn\"},{\"name\":\"gamma\",\"location\":{\"uri\":\"file:///tmp/gamma.zig\",\"range\":{\"start\":{\"line\":2,\"character\":2}}},\"kind\":\"fn\"}]}"),
     };
     defer second.deinit(std.testing.allocator);
-    try session.handleMessage(second);
+    _ = try session.handleMessage(second);
     try std.testing.expectEqual(@as(usize, 2), session.symbols.items.len);
     try std.testing.expectEqualStrings("beta", session.symbols.items[0].label);
     try std.testing.expectEqualStrings("gamma", session.symbols.items[1].label);

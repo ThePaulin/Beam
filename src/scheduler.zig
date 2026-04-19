@@ -7,6 +7,23 @@ pub const JobKind = enum {
     custom,
 };
 
+pub const CompletionKind = enum {
+    job,
+    service,
+};
+
+pub const RequestHandle = struct {
+    id: u64,
+    request_generation: u64,
+    workspace_generation: u64,
+
+    pub fn matches(self: RequestHandle, other: RequestHandle) bool {
+        return self.id == other.id and
+            self.request_generation == other.request_generation and
+            self.workspace_generation == other.workspace_generation;
+    }
+};
+
 pub const JobState = enum {
     pending,
     cancelled,
@@ -51,7 +68,7 @@ pub const Scheduler = struct {
         self.completed.deinit();
     }
 
-    pub fn spawn(self: *Scheduler, kind: JobKind, request_generation: u64, workspace_generation: u64) !u64 {
+    pub fn spawn(self: *Scheduler, kind: JobKind, request_generation: u64, workspace_generation: u64) !RequestHandle {
         const id = self.next_id;
         self.next_id += 1;
         try self.jobs.append(.{
@@ -60,12 +77,16 @@ pub const Scheduler = struct {
             .request_generation = request_generation,
             .workspace_generation = workspace_generation,
         });
-        return id;
+        return .{
+            .id = id,
+            .request_generation = request_generation,
+            .workspace_generation = workspace_generation,
+        };
     }
 
-    pub fn cancel(self: *Scheduler, job_id: u64) bool {
+    pub fn cancel(self: *Scheduler, handle: RequestHandle) bool {
         for (self.jobs.items) |*job| {
-            if (job.id == job_id and job.state == .pending) {
+            if (job.id == handle.id and Scheduler.isFresh(job.*, handle.request_generation, handle.workspace_generation)) {
                 job.state = .cancelled;
                 return true;
             }
@@ -91,6 +112,19 @@ pub const Scheduler = struct {
         return false;
     }
 
+    pub fn completeFresh(self: *Scheduler, job_id: u64, request_generation: u64, workspace_generation: u64, payload: []const u8, success: bool) !bool {
+        for (self.jobs.items) |*job| {
+            if (job.id != job_id) continue;
+            if (!Scheduler.isFresh(job.*, request_generation, workspace_generation)) return false;
+            return try self.complete(job_id, payload, success);
+        }
+        return false;
+    }
+
+    pub fn completeHandle(self: *Scheduler, handle: RequestHandle, payload: []const u8, success: bool) !bool {
+        return try self.completeFresh(handle.id, handle.request_generation, handle.workspace_generation, payload, success);
+    }
+
     pub fn popCompleted(self: *Scheduler) ?Result {
         return self.completed.pop();
     }
@@ -111,22 +145,31 @@ test "scheduler cancel and stale checks" {
     var scheduler = Scheduler.init(std.testing.allocator);
     defer scheduler.deinit();
 
-    const job_id = try scheduler.spawn(.search, 4, 7);
+    const handle = try scheduler.spawn(.search, 4, 7);
     try std.testing.expect(Scheduler.isFresh(scheduler.jobs.items[0], 4, 7));
-    try std.testing.expect(scheduler.cancel(job_id));
+    try std.testing.expect(scheduler.cancel(handle));
     try std.testing.expect(!Scheduler.isFresh(scheduler.jobs.items[0], 4, 7));
-    try std.testing.expect(!(try scheduler.complete(job_id, "ignored", true)));
+    try std.testing.expect(!(try scheduler.complete(handle.id, "ignored", true)));
 }
 
 test "scheduler completion records payloads" {
     var scheduler = Scheduler.init(std.testing.allocator);
     defer scheduler.deinit();
 
-    const job_id = try scheduler.spawn(.grep, 10, 20);
-    try std.testing.expect(try scheduler.complete(job_id, "done", true));
+    const handle = try scheduler.spawn(.grep, 10, 20);
+    try std.testing.expect(try scheduler.completeHandle(handle, "done", true));
     const result = scheduler.popCompleted() orelse return error.TestExpected;
-    try std.testing.expectEqual(job_id, result.job_id);
+    try std.testing.expectEqual(handle.id, result.job_id);
     try std.testing.expectEqualStrings("done", result.payload);
     try std.testing.expect(result.success);
     std.testing.allocator.free(result.payload);
+}
+
+test "scheduler completeFresh rejects stale generations" {
+    var scheduler = Scheduler.init(std.testing.allocator);
+    defer scheduler.deinit();
+
+    const handle = try scheduler.spawn(.symbols, 3, 9);
+    try std.testing.expect(!(try scheduler.completeFresh(handle.id, 4, 9, "stale", true)));
+    try std.testing.expect(try scheduler.completeHandle(handle, "fresh", true));
 }
