@@ -183,6 +183,10 @@ pub const App = struct {
     macro_playing: bool = false,
     macros: [26]?[]u8 = [_]?[]u8{null} ** 26,
     last_render_height: usize = 24,
+    last_render_width: usize = 0,
+    last_content_height: usize = 0,
+    last_pane_height: usize = 24,
+    needs_full_clear: bool = true,
     pending_prefix: PendingPrefix = .none,
     pending_register: ?u8 = null,
     insert_register_prefix: bool = false,
@@ -1256,6 +1260,19 @@ pub const App = struct {
 
         if (byte == 0x1b or byte == 0x03) {
             self.resetNormalInput();
+            if (self.plugins_pane_id != null) {
+                self.plugins_pane_id = null;
+                self.plugin_details_pane_id = null;
+                self.plugins_list.clear();
+            }
+            if (self.diagnostics_pane_id != null) {
+                self.diagnostics_pane_id = null;
+                self.diagnostics_list.clear();
+            }
+            if (self.picker_pane_id != null) {
+                self.picker_pane_id = null;
+                self.picker.clear();
+            }
             if (self.search_highlight != null or self.search_preview_highlight != null) {
                 self.clearSearchPreview();
                 self.clearSearchHighlight();
@@ -3500,7 +3517,7 @@ pub const App = struct {
             buf.scroll_row = 0;
             return;
         }
-        const height = self.last_render_height;
+        const height = self.last_pane_height;
         if (height == 0 or height >= line_count) {
             buf.scroll_row = 0;
             return;
@@ -3516,7 +3533,7 @@ pub const App = struct {
 
     fn setViewport(self: *App, mode: enum { top, middle, bottom }) void {
         const buf = self.activeBuffer();
-        const height = self.last_render_height;
+        const height = self.last_pane_height;
         const line_count = buf.lineCount();
         const cursor_row = buf.cursor.row;
         const target = switch (mode) {
@@ -4121,9 +4138,9 @@ pub const App = struct {
 
     fn scrollViewport(self: *App, down: bool, count: usize) !void {
         const buf = self.activeBuffer();
-        const step = @max(@as(usize, 1), self.last_render_height / 2);
+        const step = @max(@as(usize, 1), self.last_pane_height / 2);
         const amount = step * count;
-        const height = self.last_render_height;
+        const height = self.last_pane_height;
         const max_scroll = if (buf.lineCount() > height) buf.lineCount() - height else 0;
         if (down) {
             buf.scroll_row = @min(buf.scroll_row +| amount, max_scroll);
@@ -6082,13 +6099,6 @@ pub const App = struct {
     fn render(self: *App) !void {
         const stdout_file = std.fs.File.stdout();
         const size = terminal_mod.size(stdout_file);
-        var out_buf: [4096]u8 = undefined;
-        var out_writer = stdout_file.writer(&out_buf);
-        const writer = &out_writer.interface;
-        try terminal_mod.clear(writer);
-        try terminal_mod.showCursor(writer);
-        try terminal_mod.setCursorShape(writer, self.mode == .normal);
-
         const show_bottom_bar = self.config.status_bar or self.mode == .command or self.mode == .search;
         const render_height = if (show_bottom_bar and size.rows > 0) size.rows - 1 else size.rows;
         var diagnostics_rows: usize = 0;
@@ -6124,7 +6134,20 @@ pub const App = struct {
         }
         const overlay_rows = plugins_rows + plugin_details_rows + diagnostics_rows + picker_rows;
         const content_height = if (render_height > overlay_rows) render_height - overlay_rows else 0;
-        self.last_render_height = content_height;
+
+        var out_buf: [4096]u8 = undefined;
+        var out_writer = stdout_file.writer(&out_buf);
+        const writer = &out_writer.interface;
+        if (self.needs_full_clear or size.cols != self.last_render_width or size.rows != self.last_render_height or content_height != self.last_content_height) {
+            try terminal_mod.clear(writer);
+            self.needs_full_clear = false;
+        }
+        self.last_render_width = size.cols;
+        self.last_render_height = size.rows;
+        self.last_content_height = content_height;
+        self.last_pane_height = content_height;
+        try terminal_mod.hideCursor(writer);
+        try terminal_mod.setCursorShape(writer, self.mode == .normal);
         const has_split = self.split_index != null and size.cols > 1;
         const separator_width: usize = if (has_split) 1 else 0;
         const available_width = if (size.cols > separator_width) size.cols - separator_width else size.cols;
@@ -6208,6 +6231,7 @@ pub const App = struct {
         if (cursor_row > 0 and cursor_col > 0) {
             try writer.print("\x1b[{d};{d}H", .{ cursor_row, base_col + cursor_col - 1 });
         }
+        try terminal_mod.showCursor(writer);
         try writer.flush();
     }
 
@@ -8146,6 +8170,7 @@ test "linewise delete keeps the viewport stable" {
     defer app.deinit();
 
     app.last_render_height = 3;
+    app.last_pane_height = 3;
     app.activeBuffer().scroll_row = 1;
     setCursor(&app, 1, 0);
 
@@ -10051,6 +10076,7 @@ test "viewport commands update scroll position" {
     defer app.deinit();
 
     app.last_render_height = 3;
+    app.last_pane_height = 3;
     setCursor(&app, 3, 0);
     try pressNormalKeys(&app, "zt");
     try std.testing.expectEqual(@as(usize, 3), app.activeBuffer().scroll_row);
@@ -10065,6 +10091,7 @@ test "viewport scroll clamps to the last full screen" {
     defer app.deinit();
 
     app.last_render_height = 3;
+    app.last_pane_height = 3;
     setCursor(&app, 4, 0);
     try app.performNormalAction(.viewport_bottom, 1);
     try std.testing.expectEqual(@as(usize, 2), app.activeBuffer().scroll_row);
@@ -10078,6 +10105,7 @@ test "cursor motion keeps the cursor visible" {
     defer app.deinit();
 
     app.last_render_height = 3;
+    app.last_pane_height = 3;
     setCursor(&app, 0, 0);
     try pressNormalKeys(&app, "jjjj");
     try std.testing.expectEqual(@as(usize, 4), app.activeBuffer().cursor.row);
@@ -10089,6 +10117,7 @@ test "gg and G pin the viewport to the top and bottom" {
     defer app.deinit();
 
     app.last_render_height = 3;
+    app.last_pane_height = 3;
     setCursor(&app, 2, 0);
     try pressNormalKeys(&app, "G");
     try std.testing.expectEqual(@as(usize, 4), app.activeBuffer().cursor.row);
